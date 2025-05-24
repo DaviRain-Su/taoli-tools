@@ -3,11 +3,39 @@ use hyperliquid_rust_sdk::{
     BaseUrl, ClientLimit, ClientOrder, ClientOrderRequest, ExchangeClient, InfoClient,
     ClientCancelRequest, ExchangeDataStatus, ExchangeResponseStatus, Message, Subscription, UserData,
 };
-use log::{error, info};
+use log::{error, info, warn};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::time::sleep;
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum GridStrategyError {
+    #[error("配置错误: {0}")]
+    ConfigError(String),
+    
+    #[error("钱包初始化失败: {0}")]
+    WalletError(String),
+    
+    #[error("客户端初始化失败: {0}")]
+    ClientError(String),
+    
+    #[error("订单操作失败: {0}")]
+    OrderError(String),
+    
+    #[error("订阅失败: {0}")]
+    SubscriptionError(String),
+    
+    #[error("价格解析失败: {0}")]
+    PriceParseError(String),
+    
+    #[error("数量解析失败: {0}")]
+    QuantityParseError(String),
+    
+    #[error("风险控制触发: {0}")]
+    RiskControlTriggered(String),
+}
 
 // 格式化价格到指定精度
 fn format_price(price: f64, precision: u32) -> f64 {
@@ -40,11 +68,57 @@ fn calculate_amplitude(klines: &[f64]) -> (f64, f64) {
     (avg_positive, avg_negative)
 }
 
-pub async fn run_grid_strategy() -> Result<(), Box<dyn std::error::Error>> {
+// 清仓函数
+async fn close_all_positions(
+    exchange_client: &ExchangeClient,
+    grid_config: &crate::config::GridConfig,
+    long_position: f64,
+    short_position: f64,
+    current_price: f64,
+) -> Result<(), GridStrategyError> {
+    if long_position > 0.0 {
+        let order = ClientOrderRequest {
+            asset: grid_config.trading_asset.clone(),
+            is_buy: false,
+            reduce_only: true,
+            limit_px: current_price,
+            sz: long_position,
+            cloid: None,
+            order_type: ClientOrder::Limit(ClientLimit {
+                tif: "Gtc".to_string(),
+            }),
+        };
+        if let Err(e) = exchange_client.order(order, None).await {
+            return Err(GridStrategyError::OrderError(format!("清仓多头失败: {:?}", e)));
+        }
+    }
+    
+    if short_position > 0.0 {
+        let order = ClientOrderRequest {
+            asset: grid_config.trading_asset.clone(),
+            is_buy: true,
+            reduce_only: true,
+            limit_px: current_price,
+            sz: short_position,
+            cloid: None,
+            order_type: ClientOrder::Limit(ClientLimit {
+                tif: "Gtc".to_string(),
+            }),
+        };
+        if let Err(e) = exchange_client.order(order, None).await {
+            return Err(GridStrategyError::OrderError(format!("清仓空头失败: {:?}", e)));
+        }
+    }
+    
+    Ok(())
+}
+
+pub async fn run_grid_strategy() -> Result<(), GridStrategyError> {
     env_logger::init();
     
     // 加载配置文件
-    let app_config = crate::config::load_config(std::path::Path::new("configs/default.toml"))?;
+    let app_config = crate::config::load_config(std::path::Path::new("configs/default.toml"))
+        .map_err(|e| GridStrategyError::ConfigError(e.to_string()))?;
     let grid_config = &app_config.grid;
     
     // 从配置文件读取私钥
@@ -53,15 +127,18 @@ pub async fn run_grid_strategy() -> Result<(), Box<dyn std::error::Error>> {
     // 初始化钱包
     let wallet: LocalWallet = private_key
         .parse()
-        .unwrap();
+        .map_err(|e| GridStrategyError::WalletError(format!("私钥解析失败: {:?}", e)))?;
     let user_address = wallet.address();
     info!("钱包地址: {:?}", user_address);
 
     // 初始化客户端
-    let mut info_client = InfoClient::new(None, Some(BaseUrl::Mainnet)).await.unwrap();
+    let mut info_client = InfoClient::new(None, Some(BaseUrl::Mainnet))
+        .await
+        .map_err(|e| GridStrategyError::ClientError(format!("信息客户端初始化失败: {:?}", e)))?;
+    
     let exchange_client = ExchangeClient::new(None, wallet, Some(BaseUrl::Mainnet), None, None)
         .await
-        .unwrap();
+        .map_err(|e| GridStrategyError::ClientError(format!("交易客户端初始化失败: {:?}", e)))?;
 
     info!("=== 交易参数 ===");
     info!("交易资产: {}", grid_config.trading_asset);
@@ -86,7 +163,7 @@ pub async fn run_grid_strategy() -> Result<(), Box<dyn std::error::Error>> {
         Ok(_) => info!("成功设置杠杆倍数为 {}x", grid_config.leverage),
         Err(e) => {
             error!("设置杠杆倍数失败: {:?}", e);
-            return Ok(());
+            return Err(GridStrategyError::OrderError(format!("设置杠杆倍数失败: {:?}", e)));
         }
     }
 
@@ -114,12 +191,12 @@ pub async fn run_grid_strategy() -> Result<(), Box<dyn std::error::Error>> {
     info_client
         .subscribe(Subscription::AllMids, sender.clone())
         .await
-        .unwrap();
+        .map_err(|e| GridStrategyError::SubscriptionError(format!("订阅价格失败: {:?}", e)))?;
     
     info_client
         .subscribe(Subscription::UserEvents { user: user_address }, sender.clone())
         .await
-        .unwrap();
+        .map_err(|e| GridStrategyError::SubscriptionError(format!("订阅用户事件失败: {:?}", e)))?;
 
     loop {
         info!("=== 开始新一轮检查 ===");
@@ -137,7 +214,8 @@ pub async fn run_grid_strategy() -> Result<(), Box<dyn std::error::Error>> {
             Some(Message::AllMids(all_mids)) => {
                 let all_mids = all_mids.data.mids;
                 if let Some(current_price) = all_mids.get(&grid_config.trading_asset) {
-                    let current_price: f64 = current_price.parse().unwrap();
+                    let current_price: f64 = current_price.parse()
+                        .map_err(|e| GridStrategyError::PriceParseError(format!("价格解析失败: {:?}", e)))?;
                     
                     // 更新价格历史
                     price_history.push(current_price);
@@ -170,39 +248,7 @@ pub async fn run_grid_strategy() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(start_time) = position_start_time {
                         if now.duration_since(start_time).unwrap().as_secs() >= grid_config.max_holding_time {
                             info!("触发最大持仓时间限制，执行清仓");
-                            // 清仓逻辑
-                            if long_position > 0.0 {
-                                let order = ClientOrderRequest {
-                                    asset: grid_config.trading_asset.clone(),
-                                    is_buy: false,
-                                    reduce_only: true,
-                                    limit_px: current_price,
-                                    sz: long_position,
-                                    cloid: None,
-                                    order_type: ClientOrder::Limit(ClientLimit {
-                                        tif: "Gtc".to_string(),
-                                    }),
-                                };
-                                if let Err(e) = exchange_client.order(order, None).await {
-                                    error!("清仓失败: {:?}", e);
-                                }
-                            }
-                            if short_position > 0.0 {
-                                let order = ClientOrderRequest {
-                                    asset: grid_config.trading_asset.clone(),
-                                    is_buy: true,
-                                    reduce_only: true,
-                                    limit_px: current_price,
-                                    sz: short_position,
-                                    cloid: None,
-                                    order_type: ClientOrder::Limit(ClientLimit {
-                                        tif: "Gtc".to_string(),
-                                    }),
-                                };
-                                if let Err(e) = exchange_client.order(order, None).await {
-                                    error!("清仓失败: {:?}", e);
-                                }
-                            }
+                            close_all_positions(&exchange_client, grid_config, long_position, short_position, current_price).await?;
                             position_start_time = None;
                         }
                     }
@@ -212,40 +258,10 @@ pub async fn run_grid_strategy() -> Result<(), Box<dyn std::error::Error>> {
                         let drawdown = (init_equity - current_equity) / init_equity;
                         if drawdown > grid_config.max_drawdown {
                             info!("触发最大回撤保护，执行清仓");
-                            // 清仓逻辑
-                            if long_position > 0.0 {
-                                let order = ClientOrderRequest {
-                                    asset: grid_config.trading_asset.clone(),
-                                    is_buy: false,
-                                    reduce_only: true,
-                                    limit_px: current_price,
-                                    sz: long_position,
-                                    cloid: None,
-                                    order_type: ClientOrder::Limit(ClientLimit {
-                                        tif: "Gtc".to_string(),
-                                    }),
-                                };
-                                if let Err(e) = exchange_client.order(order, None).await {
-                                    error!("清仓失败: {:?}", e);
-                                }
-                            }
-                            if short_position > 0.0 {
-                                let order = ClientOrderRequest {
-                                    asset: grid_config.trading_asset.clone(),
-                                    is_buy: true,
-                                    reduce_only: true,
-                                    limit_px: current_price,
-                                    sz: short_position,
-                                    cloid: None,
-                                    order_type: ClientOrder::Limit(ClientLimit {
-                                        tif: "Gtc".to_string(),
-                                    }),
-                                };
-                                if let Err(e) = exchange_client.order(order, None).await {
-                                    error!("清仓失败: {:?}", e);
-                                }
-                            }
-                            return Ok(());
+                            close_all_positions(&exchange_client, grid_config, long_position, short_position, current_price).await?;
+                            return Err(GridStrategyError::RiskControlTriggered(format!(
+                                "触发最大回撤保护: {:.2}%", drawdown * 100.0
+                            )));
                         }
                     } else {
                         initial_equity = Some(current_equity);
@@ -254,40 +270,10 @@ pub async fn run_grid_strategy() -> Result<(), Box<dyn std::error::Error>> {
                     // 检查每日亏损限制
                     if daily_pnl < -grid_config.total_capital * grid_config.max_daily_loss {
                         info!("触发每日最大亏损限制，执行清仓");
-                        // 清仓逻辑
-                        if long_position > 0.0 {
-                            let order = ClientOrderRequest {
-                                asset: grid_config.trading_asset.clone(),
-                                is_buy: false,
-                                reduce_only: true,
-                                limit_px: current_price,
-                                sz: long_position,
-                                cloid: None,
-                                order_type: ClientOrder::Limit(ClientLimit {
-                                    tif: "Gtc".to_string(),
-                                }),
-                            };
-                            if let Err(e) = exchange_client.order(order, None).await {
-                                error!("清仓失败: {:?}", e);
-                            }
-                        }
-                        if short_position > 0.0 {
-                            let order = ClientOrderRequest {
-                                asset: grid_config.trading_asset.clone(),
-                                is_buy: true,
-                                reduce_only: true,
-                                limit_px: current_price,
-                                sz: short_position,
-                                cloid: None,
-                                order_type: ClientOrder::Limit(ClientLimit {
-                                    tif: "Gtc".to_string(),
-                                }),
-                            };
-                            if let Err(e) = exchange_client.order(order, None).await {
-                                error!("清仓失败: {:?}", e);
-                            }
-                        }
-                        return Ok(());
+                        close_all_positions(&exchange_client, grid_config, long_position, short_position, current_price).await?;
+                        return Err(GridStrategyError::RiskControlTriggered(format!(
+                            "触发每日最大亏损限制: {:.2}", daily_pnl
+                        )));
                     }
 
                     // 取消所有现有订单
@@ -298,7 +284,7 @@ pub async fn run_grid_strategy() -> Result<(), Box<dyn std::error::Error>> {
                             oid: *order_id 
                         }, None).await {
                             Ok(_) => info!("订单取消成功: {}", order_id),
-                            Err(e) => error!("取消订单失败: {:?}", e),
+                            Err(e) => warn!("取消订单失败: {:?}", e),
                         }
                     }
                     active_orders.clear();
@@ -339,8 +325,8 @@ pub async fn run_grid_strategy() -> Result<(), Box<dyn std::error::Error>> {
                                         }
                                     }
                                 },
-                                Ok(ExchangeResponseStatus::Err(e)) => error!("买单失败: {:?}", e),
-                                Err(e) => error!("买单失败: {:?}", e),
+                                Ok(ExchangeResponseStatus::Err(e)) => warn!("买单失败: {:?}", e),
+                                Err(e) => warn!("买单失败: {:?}", e),
                             }
                         }
                     }
@@ -377,8 +363,8 @@ pub async fn run_grid_strategy() -> Result<(), Box<dyn std::error::Error>> {
                                         }
                                     }
                                 },
-                                Ok(ExchangeResponseStatus::Err(e)) => error!("卖单失败: {:?}", e),
-                                Err(e) => error!("卖单失败: {:?}", e),
+                                Ok(ExchangeResponseStatus::Err(e)) => warn!("卖单失败: {:?}", e),
+                                Err(e) => warn!("卖单失败: {:?}", e),
                             }
                         }
                     }
@@ -402,8 +388,10 @@ pub async fn run_grid_strategy() -> Result<(), Box<dyn std::error::Error>> {
                                 fill.oid, fill.px, fill.sz, if fill.side == "B" { "买入" } else { "卖出" });
                             
                             // 更新持仓
-                            let fill_size: f64 = fill.sz.parse().unwrap();
-                            let fill_price: f64 = fill.px.parse().unwrap();
+                            let fill_size: f64 = fill.sz.parse()
+                                .map_err(|e| GridStrategyError::QuantityParseError(format!("数量解析失败: {:?}", e)))?;
+                            let fill_price: f64 = fill.px.parse()
+                                .map_err(|e| GridStrategyError::PriceParseError(format!("价格解析失败: {:?}", e)))?;
                             
                             // 计算盈亏
                             let pnl = if fill.side == "B" {
@@ -428,40 +416,10 @@ pub async fn run_grid_strategy() -> Result<(), Box<dyn std::error::Error>> {
                             // 检查单笔亏损限制
                             if pnl < -grid_config.total_capital * grid_config.max_single_loss {
                                 info!("触发单笔最大亏损限制，执行清仓");
-                                // 清仓逻辑
-                                if long_position > 0.0 {
-                                    let order = ClientOrderRequest {
-                                        asset: grid_config.trading_asset.clone(),
-                                        is_buy: false,
-                                        reduce_only: true,
-                                        limit_px: fill_price,
-                                        sz: long_position,
-                                        cloid: None,
-                                        order_type: ClientOrder::Limit(ClientLimit {
-                                            tif: "Gtc".to_string(),
-                                        }),
-                                    };
-                                    if let Err(e) = exchange_client.order(order, None).await {
-                                        error!("清仓失败: {:?}", e);
-                                    }
-                                }
-                                if short_position > 0.0 {
-                                    let order = ClientOrderRequest {
-                                        asset: grid_config.trading_asset.clone(),
-                                        is_buy: true,
-                                        reduce_only: true,
-                                        limit_px: fill_price,
-                                        sz: short_position,
-                                        cloid: None,
-                                        order_type: ClientOrder::Limit(ClientLimit {
-                                            tif: "Gtc".to_string(),
-                                        }),
-                                    };
-                                    if let Err(e) = exchange_client.order(order, None).await {
-                                        error!("清仓失败: {:?}", e);
-                                    }
-                                }
-                                return Ok(());
+                                close_all_positions(&exchange_client, grid_config, long_position, short_position, fill_price).await?;
+                                return Err(GridStrategyError::RiskControlTriggered(format!(
+                                    "触发单笔最大亏损限制: {:.2}", pnl
+                                )));
                             }
                             
                             if fill.side == "B" {
@@ -494,7 +452,7 @@ pub async fn run_grid_strategy() -> Result<(), Box<dyn std::error::Error>> {
             Some(_) => continue,
             None => {
                 error!("接收消息通道关闭");
-                break;
+                return Err(GridStrategyError::SubscriptionError("消息通道关闭".to_string()));
             }
         }
 
@@ -502,6 +460,4 @@ pub async fn run_grid_strategy() -> Result<(), Box<dyn std::error::Error>> {
         info!("\n等待{}秒后进行下一次检查...", grid_config.check_interval);
         sleep(Duration::from_secs(grid_config.check_interval)).await;
     }
-
-    Ok(())
 } 
