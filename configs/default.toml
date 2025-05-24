@@ -1,0 +1,43 @@
+[spot]
+exchange1 = "binance"
+exchange2 = "okx"
+symbol = "BTC/USDT"
+
+[futures]
+spot_exchange = "binance"
+futures_exchange = "okx"
+symbol = "BTC/USDT"
+
+[triangle]
+exchange = "binance"
+pair1 = "BTC/USDT"
+pair2 = "ETH/USDT"
+pair3 = "ETH/BTC"
+
+[grid]
+# 交易参数
+trading_asset = "BTC"
+total_capital = 1000.0
+grid_count = 3
+trade_amount = 100.0
+max_position = 300.0
+max_drawdown = 0.02
+price_precision = 2
+quantity_precision = 1
+check_interval = 5
+leverage = 1
+
+# 网格策略参数
+min_grid_spacing = 0.001  # 最小网格间距 0.1%
+max_grid_spacing = 0.05   # 最大网格间距 5%
+grid_price_offset = 0.0   # 网格价格偏移量
+
+# 风险控制参数
+max_single_loss = 0.01    # 单笔最大亏损 1%
+max_daily_loss = 0.05     # 每日最大亏损 5%
+max_holding_time = 86400  # 最大持仓时间（秒）
+history_length = 20       # 价格历史长度
+
+# 账户配置
+[account]
+private_key = "your_private_key_here"  # 请替换为您的私钥 
