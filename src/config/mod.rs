@@ -52,6 +52,7 @@ pub struct GridConfig {
     pub max_daily_loss: f64,
     pub max_holding_time: u64,
     pub history_length: usize,
+    pub max_active_orders: usize, // 每次最多挂单数量（买/卖各自）
 }
 
 #[derive(Debug, Deserialize)]

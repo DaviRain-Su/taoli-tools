@@ -293,13 +293,38 @@ pub async fn run_grid_strategy() -> Result<(), GridStrategyError> {
                     let buy_threshold = grid_spacing + grid_config.grid_price_offset;
                     let sell_threshold = grid_spacing - grid_config.grid_price_offset;
 
-                    // 买单网格
+                    // 资金分配：每次循环时计算可用资金
+                    let used_capital = (long_position + short_position) * current_price;
+                    let mut available_capital = grid_config.total_capital - used_capital;
+
+                    // === 分批分层投入：只挂最近N个买/卖单 ===
+                    let max_active_orders = grid_config.max_active_orders as usize;
+                    // 统计当前未成交买单和卖单数量
+                    let mut active_buy_orders = 0;
+                    let mut active_sell_orders = 0;
+                    for &oid in &active_orders {
+                        if buy_entry_prices.contains_key(&oid) {
+                            active_buy_orders += 1;
+                        } else if sell_entry_prices.contains_key(&oid) {
+                            active_sell_orders += 1;
+                        }
+                    }
+
+                    // 买单网格：只挂N个未成交买单
                     if long_position < grid_config.max_position {
+                        let mut buy_count = 0;
                         for i in 0..grid_config.grid_count {
+                            if active_buy_orders + buy_count >= max_active_orders {
+                                break;
+                            }
                             let price = current_price * (1.0 - buy_threshold - i as f64 * grid_spacing);
                             let formatted_price = format_price(price, grid_config.price_precision);
                             let quantity = format_price(grid_config.trade_amount / formatted_price, grid_config.quantity_precision);
-                            
+                            let order_capital = quantity * formatted_price;
+                            if order_capital > available_capital {
+                                info!("剩余资金不足，停止买单挂单");
+                                break;
+                            }
                             let order = ClientOrderRequest {
                                 asset: grid_config.trading_asset.clone(),
                                 is_buy: true,
@@ -321,6 +346,7 @@ pub async fn run_grid_strategy() -> Result<(), GridStrategyError> {
                                                     order.oid, formatted_price, quantity);
                                                 active_orders.push(order.oid);
                                                 buy_entry_prices.insert(order.oid, formatted_price);
+                                                buy_count += 1;
                                             }
                                         }
                                     }
@@ -328,16 +354,25 @@ pub async fn run_grid_strategy() -> Result<(), GridStrategyError> {
                                 Ok(ExchangeResponseStatus::Err(e)) => warn!("买单失败: {:?}", e),
                                 Err(e) => warn!("买单失败: {:?}", e),
                             }
+                            available_capital -= order_capital;
                         }
                     }
 
-                    // 卖单网格
+                    // 卖单网格：只挂N个未成交卖单
                     if short_position < grid_config.max_position {
+                        let mut sell_count = 0;
                         for i in 0..grid_config.grid_count {
+                            if active_sell_orders + sell_count >= max_active_orders {
+                                break;
+                            }
                             let price = current_price * (1.0 + sell_threshold + i as f64 * grid_spacing);
                             let formatted_price = format_price(price, grid_config.price_precision);
                             let quantity = format_price(grid_config.trade_amount / formatted_price, grid_config.quantity_precision);
-                            
+                            let order_capital = quantity * formatted_price;
+                            if order_capital > available_capital {
+                                info!("剩余资金不足，停止卖单挂单");
+                                break;
+                            }
                             let order = ClientOrderRequest {
                                 asset: grid_config.trading_asset.clone(),
                                 is_buy: false,
@@ -359,6 +394,7 @@ pub async fn run_grid_strategy() -> Result<(), GridStrategyError> {
                                                     order.oid, formatted_price, quantity);
                                                 active_orders.push(order.oid);
                                                 sell_entry_prices.insert(order.oid, formatted_price);
+                                                sell_count += 1;
                                             }
                                         }
                                     }
@@ -366,6 +402,7 @@ pub async fn run_grid_strategy() -> Result<(), GridStrategyError> {
                                 Ok(ExchangeResponseStatus::Err(e)) => warn!("卖单失败: {:?}", e),
                                 Err(e) => warn!("卖单失败: {:?}", e),
                             }
+                            available_capital -= order_capital;
                         }
                     }
 
