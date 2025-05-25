@@ -238,8 +238,14 @@ pub async fn run_grid_strategy() -> Result<(), GridStrategyError> {
                     }
                     last_price = Some(current_price);
 
-                    // 更新最大权益和当前权益
-                    let current_equity = long_position - short_position;
+                    // 资金分配：每次循环时计算可用资金
+                    let used_capital = (long_position + short_position) * current_price;
+                    let available_capital = grid_config.total_capital - used_capital;
+
+                    // 计算当前总权益
+                    let current_equity = long_position * current_price + short_position * current_price + available_capital;
+
+                    // 动态更新历史最大权益
                     if current_equity > max_equity {
                         max_equity = current_equity;
                     }
@@ -253,18 +259,14 @@ pub async fn run_grid_strategy() -> Result<(), GridStrategyError> {
                         }
                     }
 
-                    // 检查最大回撤
-                    if let Some(init_equity) = initial_equity {
-                        let drawdown = (init_equity - current_equity) / init_equity;
-                        if drawdown > grid_config.max_drawdown {
-                            info!("触发最大回撤保护，执行清仓");
-                            close_all_positions(&exchange_client, grid_config, long_position, short_position, current_price).await?;
-                            return Err(GridStrategyError::RiskControlTriggered(format!(
-                                "触发最大回撤保护: {:.2}%", drawdown * 100.0
-                            )));
-                        }
-                    } else {
-                        initial_equity = Some(current_equity);
+                    // 最大回撤风控
+                    let drawdown = (max_equity - current_equity) / max_equity;
+                    if drawdown > grid_config.max_drawdown {
+                        info!("触发最大回撤保护，执行清仓");
+                        close_all_positions(&exchange_client, grid_config, long_position, short_position, current_price).await?;
+                        return Err(GridStrategyError::RiskControlTriggered(format!(
+                            "触发最大回撤保护: {:.2}%", drawdown * 100.0
+                        )));
                     }
 
                     // 检查每日亏损限制
@@ -292,10 +294,6 @@ pub async fn run_grid_strategy() -> Result<(), GridStrategyError> {
                     // 计算网格价格
                     let buy_threshold = grid_spacing + grid_config.grid_price_offset;
                     let sell_threshold = grid_spacing - grid_config.grid_price_offset;
-
-                    // 资金分配：每次循环时计算可用资金
-                    let used_capital = (long_position + short_position) * current_price;
-                    let mut available_capital = grid_config.total_capital - used_capital;
 
                     // === 分批分层投入：只挂最近N个买/卖单 ===
                     let max_active_orders = grid_config.max_active_orders as usize;
