@@ -113,12 +113,8 @@ async fn close_all_positions(
     Ok(())
 }
 
-pub async fn run_grid_strategy() -> Result<(), GridStrategyError> {
+pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(), GridStrategyError> {
     env_logger::init();
-    
-    // 加载配置文件
-    let app_config = crate::config::load_config(std::path::Path::new("configs/default.toml"))
-        .map_err(|e| GridStrategyError::ConfigError(e.to_string()))?;
     let grid_config = &app_config.grid;
     
     // 从配置文件读取私钥
@@ -176,7 +172,6 @@ pub async fn run_grid_strategy() -> Result<(), GridStrategyError> {
     let mut buy_entry_prices: HashMap<u64, f64> = HashMap::new();
     let mut sell_entry_prices: HashMap<u64, f64> = HashMap::new();
     let mut max_equity = 0.0;
-    let mut initial_equity = None;
     let mut daily_pnl = 0.0;
     let mut last_daily_reset = SystemTime::now();
     let mut position_start_time: Option<SystemTime> = None;
@@ -240,7 +235,7 @@ pub async fn run_grid_strategy() -> Result<(), GridStrategyError> {
 
                     // 资金分配：每次循环时计算可用资金
                     let used_capital = (long_position + short_position) * current_price;
-                    let available_capital = grid_config.total_capital - used_capital;
+                    let mut available_capital = grid_config.total_capital - used_capital;
 
                     // 计算当前总权益
                     let current_equity = long_position * current_price + short_position * current_price + available_capital;

@@ -69,8 +69,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // TODO: 实现三角套利逻辑
         }
         Commands::Grid => {
-            let _config = app_config.unwrap();
-            strategies::grid::run_grid_strategy().await?;
+            let config = app_config.unwrap();
+            strategies::grid::run_grid_strategy(config).await?;
         }
         Commands::InitConfig => {
             use std::fs;
