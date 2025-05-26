@@ -537,25 +537,9 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                             let fill_price: f64 = fill.px.parse()
                                 .map_err(|e| GridStrategyError::PriceParseError(format!("价格解析失败: {:?}", e)))?;
                             
-                            let max_acceptable_loss = 0.0; // 允许的最大亏损（你可以调整）
-
-                            if fill.side == "B" && short_position > 0.0 {
-                                // 买入成交，且有空头持仓，视为平空
-                                let pnl = (short_avg_price - fill_price) * fill_size;
-                                if pnl < max_acceptable_loss {
-                                    info!("⚠️ 平空操作将导致亏损({:.4} USDC)，已阻止本次平仓", pnl);
-                                    continue;
-                                }
-                            } else if fill.side == "S" && long_position > 0.0 {
-                                // 卖出成交，且有多头持仓，视为平多
-                                let pnl = (fill_price - long_avg_price) * fill_size;
-                                if pnl < max_acceptable_loss {
-                                    info!("⚠️ 平多操作将导致亏损({:.4} USDC)，已阻止本次平仓", pnl);
-                                    continue;
-                                }
-                            }
-                            
-                            // 计算盈亏
+                            let fee_rate = 0.0004; // 0.04%
+                            let fee = fill_price * fill_size * fee_rate * 2.0;
+                            let max_acceptable_loss = fee;
                             let pnl = if fill.side == "B" {
                                 // 买入订单的盈亏
                                 if let Some(entry_price) = sell_entry_prices.get(&fill.oid) {
@@ -571,6 +555,11 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                                     0.0
                                 }
                             };
+                            
+                            if pnl < max_acceptable_loss {
+                                info!("⚠️ 平多操作将导致亏损({:.4} USDC)，已阻止本次平仓", pnl);
+                                continue;
+                            }
                             
                             // 更新每日盈亏
                             daily_pnl += pnl;
