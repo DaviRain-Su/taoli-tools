@@ -190,6 +190,8 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
     let mut daily_pnl = 0.0;
     let mut last_daily_reset = SystemTime::now();
     let mut position_start_time: Option<SystemTime> = None;
+    let mut long_avg_price = 0.0;
+    let mut short_avg_price = 0.0;
 
     // 价格历史记录
     let mut price_history: Vec<f64> = Vec::new();
@@ -535,31 +537,22 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                             let fill_price: f64 = fill.px.parse()
                                 .map_err(|e| GridStrategyError::PriceParseError(format!("价格解析失败: {:?}", e)))?;
                             
-                            let max_acceptable_loss = 0.0; // 允许的最大亏损（你可以调整为负数，比如 -1.0 表示最多亏1 USDC）
-                            let mut skip_close = false;
-                            if fill.side == "B" {
-                                // 买入成交，通常是平空
-                                if let Some(entry_price) = sell_entry_prices.get(&fill.oid) {
-                                    let open_price = entry_price.parse::<f64>().unwrap_or(0.0);
-                                    let pnl = (open_price - fill_price) * fill_size;
-                                    if pnl < max_acceptable_loss {
-                                        info!("⚠️ 平空操作将导致亏损({:.4} USDC)，已阻止本次平仓", pnl);
-                                        skip_close = true;
-                                    }
+                            let max_acceptable_loss = 0.0; // 允许的最大亏损（你可以调整）
+
+                            if fill.side == "B" && short_position > 0.0 {
+                                // 买入成交，且有空头持仓，视为平空
+                                let pnl = (short_avg_price - fill_price) * fill_size;
+                                if pnl < max_acceptable_loss {
+                                    info!("⚠️ 平空操作将导致亏损({:.4} USDC)，已阻止本次平仓", pnl);
+                                    continue;
                                 }
-                            } else {
-                                // 卖出成交，通常是平多
-                                if let Some(entry_price) = buy_entry_prices.get(&fill.oid) {
-                                    let open_price = entry_price.parse::<f64>().unwrap_or(0.0);
-                                    let pnl = (fill_price - open_price) * fill_size;
-                                    if pnl < max_acceptable_loss {
-                                        info!("⚠️ 平多操作将导致亏损({:.4} USDC)，已阻止本次平仓", pnl);
-                                        skip_close = true;
-                                    }
+                            } else if fill.side == "S" && long_position > 0.0 {
+                                // 卖出成交，且有多头持仓，视为平多
+                                let pnl = (fill_price - long_avg_price) * fill_size;
+                                if pnl < max_acceptable_loss {
+                                    info!("⚠️ 平多操作将导致亏损({:.4} USDC)，已阻止本次平仓", pnl);
+                                    continue;
                                 }
-                            }
-                            if skip_close {
-                                continue;
                             }
                             
                             // 计算盈亏
@@ -593,8 +586,10 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                             
                             if fill.side == "B" {
                                 long_position += fill_size;
+                                long_avg_price = (long_avg_price * long_position + fill_price * fill_size) / (long_position + fill_size);
                             } else {
                                 short_position += fill_size;
+                                short_avg_price = (short_avg_price * short_position + fill_price * fill_size) / (short_position + fill_size);
                             }
                             
                             // 更新持仓开始时间
