@@ -253,7 +253,7 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                         let price_change = ((current_price - last) / last) * 100.0;
                         info!("价格变化: {:.4}% (从 {:.4} 到 {:.4})", 
                             price_change, last, current_price);
-                        info!("当前波动率: {:.4}%, 网格间距: {:.4}%", 
+                        info!("当前波动率: {:.8}%, 网格间距: {:.8}%", 
                             volatility * 100.0, grid_spacing * 100.0);
                     }
                     last_price = Some(current_price);
@@ -312,8 +312,8 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                     active_orders.clear();
 
                     // 计算网格价格
-                    let buy_threshold = grid_spacing + grid_config.grid_price_offset;
-                    let sell_threshold = grid_spacing - grid_config.grid_price_offset;
+                    let buy_threshold = grid_spacing / 2.0;
+                    let sell_threshold = grid_spacing / 2.0;
 
                     // === 分批分层投入：只挂最近N个买/卖单 ===
                     let max_active_orders = grid_config.max_active_orders as usize;
@@ -370,17 +370,15 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                                 total_margin, margin_base, margin_limit, total_margin / margin_limit * 100.0
                             );
 
-                            let is_reduce_only = short_position > 0.0; // 有空头时买入是平仓，否则是开仓
+                            let is_reduce_only = false; // 网格买单永远是开仓单
 
-                            if !is_reduce_only {
-                                if total_margin > margin_limit {
-                                    info!(
-                                        "❌ 下单后保证金将超过最大可用保证金{}%（阈值: {:.2} USDC），本次不挂单",
-                                        app_config.grid.margin_usage_threshold * 100.0,
-                                        margin_limit
-                                    );
-                                    break;
-                                }
+                            if total_margin > margin_limit {
+                                info!(
+                                    "❌ 下单后保证金将超过最大可用保证金{}%（阈值: {:.2} USDC），本次不挂单",
+                                    app_config.grid.margin_usage_threshold * 100.0,
+                                    margin_limit
+                                );
+                                break;
                             }
                             
                             let future_position = long_position + quantity;
@@ -463,17 +461,15 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                                 total_margin, margin_base, margin_limit, total_margin / margin_limit * 100.0
                             );
 
-                            let is_reduce_only = long_position > 0.0; // 有多头时卖出是平仓，否则是开仓
+                            let is_reduce_only = false; // 网格卖单永远是开仓单
 
-                            if !is_reduce_only {
-                                if total_margin > margin_limit {
-                                    info!(
-                                        "❌ 下单后保证金将超过最大可用保证金{}%（阈值: {:.2} USDC），本次不挂单",
-                                        app_config.grid.margin_usage_threshold * 100.0,
-                                        margin_limit
-                                    );
-                                    break;
-                                }
+                            if total_margin > margin_limit {
+                                info!(
+                                    "❌ 下单后保证金将超过最大可用保证金{}%（阈值: {:.2} USDC），本次不挂单",
+                                    app_config.grid.margin_usage_threshold * 100.0,
+                                    margin_limit
+                                );
+                                break;
                             }
                             
                             let future_position = short_position + quantity;
