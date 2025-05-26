@@ -27,9 +27,11 @@ quantity_precision = 1        # 数量精度，保留1位小数
 check_interval = 5            # 检查间隔，每5秒检查一次价格
 leverage = 3                  # 杠杆倍数，使用3倍杠杆
 max_active_orders = 3           # 每次最多挂单数量（买/卖各自）
+fee_rate = 0.0004              # 手续费率，0.04%
+min_profit = 0.01              # 最小盈利阈值，单位USDC
 
 # 网格策略参数
-min_grid_spacing = 0.005     # 最小网格间距，0.1%，防止网格过密
+min_grid_spacing = 0.003     # 最小网格间距，0.1%，防止网格过密
 max_grid_spacing = 0.008       # 最大网格间距，5%，防止网格过疏
 # min_grid_spacing 和 max_grid_spacing 建议设置为 0.2%~0.3% 以上（即 0.002~0.003），这样每次开平仓的价差能覆盖手续费。
 grid_price_offset = 0.0       # 网格价格偏移量，可以设置一个偏移值来调整网格位置

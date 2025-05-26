@@ -380,13 +380,13 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                                 break;
                             }
 
-                            let fee_rate = 0.0004; // 0.04%
-                            let min_grid_spacing = 2.0 * fee_rate; // 单边手续费*2
+                            let fee_rate = grid_config.fee_rate;
+                            let min_grid_spacing = 2.0 * fee_rate;
                             if grid_spacing < min_grid_spacing {
                                 info!("❌ 网格间距({:.4}%)过小，无法覆盖手续费({:.4}%)，本次不挂单", grid_spacing * 100.0, min_grid_spacing * 100.0);
                                 break;
                             }
-
+                            // === 最小盈利阈值风控 ===
                             let order = ClientOrderRequest {
                                 asset: grid_config.trading_asset.clone(),
                                 is_buy: true,
@@ -465,13 +465,13 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                                 break;
                             }
 
-                            let fee_rate = 0.0004; // 0.04%
-                            let min_grid_spacing = 2.0 * fee_rate; // 单边手续费*2
+                            let fee_rate = grid_config.fee_rate;
+                            let min_grid_spacing = 2.0 * fee_rate;
                             if grid_spacing < min_grid_spacing {
                                 info!("❌ 网格间距({:.4}%)过小，无法覆盖手续费({:.4}%)，本次不挂单", grid_spacing * 100.0, min_grid_spacing * 100.0);
                                 break;
                             }
-
+                            // === 最小盈利阈值风控 ===
                             let order = ClientOrderRequest {
                                 asset: grid_config.trading_asset.clone(),
                                 is_buy: false,
@@ -537,10 +537,8 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                             let fill_price: f64 = fill.px.parse()
                                 .map_err(|e| GridStrategyError::PriceParseError(format!("价格解析失败: {:?}", e)))?;
                             
-                            let fee_rate = 0.0004; // 0.04%
+                            let fee_rate = grid_config.fee_rate;
                             let fee = fill_price * fill_size * fee_rate * 2.0;
-                            let min_profit = 0.01; // 你期望的最小盈利（比如0.01 USDC）
-                            let max_acceptable_loss = fee - min_profit;
 
                             if fill.side == "B" {
                                 long_avg_price = (long_avg_price * long_position + fill_price * fill_size) / (long_position + fill_size);
@@ -603,6 +601,10 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                             if fill.side == "S" && long_position > 0.0 {
                                 // 卖出成交，且有多头持仓，视为平多
                                 let pnl = (fill_price - long_avg_price) * fill_size;
+                                let fee_rate = grid_config.fee_rate;
+                                let fee = pnl * fee_rate * 2.0;
+                                let max_acceptable_loss = fee;
+
                                 if pnl < max_acceptable_loss {
                                     info!("⚠️ 平多操作将导致亏损({:.4} USDC)，已阻止本次平仓", pnl);
                                     continue;
