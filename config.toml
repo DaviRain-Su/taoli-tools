@@ -41,4 +41,5 @@ history_length = 60           # 价格历史长度，用于计算波动率和调
 
 # 账户配置
 [account]
-private_key = ""  # 请替换为您的私钥 
+private_key = ""  # 请替换为您的私钥
+real_account_address = "0x0C219488E878b66d9e098ED59Ab714c5c29eB0dF"

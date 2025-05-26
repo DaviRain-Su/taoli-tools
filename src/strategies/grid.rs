@@ -135,8 +135,12 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
     let wallet: LocalWallet = private_key
         .parse()
         .map_err(|e| GridStrategyError::WalletError(format!("私钥解析失败: {:?}", e)))?;
-    let user_address = wallet.address();
-    info!("钱包地址: {:?}", user_address);
+    let user_address = if let Some(addr) = &app_config.account.real_account_address {
+        addr.parse().expect("real_account_address 格式错误")
+    } else {
+        wallet.address()
+    };
+    info!("实际查询的钱包地址: {:?}", user_address);
 
     // 初始化客户端
     let mut info_client = InfoClient::new(None, Some(BaseUrl::Mainnet))
@@ -225,12 +229,11 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                     
                     // 获取实际账户信息
                     let account_info = get_account_info(&info_client, user_address).await?;
-                    let actual_balance: f64 = account_info.margin_summary.account_value.parse().unwrap_or(0.0);
-                    let actual_margin_used: f64 = account_info.margin_summary.total_margin_used.parse().unwrap_or(0.0);
-                    let actual_available_margin = actual_balance - actual_margin_used;
-                    
-                    info!("账户信息 - 总资产: {}, 已用保证金: {}, 可用保证金: {}", 
-                        actual_balance, actual_margin_used, actual_available_margin);
+                    info!("完整账户信息: {:?}", account_info);
+
+                    // 用 withdrawable 字段作为 USDC 可用余额
+                    let usdc_balance = account_info.withdrawable.parse().unwrap_or(0.0);
+                    info!("USDC 余额: {}", usdc_balance);
 
                     // 更新价格历史
                     price_history.push(current_price);
@@ -345,9 +348,11 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                             let order_margin = order_capital / grid_config.leverage as f64;
                             
                             // 使用实际账户数据检查保证金
-                            let total_margin = actual_margin_used + pending_buy_margin + pending_sell_margin + order_margin;
-                            if total_margin > actual_balance {
-                                info!("下单后保证金将超过账户总资产，停止买单挂单");
+                            let total_margin = usdc_balance + pending_buy_margin + pending_sell_margin + order_margin;
+                            info!("保证金检查 - 当前已用: {}, 待用买单: {}, 待用卖单: {}, 新订单: {}, 总计: {}", 
+                                usdc_balance, pending_buy_margin, pending_sell_margin, order_margin, total_margin);
+                            if total_margin > usdc_balance * 0.9 {
+                                info!("下单后保证金将超过有效余额的90%，停止买单挂单");
                                 break;
                             }
                             
@@ -405,9 +410,11 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                             let order_margin = order_capital / grid_config.leverage as f64;
                             
                             // 使用实际账户数据检查保证金
-                            let total_margin = actual_margin_used + pending_buy_margin + pending_sell_margin + order_margin;
-                            if total_margin > actual_balance {
-                                info!("下单后保证金将超过账户总资产，停止卖单挂单");
+                            let total_margin = usdc_balance + pending_buy_margin + pending_sell_margin + order_margin;
+                            info!("保证金检查 - 当前已用: {}, 待用买单: {}, 待用卖单: {}, 新订单: {}, 总计: {}", 
+                                usdc_balance, pending_buy_margin, pending_sell_margin, order_margin, total_margin);
+                            if total_margin > usdc_balance * 0.9 {
+                                info!("下单后保证金将超过有效余额的90%，停止卖单挂单");
                                 break;
                             }
                             
@@ -459,9 +466,7 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                     info!("当前权益: {}", current_equity);
                     info!("每日盈亏: {}", daily_pnl);
                     info!("活跃订单数量: {}", active_orders.len());
-                    info!("实际账户总资产: {}", actual_balance);
-                    info!("实际已用保证金: {}", actual_margin_used);
-                    info!("实际可用保证金: {}", actual_available_margin);
+                    info!("实际账户总资产: {}", usdc_balance);
                 }
             },
             Some(Message::User(user_event)) => {

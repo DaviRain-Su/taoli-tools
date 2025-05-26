@@ -59,6 +59,7 @@ pub struct GridConfig {
 pub struct AccountConfig {
     // Configuration for account credentials
     pub private_key: String,
+    pub real_account_address: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
