@@ -372,14 +372,14 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
 
                             let is_reduce_only = false; // 网格买单永远是开仓单
 
-                            if total_margin > margin_limit {
-                                info!(
-                                    "❌ 下单后保证金将超过最大可用保证金{}%（阈值: {:.2} USDC），本次不挂单",
-                                    app_config.grid.margin_usage_threshold * 100.0,
-                                    margin_limit
-                                );
-                                break;
-                            }
+                            //if total_margin > margin_limit {
+                            //    info!(
+                            //        "❌ 下单后保证金将超过最大可用保证金{}%（阈值: {:.2} USDC），本次不挂单",
+                            //        app_config.grid.margin_usage_threshold * 100.0,
+                            //        margin_limit
+                            //    );
+                            //    break;
+                            //}
                             
                             let future_position = long_position + quantity;
                             if future_position > grid_config.max_position {
@@ -463,14 +463,14 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
 
                             let is_reduce_only = false; // 网格卖单永远是开仓单
 
-                            if total_margin > margin_limit {
-                                info!(
-                                    "❌ 下单后保证金将超过最大可用保证金{}%（阈值: {:.2} USDC），本次不挂单",
-                                    app_config.grid.margin_usage_threshold * 100.0,
-                                    margin_limit
-                                );
-                                break;
-                            }
+                            //if total_margin > margin_limit {
+                            //    info!(
+                            //        "❌ 下单后保证金将超过最大可用保证金{}%（阈值: {:.2} USDC），本次不挂单",
+                            //        app_config.grid.margin_usage_threshold * 100.0,
+                            //        margin_limit
+                            //    );
+                            //    break;
+                            //}
                             
                             let future_position = short_position + quantity;
                             if future_position > grid_config.max_position {
