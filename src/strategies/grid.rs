@@ -251,7 +251,7 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                     // 打印价格变化
                     if let Some(last) = last_price {
                         let price_change = ((current_price - last) / last) * 100.0;
-                        info!("价格变化: {:.2}% (从 {:.2} 到 {:.2})", 
+                        info!("价格变化: {:.4}% (从 {:.4} 到 {:.4})", 
                             price_change, last, current_price);
                         info!("当前波动率: {:.4}%, 网格间距: {:.4}%", 
                             volatility * 100.0, grid_spacing * 100.0);
@@ -338,6 +338,7 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
 
                     // 买单网格：只挂N个未成交买单
                     if long_position < grid_config.max_position {
+                   
                         let mut buy_count = 0;
                         for i in 0..grid_config.grid_count {
                             if active_buy_orders + buy_count >= max_active_orders {
@@ -369,9 +370,17 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                                 total_margin, margin_base, margin_limit, total_margin / margin_limit * 100.0
                             );
 
-                            if total_margin > margin_limit {
-                                info!("❌ 下单后保证金将超过最大可用保证金{}%（阈值: {:.2} USDC），本次不挂单", app_config.grid.margin_usage_threshold * 100.0, margin_limit);
-                                break;
+                            let is_reduce_only = short_position > 0.0; // 有空头时买入是平仓，否则是开仓
+
+                            if !is_reduce_only {
+                                if total_margin > margin_limit {
+                                    info!(
+                                        "❌ 下单后保证金将超过最大可用保证金{}%（阈值: {:.2} USDC），本次不挂单",
+                                        app_config.grid.margin_usage_threshold * 100.0,
+                                        margin_limit
+                                    );
+                                    break;
+                                }
                             }
                             
                             let future_position = long_position + quantity;
@@ -390,7 +399,7 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                             let order = ClientOrderRequest {
                                 asset: grid_config.trading_asset.clone(),
                                 is_buy: true,
-                                reduce_only: false,
+                                reduce_only: is_reduce_only,
                                 limit_px: formatted_price,
                                 sz: quantity,
                                 cloid: None,
@@ -454,9 +463,17 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                                 total_margin, margin_base, margin_limit, total_margin / margin_limit * 100.0
                             );
 
-                            if total_margin > margin_limit {
-                                info!("❌ 下单后保证金将超过最大可用保证金{}%（阈值: {:.2} USDC），本次不挂单", app_config.grid.margin_usage_threshold * 100.0, margin_limit);
-                                break;
+                            let is_reduce_only = long_position > 0.0; // 有多头时卖出是平仓，否则是开仓
+
+                            if !is_reduce_only {
+                                if total_margin > margin_limit {
+                                    info!(
+                                        "❌ 下单后保证金将超过最大可用保证金{}%（阈值: {:.2} USDC），本次不挂单",
+                                        app_config.grid.margin_usage_threshold * 100.0,
+                                        margin_limit
+                                    );
+                                    break;
+                                }
                             }
                             
                             let future_position = short_position + quantity;
@@ -475,7 +492,7 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                             let order = ClientOrderRequest {
                                 asset: grid_config.trading_asset.clone(),
                                 is_buy: false,
-                                reduce_only: false,
+                                reduce_only: is_reduce_only,
                                 limit_px: formatted_price,
                                 sz: quantity,
                                 cloid: None,
