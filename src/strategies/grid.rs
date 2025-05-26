@@ -231,7 +231,7 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                     
                     // 获取实际账户信息
                     let account_info = get_account_info(&info_client, user_address).await?;
-                    info!("完整账户信息: {:?}", account_info);
+                    //info!("完整账户信息: {:?}", account_info);
 
                     // 用 withdrawable 字段作为 USDC 可用余额
                     let usdc_balance = account_info.withdrawable.parse().unwrap_or(0.0);
@@ -352,7 +352,7 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                             // 使用实际账户数据检查保证金
                             let actual_margin_used = account_info.margin_summary.total_margin_used.parse().unwrap_or(0.0);
                             let margin_base = usdc_balance + actual_margin_used;
-                            let margin_limit = margin_base * 0.8;
+                            let margin_limit = margin_base * app_config.grid.margin_usage_threshold;
                             let total_margin = actual_margin_used + pending_buy_margin + pending_sell_margin + order_margin;
 
                             info!(
@@ -370,7 +370,7 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                             );
 
                             if total_margin > margin_limit {
-                                info!("❌ 下单后保证金将超过最大可用保证金80%（阈值: {:.2} USDC），本次不挂单", margin_limit);
+                                info!("❌ 下单后保证金将超过最大可用保证金{}%（阈值: {:.2} USDC），本次不挂单", app_config.grid.margin_usage_threshold * 100.0, margin_limit);
                                 break;
                             }
                             
@@ -437,7 +437,7 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                             // 使用实际账户数据检查保证金
                             let actual_margin_used = account_info.margin_summary.total_margin_used.parse().unwrap_or(0.0);
                             let margin_base = usdc_balance + actual_margin_used;
-                            let margin_limit = margin_base * 0.8;
+                            let margin_limit = margin_base * app_config.grid.margin_usage_threshold;
                             let total_margin = actual_margin_used + pending_buy_margin + pending_sell_margin + order_margin;
 
                             info!(
@@ -455,7 +455,7 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                             );
 
                             if total_margin > margin_limit {
-                                info!("❌ 下单后保证金将超过最大可用保证金80%（阈值: {:.2} USDC），本次不挂单", margin_limit);
+                                info!("❌ 下单后保证金将超过最大可用保证金{}%（阈值: {:.2} USDC），本次不挂单", app_config.grid.margin_usage_threshold * 100.0, margin_limit);
                                 break;
                             }
                             

@@ -26,8 +26,10 @@ price_precision = 2           # 价格精度，保留2位小数
 quantity_precision = 1        # 数量精度，保留1位小数
 check_interval = 5            # 检查间隔，每5秒检查一次价格
 leverage = 3                  # 杠杆倍数，使用3倍杠杆
-max_active_orders = 3           # 每次最多挂单数量（买/卖各自） 
-fee_rate = 0.0004              # 手续费率，0.04%
+max_active_orders = 3         # 每次最多挂单数量（买/卖各自） 
+fee_rate = 0.0004            # 手续费率，0.04%
+min_profit = 0.01              # 最小盈利阈值，单位USDC
+margin_usage_threshold = 0.8  # 保证金使用率阈值，80%
 
 # 网格策略参数
 min_grid_spacing = 0.002      # 最小网格间距，0.1%，防止网格过密

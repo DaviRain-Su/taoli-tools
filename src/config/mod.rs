@@ -55,6 +55,7 @@ pub struct GridConfig {
     pub max_active_orders: usize, // 每次最多挂单数量（买/卖各自）
     pub fee_rate: f64,           // 手续费率
     pub min_profit: f64,         // 最小盈利阈值
+    pub margin_usage_threshold: f64, // 保证金使用率阈值，默认0.8（80%）
 }
 
 #[derive(Debug, Deserialize)]
