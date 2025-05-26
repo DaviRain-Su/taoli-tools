@@ -539,46 +539,48 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                             
                             let fee_rate = 0.0004; // 0.04%
                             let fee = fill_price * fill_size * fee_rate * 2.0;
-                            let max_acceptable_loss = fee;
-                            let pnl = if fill.side == "B" {
-                                // 买入订单的盈亏
-                                if let Some(entry_price) = sell_entry_prices.get(&fill.oid) {
-                                    (entry_price.parse::<f64>().unwrap_or(0.0) - fill_price) * fill_size
-                                } else {
-                                    0.0
-                                }
+                            let min_profit = 0.01; // 你期望的最小盈利（比如0.01 USDC）
+                            let max_acceptable_loss = fee - min_profit;
+
+                            if fill.side == "B" {
+                                long_avg_price = (long_avg_price * long_position + fill_price * fill_size) / (long_position + fill_size);
+                                long_position += fill_size;
                             } else {
-                                // 卖出订单的盈亏
-                                if let Some(entry_price) = buy_entry_prices.get(&fill.oid) {
-                                    (fill_price - entry_price.parse::<f64>().unwrap_or(0.0)) * fill_size
-                                } else {
-                                    0.0
-                                }
-                            };
-                            
-                            if pnl < max_acceptable_loss {
-                                info!("⚠️ 平多操作将导致亏损({:.4} USDC)，已阻止本次平仓", pnl);
-                                continue;
+                                short_avg_price = (short_avg_price * short_position + fill_price * fill_size) / (short_position + fill_size);
+                                short_position += fill_size;
                             }
                             
                             // 更新每日盈亏
-                            daily_pnl += pnl;
+                            daily_pnl += if fill.side == "B" {
+                                (fill_price - long_avg_price) * fill_size
+                            } else {
+                                (short_avg_price - fill_price) * fill_size
+                            };
                             
                             // 检查单笔亏损限制
-                            if pnl < -grid_config.total_capital * grid_config.max_single_loss {
-                                info!("触发单笔最大亏损限制，执行清仓");
+                            if daily_pnl < -grid_config.total_capital * grid_config.max_daily_loss {
+                                info!("触发每日最大亏损限制，执行清仓");
                                 close_all_positions(&exchange_client, grid_config, long_position, short_position, fill_price).await?;
                                 return Err(GridStrategyError::RiskControlTriggered(format!(
-                                    "触发单笔最大亏损限制: {:.2}", pnl
+                                    "触发每日最大亏损限制: {:.2}", daily_pnl
                                 )));
                             }
                             
-                            if fill.side == "B" {
-                                long_position += fill_size;
-                                long_avg_price = (long_avg_price * long_position + fill_price * fill_size) / (long_position + fill_size);
+                            // 检查单笔亏损限制
+                            if if fill.side == "B" {
+                                (fill_price - long_avg_price) * fill_size
                             } else {
-                                short_position += fill_size;
-                                short_avg_price = (short_avg_price * short_position + fill_price * fill_size) / (short_position + fill_size);
+                                (short_avg_price - fill_price) * fill_size
+                            } < -grid_config.total_capital * grid_config.max_single_loss {
+                                info!("触发单笔最大亏损限制，执行清仓");
+                                close_all_positions(&exchange_client, grid_config, long_position, short_position, fill_price).await?;
+                                return Err(GridStrategyError::RiskControlTriggered(format!(
+                                    "触发单笔最大亏损限制: {:.2}", if fill.side == "B" {
+                                        (fill_price - long_avg_price) * fill_size
+                                    } else {
+                                        (short_avg_price - fill_price) * fill_size
+                                    }
+                                )));
                             }
                             
                             // 更新持仓开始时间
@@ -596,6 +598,19 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                                 buy_entry_prices.remove(&fill.oid);
                             } else {
                                 sell_entry_prices.remove(&fill.oid);
+                            }
+
+                            if fill.side == "S" && long_position > 0.0 {
+                                // 卖出成交，且有多头持仓，视为平多
+                                let pnl = (fill_price - long_avg_price) * fill_size;
+                                if pnl < max_acceptable_loss {
+                                    info!("⚠️ 平多操作将导致亏损({:.4} USDC)，已阻止本次平仓", pnl);
+                                    continue;
+                                }
+                                long_position -= fill_size;
+                                if long_position <= 0.0 {
+                                    long_avg_price = 0.0;
+                                }
                             }
                         }
                     },
