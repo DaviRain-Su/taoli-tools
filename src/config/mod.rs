@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use std::path::Path;
 use config::Config as ConfigBuilder;
+use std::env;
 
 #[derive(Debug, Deserialize)]
 pub struct SpotConfig {
@@ -81,6 +82,10 @@ pub fn load_config(config_path: &Path) -> Result<AppConfig, Box<dyn std::error::
         .add_source(config::File::from(config_path))
         .build()?;
 
-    let config: AppConfig = settings.try_deserialize()?;
+    let mut config: AppConfig = settings.try_deserialize()?;
+     // 优先从环境变量读取 private_key
+     if let Ok(pk) = env::var("PRIVATE_KEY") {
+        config.account.private_key = pk;
+    }
     Ok(config)
 } 
