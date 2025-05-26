@@ -537,8 +537,6 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                             let fill_price: f64 = fill.px.parse()
                                 .map_err(|e| GridStrategyError::PriceParseError(format!("价格解析失败: {:?}", e)))?;
                             
-                            let fee_rate = grid_config.fee_rate;
-                            let fee = fill_price * fill_size * fee_rate * 2.0;
 
                             if fill.side == "B" {
                                 long_avg_price = (long_avg_price * long_position + fill_price * fill_size) / (long_position + fill_size);
