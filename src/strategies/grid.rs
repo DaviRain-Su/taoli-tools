@@ -113,6 +113,17 @@ async fn close_all_positions(
     Ok(())
 }
 
+// 查询账户信息
+async fn get_account_info(
+    info_client: &InfoClient,
+    user_address: ethers::types::Address,
+) -> Result<hyperliquid_rust_sdk::UserStateResponse, GridStrategyError> {
+    info_client
+        .user_state(user_address)
+        .await
+        .map_err(|e| GridStrategyError::ClientError(format!("获取账户信息失败: {:?}", e)))
+}
+
 pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(), GridStrategyError> {
     env_logger::init();
     let grid_config = &app_config.grid;
@@ -169,8 +180,8 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
     // 持仓管理
     let mut long_position = 0.0;
     let mut short_position = 0.0;
-    let mut buy_entry_prices: HashMap<u64, f64> = HashMap::new();
-    let mut sell_entry_prices: HashMap<u64, f64> = HashMap::new();
+    let mut buy_entry_prices: HashMap<u64, String> = HashMap::new();
+    let mut sell_entry_prices: HashMap<u64, String> = HashMap::new();
     let mut max_equity = 0.0;
     let mut daily_pnl = 0.0;
     let mut last_daily_reset = SystemTime::now();
@@ -212,6 +223,15 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                     let current_price: f64 = current_price.parse()
                         .map_err(|e| GridStrategyError::PriceParseError(format!("价格解析失败: {:?}", e)))?;
                     
+                    // 获取实际账户信息
+                    let account_info = get_account_info(&info_client, user_address).await?;
+                    let actual_balance: f64 = account_info.margin_summary.account_value.parse().unwrap_or(0.0);
+                    let actual_margin_used: f64 = account_info.margin_summary.total_margin_used.parse().unwrap_or(0.0);
+                    let actual_available_margin = actual_balance - actual_margin_used;
+                    
+                    info!("账户信息 - 总资产: {}, 已用保证金: {}, 可用保证金: {}", 
+                        actual_balance, actual_margin_used, actual_available_margin);
+
                     // 更新价格历史
                     price_history.push(current_price);
                     if price_history.len() > grid_config.history_length {
@@ -292,14 +312,22 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
 
                     // === 分批分层投入：只挂最近N个买/卖单 ===
                     let max_active_orders = grid_config.max_active_orders as usize;
-                    // 统计当前未成交买单和卖单数量
+                    // 统计当前未成交买单和卖单数量，并计算所有挂单的保证金需求
                     let mut active_buy_orders = 0;
                     let mut active_sell_orders = 0;
+                    let mut pending_buy_margin: f64 = 0.0;
+                    let mut pending_sell_margin: f64 = 0.0;
                     for &oid in &active_orders {
-                        if buy_entry_prices.contains_key(&oid) {
+                        if let Some(price) = buy_entry_prices.get(&oid) {
                             active_buy_orders += 1;
-                        } else if sell_entry_prices.contains_key(&oid) {
+                            let price_f: f64 = price.parse().unwrap_or(0.0);
+                            let quantity = grid_config.trade_amount / price_f;
+                            pending_buy_margin += (quantity * price_f) / grid_config.leverage as f64;
+                        } else if let Some(price) = sell_entry_prices.get(&oid) {
                             active_sell_orders += 1;
+                            let price_f: f64 = price.parse().unwrap_or(0.0);
+                            let quantity = grid_config.trade_amount / price_f;
+                            pending_sell_margin += (quantity * price_f) / grid_config.leverage as f64;
                         }
                     }
 
@@ -314,10 +342,21 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                             let formatted_price = format_price(price, grid_config.price_precision);
                             let quantity = format_price(grid_config.trade_amount / formatted_price, grid_config.quantity_precision);
                             let order_capital = quantity * formatted_price;
-                            if order_capital > available_capital {
-                                info!("剩余资金不足，停止买单挂单");
+                            let order_margin = order_capital / grid_config.leverage as f64;
+                            
+                            // 使用实际账户数据检查保证金
+                            let total_margin = actual_margin_used + pending_buy_margin + pending_sell_margin + order_margin;
+                            if total_margin > actual_balance {
+                                info!("下单后保证金将超过账户总资产，停止买单挂单");
                                 break;
                             }
+                            
+                            let future_position = long_position + quantity;
+                            if future_position > grid_config.max_position {
+                                info!("下单后多头持仓将超限，停止买单挂单");
+                                break;
+                            }
+
                             let order = ClientOrderRequest {
                                 asset: grid_config.trading_asset.clone(),
                                 is_buy: true,
@@ -338,8 +377,9 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                                                 info!("买单已提交: ID={}, 价格={}, 数量={}", 
                                                     order.oid, formatted_price, quantity);
                                                 active_orders.push(order.oid);
-                                                buy_entry_prices.insert(order.oid, formatted_price);
+                                                buy_entry_prices.insert(order.oid, formatted_price.to_string());
                                                 buy_count += 1;
+                                                pending_buy_margin += order_margin;
                                             }
                                         }
                                     }
@@ -362,10 +402,21 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                             let formatted_price = format_price(price, grid_config.price_precision);
                             let quantity = format_price(grid_config.trade_amount / formatted_price, grid_config.quantity_precision);
                             let order_capital = quantity * formatted_price;
-                            if order_capital > available_capital {
-                                info!("剩余资金不足，停止卖单挂单");
+                            let order_margin = order_capital / grid_config.leverage as f64;
+                            
+                            // 使用实际账户数据检查保证金
+                            let total_margin = actual_margin_used + pending_buy_margin + pending_sell_margin + order_margin;
+                            if total_margin > actual_balance {
+                                info!("下单后保证金将超过账户总资产，停止卖单挂单");
                                 break;
                             }
+                            
+                            let future_position = short_position + quantity;
+                            if future_position > grid_config.max_position {
+                                info!("下单后空头持仓将超限，停止卖单挂单");
+                                break;
+                            }
+
                             let order = ClientOrderRequest {
                                 asset: grid_config.trading_asset.clone(),
                                 is_buy: false,
@@ -386,8 +437,9 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                                                 info!("卖单已提交: ID={}, 价格={}, 数量={}", 
                                                     order.oid, formatted_price, quantity);
                                                 active_orders.push(order.oid);
-                                                sell_entry_prices.insert(order.oid, formatted_price);
+                                                sell_entry_prices.insert(order.oid, formatted_price.to_string());
                                                 sell_count += 1;
+                                                pending_sell_margin += order_margin;
                                             }
                                         }
                                     }
@@ -407,6 +459,9 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                     info!("当前权益: {}", current_equity);
                     info!("每日盈亏: {}", daily_pnl);
                     info!("活跃订单数量: {}", active_orders.len());
+                    info!("实际账户总资产: {}", actual_balance);
+                    info!("实际已用保证金: {}", actual_margin_used);
+                    info!("实际可用保证金: {}", actual_available_margin);
                 }
             },
             Some(Message::User(user_event)) => {
@@ -427,14 +482,14 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                             let pnl = if fill.side == "B" {
                                 // 买入订单的盈亏
                                 if let Some(entry_price) = sell_entry_prices.get(&fill.oid) {
-                                    (entry_price - fill_price) * fill_size
+                                    (entry_price.parse::<f64>().unwrap_or(0.0) - fill_price) * fill_size
                                 } else {
                                     0.0
                                 }
                             } else {
                                 // 卖出订单的盈亏
                                 if let Some(entry_price) = buy_entry_prices.get(&fill.oid) {
-                                    (fill_price - entry_price) * fill_size
+                                    (fill_price - entry_price.parse::<f64>().unwrap_or(0.0)) * fill_size
                                 } else {
                                     0.0
                                 }
