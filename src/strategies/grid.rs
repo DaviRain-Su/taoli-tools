@@ -229,7 +229,7 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                     
                     // 获取实际账户信息
                     let account_info = get_account_info(&info_client, user_address).await?;
-                    info!("完整账户信息: {:?}", account_info);
+                    //info!("完整账户信息: {:?}", account_info);
 
                     // 用 withdrawable 字段作为 USDC 可用余额
                     let usdc_balance = account_info.withdrawable.parse().unwrap_or(0.0);
@@ -348,11 +348,20 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                             let order_margin = order_capital / grid_config.leverage as f64;
                             
                             // 使用实际账户数据检查保证金
-                            let total_margin = usdc_balance + pending_buy_margin + pending_sell_margin + order_margin;
-                            info!("保证金检查 - 当前已用: {}, 待用买单: {}, 待用卖单: {}, 新订单: {}, 总计: {}", 
-                                usdc_balance, pending_buy_margin, pending_sell_margin, order_margin, total_margin);
+                            let actual_margin_used = account_info.margin_summary.total_margin_used.parse().unwrap_or(0.0);
+                            let total_margin = actual_margin_used + pending_buy_margin + pending_sell_margin + order_margin;
+                            info!(
+                                "\n🛡️ [风控检查] 保证金明细：\
+                                \n   💰 已用保证金      : {:>12.4} USDC\
+                                \n   🟢 待用买单保证金  : {:>12.4} USDC\
+                                \n   🔴 待用卖单保证金  : {:>12.4} USDC\
+                                \n   📝 新订单保证金    : {:>12.4} USDC\
+                                \n   🧮 总计保证金需求  : {:>12.4} USDC\
+                                \n   💵 可用余额        : {:>12.4} USDC",
+                                actual_margin_used, pending_buy_margin, pending_sell_margin, order_margin, total_margin, usdc_balance
+                            );
                             if total_margin > usdc_balance * 0.9 {
-                                info!("下单后保证金将超过有效余额的90%，停止买单挂单");
+                                info!("❌ 下单后保证金将超过可用余额的90%（阈值: {:.2} USDC），本次不挂单", usdc_balance * 0.9);
                                 break;
                             }
                             
@@ -379,7 +388,7 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                                     if let Some(data) = response.data {
                                         if !data.statuses.is_empty() {
                                             if let ExchangeDataStatus::Resting(order) = &data.statuses[0] {
-                                                info!("买单已提交: ID={}, 价格={}, 数量={}", 
+                                                info!("✅ 买单已提交: ID={}, 价格={}, 数量={}", 
                                                     order.oid, formatted_price, quantity);
                                                 active_orders.push(order.oid);
                                                 buy_entry_prices.insert(order.oid, formatted_price.to_string());
@@ -389,8 +398,8 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                                         }
                                     }
                                 },
-                                Ok(ExchangeResponseStatus::Err(e)) => warn!("买单失败: {:?}", e),
-                                Err(e) => warn!("买单失败: {:?}", e),
+                                Ok(ExchangeResponseStatus::Err(e)) => warn!("❌ 买单失败: {:?}", e),
+                                Err(e) => warn!("❌ 买单失败: {:?}", e),
                             }
                             available_capital -= order_capital;
                         }
@@ -410,11 +419,20 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                             let order_margin = order_capital / grid_config.leverage as f64;
                             
                             // 使用实际账户数据检查保证金
-                            let total_margin = usdc_balance + pending_buy_margin + pending_sell_margin + order_margin;
-                            info!("保证金检查 - 当前已用: {}, 待用买单: {}, 待用卖单: {}, 新订单: {}, 总计: {}", 
-                                usdc_balance, pending_buy_margin, pending_sell_margin, order_margin, total_margin);
+                            let actual_margin_used = account_info.margin_summary.total_margin_used.parse().unwrap_or(0.0);
+                            let total_margin = actual_margin_used + pending_buy_margin + pending_sell_margin + order_margin;
+                            info!(
+                                "\n🛡️ [风控检查] 保证金明细：\
+                                \n   💰 已用保证金      : {:>12.4} USDC\
+                                \n   🟢 待用买单保证金  : {:>12.4} USDC\
+                                \n   🔴 待用卖单保证金  : {:>12.4} USDC\
+                                \n   📝 新订单保证金    : {:>12.4} USDC\
+                                \n   🧮 总计保证金需求  : {:>12.4} USDC\
+                                \n   💵 可用余额        : {:>12.4} USDC",
+                                actual_margin_used, pending_buy_margin, pending_sell_margin, order_margin, total_margin, usdc_balance
+                            );
                             if total_margin > usdc_balance * 0.9 {
-                                info!("下单后保证金将超过有效余额的90%，停止卖单挂单");
+                                info!("❌ 下单后保证金将超过可用余额的90%（阈值: {:.2} USDC），本次不挂单", usdc_balance * 0.9);
                                 break;
                             }
                             
@@ -441,7 +459,7 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                                     if let Some(data) = response.data {
                                         if !data.statuses.is_empty() {
                                             if let ExchangeDataStatus::Resting(order) = &data.statuses[0] {
-                                                info!("卖单已提交: ID={}, 价格={}, 数量={}", 
+                                                info!("✅ 卖单已提交: ID={}, 价格={}, 数量={}", 
                                                     order.oid, formatted_price, quantity);
                                                 active_orders.push(order.oid);
                                                 sell_entry_prices.insert(order.oid, formatted_price.to_string());
@@ -451,22 +469,26 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                                         }
                                     }
                                 },
-                                Ok(ExchangeResponseStatus::Err(e)) => warn!("卖单失败: {:?}", e),
-                                Err(e) => warn!("卖单失败: {:?}", e),
+                                Ok(ExchangeResponseStatus::Err(e)) => warn!("❌ 卖单失败: {:?}", e),
+                                Err(e) => warn!("❌ 卖单失败: {:?}", e),
                             }
                             available_capital -= order_capital;
                         }
                     }
 
                     // 打印当前状态
-                    info!("\n=== 当前状态 ===");
-                    info!("多头持仓: {}", long_position);
-                    info!("空头持仓: {}", short_position);
-                    info!("最大权益: {}", max_equity);
-                    info!("当前权益: {}", current_equity);
-                    info!("每日盈亏: {}", daily_pnl);
-                    info!("活跃订单数量: {}", active_orders.len());
-                    info!("实际账户总资产: {}", usdc_balance);
+                    info!(
+                        "\n📊 ====== 当前账户状态 ======\
+                        \n  🟩 多头持仓      : {:>10.4}\
+                        \n  🟥 空头持仓      : {:>10.4}\
+                        \n  🏆 最大权益      : {:>10.2} USDC\
+                        \n  💎 当前权益      : {:>10.2} USDC\
+                        \n  📈 每日盈亏      : {:>10.2} USDC\
+                        \n  📝 活跃订单数量  : {:>10}\
+                        \n  💵 账户可用余额  : {:>10.2} USDC\
+                        \n==============================",
+                        long_position, short_position, max_equity, current_equity, daily_pnl, active_orders.len(), usdc_balance
+                    );
                 }
             },
             Some(Message::User(user_event)) => {
@@ -474,8 +496,10 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                 match user_event.data {
                     UserData::Fills(fills) => {
                         for fill in fills {
-                            info!("订单成交: ID={}, 价格={}, 数量={}, 方向={}", 
-                                fill.oid, fill.px, fill.sz, if fill.side == "B" { "买入" } else { "卖出" });
+                            info!(
+                                "🎯 订单成交: ID={}, 价格={}, 数量={}, 方向={}",
+                                fill.oid, fill.px, fill.sz, if fill.side == "B" { "🟩 买入" } else { "🟥 卖出" }
+                            );
                             
                             // 更新持仓
                             let fill_size: f64 = fill.sz.parse()
