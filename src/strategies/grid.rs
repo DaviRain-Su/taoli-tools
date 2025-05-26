@@ -37,6 +37,14 @@ pub enum GridStrategyError {
     RiskControlTriggered(String),
 }
 
+// 订单信息结构体
+#[derive(Debug, Clone)]
+struct OrderInfo {
+    price: f64,
+    quantity: f64,
+    cost_price: Option<f64>, // 对于卖单，记录对应的买入成本价
+}
+
 // 格式化价格到指定精度
 fn format_price(price: f64, precision: u32) -> f64 {
     let multiplier = 10.0_f64.powi(precision as i32);
@@ -66,6 +74,335 @@ fn calculate_amplitude(klines: &[f64]) -> (f64, f64) {
     } else { 0.0 };
     
     (avg_positive, avg_negative)
+}
+
+// 计算考虑手续费后的最小卖出价格
+fn calculate_min_sell_price(buy_price: f64, fee_rate: f64, min_profit_rate: f64) -> f64 {
+    let buy_cost = buy_price * (1.0 + fee_rate);
+    buy_cost * (1.0 + min_profit_rate) / (1.0 - fee_rate)
+}
+
+// 计算预期利润率
+fn calculate_expected_profit_rate(buy_price: f64, sell_price: f64, fee_rate: f64) -> f64 {
+    let buy_cost = buy_price * (1.0 + fee_rate);
+    let sell_revenue = sell_price * (1.0 - fee_rate);
+    (sell_revenue - buy_cost) / buy_cost
+}
+
+// 验证网格配置参数
+fn validate_grid_config(grid_config: &crate::config::GridConfig) -> Result<(), GridStrategyError> {
+    // 检查基本参数
+    if grid_config.total_capital <= 0.0 {
+        return Err(GridStrategyError::ConfigError("总资金必须大于0".to_string()));
+    }
+    
+    if grid_config.trade_amount <= 0.0 {
+        return Err(GridStrategyError::ConfigError("每格交易金额必须大于0".to_string()));
+    }
+    
+    if grid_config.trade_amount > grid_config.total_capital {
+        return Err(GridStrategyError::ConfigError("每格交易金额不能超过总资金".to_string()));
+    }
+    
+    if grid_config.max_position <= 0.0 {
+        return Err(GridStrategyError::ConfigError("最大持仓必须大于0".to_string()));
+    }
+    
+    if grid_config.grid_count == 0 {
+        return Err(GridStrategyError::ConfigError("网格数量必须大于0".to_string()));
+    }
+    
+    // 检查网格间距
+    if grid_config.min_grid_spacing <= 0.0 {
+        return Err(GridStrategyError::ConfigError("最小网格间距必须大于0".to_string()));
+    }
+    
+    if grid_config.max_grid_spacing <= grid_config.min_grid_spacing {
+        return Err(GridStrategyError::ConfigError("最大网格间距必须大于最小网格间距".to_string()));
+    }
+    
+    // 检查手续费率
+    if grid_config.fee_rate < 0.0 || grid_config.fee_rate > 0.1 {
+        return Err(GridStrategyError::ConfigError("手续费率必须在0-10%之间".to_string()));
+    }
+    
+    // 检查网格间距是否足够覆盖手续费
+    let min_required_spacing = grid_config.fee_rate * 2.5; // 至少是手续费的2.5倍
+    if grid_config.min_grid_spacing < min_required_spacing {
+        return Err(GridStrategyError::ConfigError(format!(
+            "最小网格间距({:.4}%)过小，无法覆盖手续费成本，建议至少设置为{:.4}%",
+            grid_config.min_grid_spacing * 100.0,
+            min_required_spacing * 100.0
+        )));
+    }
+    
+    // 检查风险控制参数
+    if grid_config.max_drawdown <= 0.0 || grid_config.max_drawdown > 1.0 {
+        return Err(GridStrategyError::ConfigError("最大回撤必须在0-100%之间".to_string()));
+    }
+    
+    if grid_config.max_single_loss <= 0.0 || grid_config.max_single_loss > 1.0 {
+        return Err(GridStrategyError::ConfigError("单笔最大亏损必须在0-100%之间".to_string()));
+    }
+    
+    if grid_config.max_daily_loss <= 0.0 || grid_config.max_daily_loss > 1.0 {
+        return Err(GridStrategyError::ConfigError("每日最大亏损必须在0-100%之间".to_string()));
+    }
+    
+    // 检查杠杆倍数
+    if grid_config.leverage == 0 || grid_config.leverage > 100 {
+        return Err(GridStrategyError::ConfigError("杠杆倍数必须在1-100之间".to_string()));
+    }
+    
+    // 检查精度设置
+    if grid_config.price_precision > 8 {
+        return Err(GridStrategyError::ConfigError("价格精度不能超过8位小数".to_string()));
+    }
+    
+    if grid_config.quantity_precision > 8 {
+        return Err(GridStrategyError::ConfigError("数量精度不能超过8位小数".to_string()));
+    }
+    
+    // 检查时间参数
+    if grid_config.check_interval == 0 {
+        return Err(GridStrategyError::ConfigError("检查间隔必须大于0秒".to_string()));
+    }
+    
+    if grid_config.max_holding_time == 0 {
+        return Err(GridStrategyError::ConfigError("最大持仓时间必须大于0秒".to_string()));
+    }
+    
+    // 检查保证金使用率
+    if grid_config.margin_usage_threshold <= 0.0 || grid_config.margin_usage_threshold > 1.0 {
+        return Err(GridStrategyError::ConfigError("保证金使用率阈值必须在0-100%之间".to_string()));
+    }
+    
+    info!("✅ 网格配置验证通过");
+    Ok(())
+}
+
+// 处理买单成交
+async fn handle_buy_fill(
+    exchange_client: &ExchangeClient,
+    grid_config: &crate::config::GridConfig,
+    fill_price: f64,
+    fill_size: f64,
+    grid_spacing: f64,
+    active_orders: &mut Vec<u64>,
+    buy_orders: &mut HashMap<u64, OrderInfo>,
+    sell_orders: &mut HashMap<u64, OrderInfo>,
+) -> Result<(), GridStrategyError> {
+    info!("🟢 处理买单成交: 价格={}, 数量={}", fill_price, fill_size);
+    
+    // 计算基础卖出价格
+    let base_sell_price = fill_price * (1.0 + grid_spacing);
+    
+    // 计算考虑手续费和最小利润的实际卖出价格
+    let min_sell_price = calculate_min_sell_price(fill_price, grid_config.fee_rate, grid_config.min_profit / fill_price);
+    let actual_sell_price = base_sell_price.max(min_sell_price);
+    let formatted_sell_price = format_price(actual_sell_price, grid_config.price_precision);
+    
+    // 检查是否超出网格上限
+    let upper_limit = fill_price * (1.0 + grid_config.max_grid_spacing * grid_config.grid_count as f64);
+    if formatted_sell_price > upper_limit {
+        warn!("⚠️ 卖出价格({:.4})超出网格上限({:.4})，可能影响网格完整性", formatted_sell_price, upper_limit);
+    }
+    
+    // 考虑买入时的手续费损失，调整卖出数量
+    let sell_quantity = format_price(fill_size * (1.0 - grid_config.fee_rate), grid_config.quantity_precision);
+    
+    // 创建卖单
+    let sell_order = ClientOrderRequest {
+        asset: grid_config.trading_asset.clone(),
+        is_buy: false,
+        reduce_only: false,
+        limit_px: formatted_sell_price,
+        sz: sell_quantity,
+        cloid: None,
+        order_type: ClientOrder::Limit(ClientLimit {
+            tif: "Gtc".to_string(),
+        }),
+    };
+    
+    match exchange_client.order(sell_order, None).await {
+        Ok(ExchangeResponseStatus::Ok(response)) => {
+            if let Some(data) = response.data {
+                if !data.statuses.is_empty() {
+                    if let ExchangeDataStatus::Resting(order) = &data.statuses[0] {
+                        info!("🔴【对冲卖单】✅ 卖单已提交: ID={}, 价格={}, 数量={}, 成本价={}", 
+                            order.oid, formatted_sell_price, sell_quantity, fill_price);
+                        active_orders.push(order.oid);
+                        sell_orders.insert(order.oid, OrderInfo {
+                            price: formatted_sell_price,
+                            quantity: sell_quantity,
+                            cost_price: Some(fill_price),
+                        });
+                    }
+                }
+            }
+        },
+        Ok(ExchangeResponseStatus::Err(e)) => warn!("❌ 对冲卖单失败: {:?}", e),
+        Err(e) => warn!("❌ 对冲卖单失败: {:?}", e),
+    }
+    
+    // 在相同价格重新创建买单
+    let new_buy_order = ClientOrderRequest {
+        asset: grid_config.trading_asset.clone(),
+        is_buy: true,
+        reduce_only: false,
+        limit_px: fill_price,
+        sz: fill_size,
+        cloid: None,
+        order_type: ClientOrder::Limit(ClientLimit {
+            tif: "Gtc".to_string(),
+        }),
+    };
+    
+    match exchange_client.order(new_buy_order, None).await {
+        Ok(ExchangeResponseStatus::Ok(response)) => {
+            if let Some(data) = response.data {
+                if !data.statuses.is_empty() {
+                    if let ExchangeDataStatus::Resting(order) = &data.statuses[0] {
+                        info!("🟢【重建买单】✅ 买单已提交: ID={}, 价格={}, 数量={}", 
+                            order.oid, fill_price, fill_size);
+                        active_orders.push(order.oid);
+                        buy_orders.insert(order.oid, OrderInfo {
+                            price: fill_price,
+                            quantity: fill_size,
+                            cost_price: None,
+                        });
+                    }
+                }
+            }
+        },
+        Ok(ExchangeResponseStatus::Err(e)) => warn!("❌ 重建买单失败: {:?}", e),
+        Err(e) => warn!("❌ 重建买单失败: {:?}", e),
+    }
+    
+    Ok(())
+}
+
+// 处理卖单成交
+async fn handle_sell_fill(
+    exchange_client: &ExchangeClient,
+    grid_config: &crate::config::GridConfig,
+    fill_price: f64,
+    fill_size: f64,
+    cost_price: Option<f64>,
+    grid_spacing: f64,
+    active_orders: &mut Vec<u64>,
+    buy_orders: &mut HashMap<u64, OrderInfo>,
+    sell_orders: &mut HashMap<u64, OrderInfo>,
+) -> Result<(), GridStrategyError> {
+    info!("🔴 处理卖单成交: 价格={}, 数量={}, 成本价={:?}", fill_price, fill_size, cost_price);
+    
+    // 计算实际利润
+    let actual_cost_price = cost_price.unwrap_or_else(|| {
+        let estimated = fill_price - grid_spacing * fill_price;
+        warn!("⚠️ 未找到成本价，估算为: {:.4}", estimated);
+        estimated
+    });
+    
+    let actual_profit_rate = calculate_expected_profit_rate(actual_cost_price, fill_price, grid_config.fee_rate);
+    
+    info!("💰 交易完成 - 成本价: {:.4}, 卖出价: {:.4}, 利润率: {:.4}%", 
+        actual_cost_price, fill_price, actual_profit_rate * 100.0);
+    
+    // 计算潜在买入价格
+    let base_buy_price = fill_price * (1.0 - grid_spacing);
+    let formatted_buy_price = format_price(base_buy_price, grid_config.price_precision);
+    
+    // 检查新买入点的预期利润率
+    let potential_sell_price = formatted_buy_price * (1.0 + grid_spacing);
+    let expected_profit_rate = calculate_expected_profit_rate(formatted_buy_price, potential_sell_price, grid_config.fee_rate);
+    let min_profit_rate = grid_config.min_profit / (formatted_buy_price * grid_config.trade_amount / formatted_buy_price);
+    
+    if expected_profit_rate >= min_profit_rate {
+        let buy_quantity = format_price(grid_config.trade_amount / formatted_buy_price, grid_config.quantity_precision);
+        
+        // 创建新买单
+        let new_buy_order = ClientOrderRequest {
+            asset: grid_config.trading_asset.clone(),
+            is_buy: true,
+            reduce_only: false,
+            limit_px: formatted_buy_price,
+            sz: buy_quantity,
+            cloid: None,
+            order_type: ClientOrder::Limit(ClientLimit {
+                tif: "Gtc".to_string(),
+            }),
+        };
+        
+        match exchange_client.order(new_buy_order, None).await {
+            Ok(ExchangeResponseStatus::Ok(response)) => {
+                if let Some(data) = response.data {
+                    if !data.statuses.is_empty() {
+                        if let ExchangeDataStatus::Resting(order) = &data.statuses[0] {
+                            info!("🟢【新买单】✅ 买单已提交: ID={}, 价格={}, 数量={}, 预期利润率={:.4}%", 
+                                order.oid, formatted_buy_price, buy_quantity, expected_profit_rate * 100.0);
+                            active_orders.push(order.oid);
+                            buy_orders.insert(order.oid, OrderInfo {
+                                price: formatted_buy_price,
+                                quantity: buy_quantity,
+                                cost_price: None,
+                            });
+                        }
+                    }
+                }
+            },
+            Ok(ExchangeResponseStatus::Err(e)) => warn!("❌ 新买单失败: {:?}", e),
+            Err(e) => warn!("❌ 新买单失败: {:?}", e),
+        }
+    } else {
+        warn!("⚠️ 网格点 {:.4} 的预期利润率({:.4}%)不满足最小要求({:.4}%)，跳过此买单", 
+            formatted_buy_price, expected_profit_rate * 100.0, min_profit_rate * 100.0);
+    }
+    
+    // 根据策略决定是否在相同价格再次创建卖单
+    // 检查是否有足够的资产和是否应该在相同价格创建卖单
+    let should_recreate_sell = actual_profit_rate > 0.0; // 只有盈利的情况下才重建卖单
+    
+    if should_recreate_sell {
+        // 在相同价格重新创建卖单
+        let new_sell_order = ClientOrderRequest {
+            asset: grid_config.trading_asset.clone(),
+            is_buy: false,
+            reduce_only: false,
+            limit_px: fill_price,
+            sz: fill_size,
+            cloid: None,
+            order_type: ClientOrder::Limit(ClientLimit {
+                tif: "Gtc".to_string(),
+            }),
+        };
+        
+        match exchange_client.order(new_sell_order, None).await {
+            Ok(ExchangeResponseStatus::Ok(response)) => {
+                if let Some(data) = response.data {
+                    if !data.statuses.is_empty() {
+                        if let ExchangeDataStatus::Resting(order) = &data.statuses[0] {
+                            info!("🔴【重建卖单】✅ 卖单已提交: ID={}, 价格={}, 数量={}", 
+                                order.oid, fill_price, fill_size);
+                            active_orders.push(order.oid);
+                            // 估算新卖单的成本价（当前价格减去网格间距）
+                            let estimated_cost_price = fill_price * (1.0 - grid_spacing);
+                            sell_orders.insert(order.oid, OrderInfo {
+                                price: fill_price,
+                                quantity: fill_size,
+                                cost_price: Some(estimated_cost_price),
+                            });
+                        }
+                    }
+                }
+            },
+            Ok(ExchangeResponseStatus::Err(e)) => warn!("❌ 重建卖单失败: {:?}", e),
+            Err(e) => warn!("❌ 重建卖单失败: {:?}", e),
+        }
+    } else {
+        info!("📊 利润率不足或策略不建议重建卖单，跳过重建");
+    }
+    
+    Ok(())
 }
 
 // 清仓函数
@@ -128,6 +465,9 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
     env_logger::init();
     let grid_config = &app_config.grid;
     
+    // 验证配置参数
+    validate_grid_config(grid_config)?;
+    
     // 从配置文件读取私钥
     let private_key = &app_config.account.private_key;
     
@@ -184,14 +524,15 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
     // 持仓管理
     let mut long_position = 0.0;
     let mut short_position = 0.0;
-    let mut buy_entry_prices: HashMap<u64, String> = HashMap::new();
-    let mut sell_entry_prices: HashMap<u64, String> = HashMap::new();
+    let mut buy_orders: HashMap<u64, OrderInfo> = HashMap::new();
+    let mut sell_orders: HashMap<u64, OrderInfo> = HashMap::new();
     let mut max_equity = 0.0;
     let mut daily_pnl = 0.0;
     let mut last_daily_reset = SystemTime::now();
     let mut position_start_time: Option<SystemTime> = None;
     let mut long_avg_price = 0.0;
     let mut short_avg_price = 0.0;
+    let mut current_grid_spacing = grid_config.min_grid_spacing; // 当前网格间距
 
     // 价格历史记录
     let mut price_history: Vec<f64> = Vec::new();
@@ -246,7 +587,7 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                     // 计算波动率并调整网格间距
                     let (avg_up, avg_down) = calculate_amplitude(&price_history);
                     let volatility = (avg_up + avg_down) / 2.0;
-                    let grid_spacing = volatility.max(grid_config.min_grid_spacing).min(grid_config.max_grid_spacing);
+                    current_grid_spacing = volatility.max(grid_config.min_grid_spacing).min(grid_config.max_grid_spacing);
                     
                     // 打印价格变化
                     if let Some(last) = last_price {
@@ -254,7 +595,7 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                         info!("价格变化: {:.4}% (从 {:.4} 到 {:.4})", 
                             price_change, last, current_price);
                         info!("当前波动率: {:.8}%, 网格间距: {:.8}%", 
-                            volatility * 100.0, grid_spacing * 100.0);
+                            volatility * 100.0, current_grid_spacing * 100.0);
                     }
                     last_price = Some(current_price);
 
@@ -312,8 +653,8 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                     active_orders.clear();
 
                     // 计算网格价格
-                    let buy_threshold = grid_spacing / 2.0;
-                    let sell_threshold = grid_spacing / 2.0;
+                    let buy_threshold = current_grid_spacing / 2.0;
+                    let sell_threshold = current_grid_spacing / 2.0;
 
                     // === 分批分层投入：只挂最近N个买/卖单 ===
                     let max_active_orders = grid_config.max_active_orders as usize;
@@ -323,16 +664,12 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                     let mut pending_buy_margin: f64 = 0.0;
                     let mut pending_sell_margin: f64 = 0.0;
                     for &oid in &active_orders {
-                        if let Some(price) = buy_entry_prices.get(&oid) {
+                        if let Some(order_info) = buy_orders.get(&oid) {
                             active_buy_orders += 1;
-                            let price_f: f64 = price.parse().unwrap_or(0.0);
-                            let quantity = grid_config.trade_amount / price_f;
-                            pending_buy_margin += (quantity * price_f) / grid_config.leverage as f64;
-                        } else if let Some(price) = sell_entry_prices.get(&oid) {
+                            pending_buy_margin += (order_info.quantity * order_info.price) / grid_config.leverage as f64;
+                        } else if let Some(order_info) = sell_orders.get(&oid) {
                             active_sell_orders += 1;
-                            let price_f: f64 = price.parse().unwrap_or(0.0);
-                            let quantity = grid_config.trade_amount / price_f;
-                            pending_sell_margin += (quantity * price_f) / grid_config.leverage as f64;
+                            pending_sell_margin += (order_info.quantity * order_info.price) / grid_config.leverage as f64;
                         }
                     }
 
@@ -344,7 +681,7 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                             if active_buy_orders + buy_count >= max_active_orders {
                                 break;
                             }
-                            let price = current_price * (1.0 - buy_threshold - i as f64 * grid_spacing);
+                            let price = current_price * (1.0 - buy_threshold - i as f64 * current_grid_spacing);
                             let formatted_price = format_price(price, grid_config.price_precision);
                             let quantity = format_price(grid_config.trade_amount / formatted_price, grid_config.quantity_precision);
                             let order_capital = quantity * formatted_price;
@@ -389,8 +726,8 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
 
                             let fee_rate = grid_config.fee_rate;
                             let min_grid_spacing = 2.0 * fee_rate;
-                            if grid_spacing < min_grid_spacing {
-                                info!("❌ 网格间距({:.4}%)过小，无法覆盖手续费({:.4}%)，本次不挂单", grid_spacing * 100.0, min_grid_spacing * 100.0);
+                            if current_grid_spacing < min_grid_spacing {
+                                info!("❌ 网格间距({:.4}%)过小，无法覆盖手续费({:.4}%)，本次不挂单", current_grid_spacing * 100.0, min_grid_spacing * 100.0);
                                 break;
                             }
                             // === 最小盈利阈值风控 ===
@@ -414,7 +751,11 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                                                 info!("🟢【买单】✅ 买单已提交: ID={}, 价格={}, 数量={}", 
                                                     order.oid, formatted_price, quantity);
                                                 active_orders.push(order.oid);
-                                                buy_entry_prices.insert(order.oid, formatted_price.to_string());
+                                                buy_orders.insert(order.oid, OrderInfo {
+                                                    price: formatted_price,
+                                                    quantity,
+                                                    cost_price: None,
+                                                });
                                                 buy_count += 1;
                                                 pending_buy_margin += order_margin;
                                             }
@@ -435,7 +776,7 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                             if active_sell_orders + sell_count >= max_active_orders {
                                 break;
                             }
-                            let price = current_price * (1.0 + sell_threshold + i as f64 * grid_spacing);
+                            let price = current_price * (1.0 + sell_threshold + i as f64 * current_grid_spacing);
                             let formatted_price = format_price(price, grid_config.price_precision);
                             let quantity = format_price(grid_config.trade_amount / formatted_price, grid_config.quantity_precision);
                             let order_capital = quantity * formatted_price;
@@ -480,8 +821,8 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
 
                             let fee_rate = grid_config.fee_rate;
                             let min_grid_spacing = 2.0 * fee_rate;
-                            if grid_spacing < min_grid_spacing {
-                                info!("❌ 网格间距({:.4}%)过小，无法覆盖手续费({:.4}%)，本次不挂单", grid_spacing * 100.0, min_grid_spacing * 100.0);
+                            if current_grid_spacing < min_grid_spacing {
+                                info!("❌ 网格间距({:.4}%)过小，无法覆盖手续费({:.4}%)，本次不挂单", current_grid_spacing * 100.0, min_grid_spacing * 100.0);
                                 break;
                             }
                             // === 最小盈利阈值风控 ===
@@ -505,7 +846,11 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                                                 info!("🔴【卖单】✅ 卖单已提交: ID={}, 价格={}, 数量={}", 
                                                     order.oid, formatted_price, quantity);
                                                 active_orders.push(order.oid);
-                                                sell_entry_prices.insert(order.oid, formatted_price.to_string());
+                                                sell_orders.insert(order.oid, OrderInfo {
+                                                    price: formatted_price,
+                                                    quantity,
+                                                    cost_price: None,
+                                                });
                                                 sell_count += 1;
                                                 pending_sell_margin += order_margin;
                                             }
@@ -602,11 +947,59 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                                 active_orders.remove(pos);
                             }
                             
-                            // 从价格记录中移除
+                            // 使用新的智能订单处理逻辑
                             if fill.side == "B" {
-                                buy_entry_prices.remove(&fill.oid);
+                                // 买单成交，使用新的处理逻辑
+                                if let Some(order_info) = buy_orders.remove(&fill.oid) {
+                                    info!("📋 原始买单信息: 价格={}, 数量={}", order_info.price, order_info.quantity);
+                                    
+                                    // 验证成交信息与原始订单是否匹配
+                                    if (fill_price - order_info.price).abs() > 0.0001 {
+                                        warn!("⚠️ 成交价格({})与订单价格({})不匹配", fill_price, order_info.price);
+                                    }
+                                    
+                                    if let Err(e) = handle_buy_fill(
+                                        &exchange_client,
+                                        grid_config,
+                                        fill_price,
+                                        fill_size,
+                                        current_grid_spacing,
+                                        &mut active_orders,
+                                        &mut buy_orders,
+                                        &mut sell_orders,
+                                    ).await {
+                                        warn!("处理买单成交失败: {:?}", e);
+                                    }
+                                } else {
+                                    warn!("⚠️ 未找到买单订单信息: ID={}", fill.oid);
+                                }
                             } else {
-                                sell_entry_prices.remove(&fill.oid);
+                                // 卖单成交，使用新的处理逻辑
+                                if let Some(order_info) = sell_orders.remove(&fill.oid) {
+                                    info!("📋 原始卖单信息: 价格={}, 数量={}, 成本价={:?}", 
+                                        order_info.price, order_info.quantity, order_info.cost_price);
+                                    
+                                    // 验证成交信息与原始订单是否匹配
+                                    if (fill_price - order_info.price).abs() > 0.0001 {
+                                        warn!("⚠️ 成交价格({})与订单价格({})不匹配", fill_price, order_info.price);
+                                    }
+                                    
+                                    if let Err(e) = handle_sell_fill(
+                                        &exchange_client,
+                                        grid_config,
+                                        fill_price,
+                                        fill_size,
+                                        order_info.cost_price,
+                                        current_grid_spacing,
+                                        &mut active_orders,
+                                        &mut buy_orders,
+                                        &mut sell_orders,
+                                    ).await {
+                                        warn!("处理卖单成交失败: {:?}", e);
+                                    }
+                                } else {
+                                    warn!("⚠️ 未找到卖单订单信息: ID={}", fill.oid);
+                                }
                             }
 
                             if fill.side == "S" && long_position > 0.0 {
