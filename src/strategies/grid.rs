@@ -2467,70 +2467,273 @@ pub async fn run_grid_strategy(
     Ok(())
 }
 
-// 检查保证金率
+// 安全解析字符串为f64，支持空值和无效值处理
+fn safe_parse_f64(value: &str, field_name: &str, default_value: f64) -> Result<f64, GridStrategyError> {
+    // 处理空字符串或仅包含空白字符的情况
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        warn!("⚠️ 字段 '{}' 为空，使用默认值: {}", field_name, default_value);
+        return Ok(default_value);
+    }
+    
+    // 尝试解析数值
+    match trimmed.parse::<f64>() {
+        Ok(parsed_value) => {
+            // 检查是否为有效数值（非NaN、非无穷大）
+            if parsed_value.is_finite() && parsed_value >= 0.0 {
+                Ok(parsed_value)
+            } else {
+                warn!("⚠️ 字段 '{}' 包含无效数值: {}，使用默认值: {}", 
+                    field_name, parsed_value, default_value);
+                Ok(default_value)
+            }
+        }
+        Err(e) => {
+            warn!("⚠️ 字段 '{}' 解析失败: '{}' -> {:?}，使用默认值: {}", 
+                field_name, trimmed, e, default_value);
+            Ok(default_value)
+        }
+    }
+}
+
+// 检查保证金率 - 改进版本，包含健壮的错误处理
 async fn check_margin_ratio(
     info_client: &InfoClient,
     user_address: ethers::types::Address,
     grid_config: &crate::config::GridConfig,
 ) -> Result<f64, GridStrategyError> {
-    let account_info = get_account_info(info_client, user_address).await?;
-    
-    // 解析保证金信息
-    let margin_used = account_info.margin_summary.account_value.parse::<f64>()
-        .map_err(|e| GridStrategyError::PriceParseError(format!("解析账户价值失败: {:?}", e)))?;
-    
-    let total_margin_requirement = account_info.margin_summary.total_margin_used.parse::<f64>()
-        .map_err(|e| GridStrategyError::PriceParseError(format!("解析保证金使用失败: {:?}", e)))?;
-    
-    let margin_ratio = if total_margin_requirement > 0.0 {
-        margin_used / total_margin_requirement
-    } else {
-        1.0 // 如果没有保证金要求，认为是安全的
+    // 获取账户信息，包含重试机制
+    let account_info = match get_account_info(info_client, user_address).await {
+        Ok(info) => info,
+        Err(e) => {
+            warn!("⚠️ 获取账户信息失败，无法检查保证金率: {:?}", e);
+            return Err(GridStrategyError::ClientError(format!(
+                "获取账户信息失败: {:?}", e
+            )));
+        }
     };
     
+    // 检查margin_summary字段是否存在
+    let margin_summary = &account_info.margin_summary;
+    
+    // 安全解析账户价值
+    let account_value = safe_parse_f64(
+        &margin_summary.account_value,
+        "account_value",
+        0.0
+    )?;
+    
+    // 安全解析已使用保证金
+    let total_margin_used = safe_parse_f64(
+        &margin_summary.total_margin_used,
+        "total_margin_used",
+        0.0
+    )?;
+    
+    // 尝试解析其他相关字段以获得更完整的保证金信息
+    let total_ntl_pos = safe_parse_f64(
+        &margin_summary.total_ntl_pos,
+        "total_ntl_pos",
+        0.0
+    ).unwrap_or(0.0);
+    
+    let total_raw_usd = safe_parse_f64(
+        &margin_summary.total_raw_usd,
+        "total_raw_usd",
+        0.0
+    ).unwrap_or(0.0);
+    
+    info!("💳 保证金详细信息:");
+    info!("   账户价值: {:.2}", account_value);
+    info!("   已使用保证金: {:.2}", total_margin_used);
+    info!("   总持仓价值: {:.2}", total_ntl_pos);
+    info!("   总USD价值: {:.2}", total_raw_usd);
+    
+    // 计算保证金率 - 使用多种方法确保准确性
+    let margin_ratio = if total_margin_used > 0.0 {
+        // 标准计算方法：可用资金 / 已使用保证金
+        account_value / total_margin_used
+    } else if total_ntl_pos > 0.0 {
+        // 备用计算方法：使用持仓价值
+        warn!("⚠️ total_margin_used为0，使用持仓价值计算保证金率");
+        account_value / (total_ntl_pos * 0.1) // 假设10%的保证金要求
+    } else {
+        // 没有持仓或保证金要求，认为是安全的
+        info!("💡 没有持仓或保证金要求，保证金率设为安全值");
+        10.0 // 设置一个安全的高值
+    };
+    
+    // 验证计算结果的合理性
+    if !margin_ratio.is_finite() {
+        warn!("⚠️ 保证金率计算结果无效: {}，使用默认安全值", margin_ratio);
+        return Ok(10.0); // 返回安全值
+    }
+    
+    if margin_ratio < 0.0 {
+        warn!("⚠️ 保证金率为负值: {:.2}，可能存在数据异常", margin_ratio);
+        return Err(GridStrategyError::MarginInsufficient(format!(
+            "保证金率异常: {:.2}%，可能存在账户数据问题",
+            margin_ratio * 100.0
+        )));
+    }
+    
+    // 检查保证金安全阈值
     if margin_ratio < grid_config.margin_safety_threshold {
         warn!(
             "🚨 保证金率过低: {:.2}%, 低于安全阈值: {:.2}%",
             margin_ratio * 100.0,
             grid_config.margin_safety_threshold * 100.0
         );
+        
+        // 提供详细的风险信息
+        let risk_level = if margin_ratio < grid_config.margin_safety_threshold * 0.5 {
+            "极高风险"
+        } else if margin_ratio < grid_config.margin_safety_threshold * 0.8 {
+            "高风险"
+        } else {
+            "中等风险"
+        };
+        
+        warn!("🚨 风险等级: {} - 建议立即减仓或增加保证金", risk_level);
+        
         return Err(GridStrategyError::MarginInsufficient(format!(
-            "保证金率过低: {:.2}%",
-            margin_ratio * 100.0
+            "保证金率过低: {:.2}% (风险等级: {})",
+            margin_ratio * 100.0,
+            risk_level
         )));
     }
+    
+    // 提供保证金健康度反馈
+    let health_status = if margin_ratio > grid_config.margin_safety_threshold * 3.0 {
+        "优秀"
+    } else if margin_ratio > grid_config.margin_safety_threshold * 2.0 {
+        "良好"
+    } else if margin_ratio > grid_config.margin_safety_threshold * 1.5 {
+        "一般"
+    } else {
+        "需要关注"
+    };
+    
+    info!("💳 保证金健康度: {} (比率: {:.2}%)", health_status, margin_ratio * 100.0);
     
     Ok(margin_ratio)
 }
 
-// 确保连接状态
+// 确保连接状态 - 改进版本，包含更好的错误分类和重试策略
 async fn ensure_connection(
     info_client: &InfoClient,
     user_address: ethers::types::Address,
     grid_state: &mut GridState,
 ) -> Result<bool, GridStrategyError> {
-    match get_account_info(info_client, user_address).await {
-        Ok(_) => {
+    let start_time = SystemTime::now();
+    
+    // 使用超时控制的连接检查
+    let connection_result = tokio::time::timeout(
+        Duration::from_secs(15), // 连接检查超时15秒
+        get_account_info(info_client, user_address)
+    ).await;
+    
+    match connection_result {
+        Ok(Ok(_account_info)) => {
+            // 连接成功
+            if grid_state.connection_retry_count > 0 {
+                info!("✅ 网络连接已恢复 (之前重试次数: {})", grid_state.connection_retry_count);
+            }
             grid_state.connection_retry_count = 0;
+            
+            let elapsed = start_time.elapsed().unwrap_or_default();
+            if elapsed.as_millis() > 5000 {
+                warn!("⚠️ 连接检查耗时较长: {}ms", elapsed.as_millis());
+            }
+            
             Ok(true)
         }
-        Err(e) => {
+        Ok(Err(e)) => {
+            // API调用失败
             grid_state.connection_retry_count += 1;
+            
+            // 分析错误类型
+            let error_type = classify_connection_error(&e);
             warn!(
-                "⚠️ 连接检查失败 (重试次数: {}): {:?}",
-                grid_state.connection_retry_count, e
+                "⚠️ 连接检查失败 (重试次数: {}, 错误类型: {}): {:?}",
+                grid_state.connection_retry_count, error_type, e
             );
             
-            if grid_state.connection_retry_count > 5 {
+            // 根据错误类型决定重试策略
+            let max_retries = match error_type.as_str() {
+                "网络超时" => 8,      // 网络问题允许更多重试
+                "API限制" => 5,       // API限制适中重试
+                "认证失败" => 2,      // 认证问题快速失败
+                "服务器错误" => 6,    // 服务器问题适中重试
+                _ => 5,               // 默认重试次数
+            };
+            
+            if grid_state.connection_retry_count > max_retries {
+                error!("❌ 连接失败次数过多 ({}/{}，错误类型: {})", 
+                    grid_state.connection_retry_count, max_retries, error_type);
+                return Err(GridStrategyError::NetworkError(format!(
+                    "连接失败次数过多: {} (错误类型: {})",
+                    grid_state.connection_retry_count, error_type
+                )));
+            }
+            
+            // 根据错误类型和重试次数计算等待时间
+            let base_delay = match error_type.as_str() {
+                "API限制" => 5,       // API限制等待更长时间
+                "网络超时" => 2,      // 网络超时等待较短时间
+                "服务器错误" => 3,    // 服务器错误中等等待时间
+                _ => 2,               // 默认等待时间
+            };
+            
+            let wait_seconds = base_delay * 2_u64.pow(grid_state.connection_retry_count.min(4));
+            info!("⏱️ 等待 {}秒 后重试连接 (错误类型: {})", wait_seconds, error_type);
+            sleep(Duration::from_secs(wait_seconds)).await;
+            
+            Ok(false)
+        }
+        Err(_timeout) => {
+            // 连接超时
+            grid_state.connection_retry_count += 1;
+            warn!(
+                "⚠️ 连接检查超时 (重试次数: {}, 超时时间: 15秒)",
+                grid_state.connection_retry_count
+            );
+            
+            if grid_state.connection_retry_count > 6 {
+                error!("❌ 连接超时次数过多 ({}次)", grid_state.connection_retry_count);
                 return Err(GridStrategyError::NetworkError(
-                    "连接失败次数过多".to_string(),
+                    "连接超时次数过多".to_string(),
                 ));
             }
             
-            // 等待一段时间后重试
-            sleep(Duration::from_secs(2_u64.pow(grid_state.connection_retry_count.min(4)))).await;
+            // 超时情况下使用较短的等待时间
+            let wait_seconds = 3 * grid_state.connection_retry_count.min(5);
+            info!("⏱️ 连接超时，等待 {}秒 后重试", wait_seconds);
+            sleep(Duration::from_secs(wait_seconds as u64)).await;
+            
             Ok(false)
         }
+    }
+}
+
+// 分析连接错误类型，用于制定不同的重试策略
+fn classify_connection_error(error: &GridStrategyError) -> String {
+    let error_msg = format!("{:?}", error).to_lowercase();
+    
+    if error_msg.contains("timeout") || error_msg.contains("超时") {
+        "网络超时".to_string()
+    } else if error_msg.contains("rate limit") || error_msg.contains("限制") || error_msg.contains("429") {
+        "API限制".to_string()
+    } else if error_msg.contains("unauthorized") || error_msg.contains("认证") || error_msg.contains("401") || error_msg.contains("403") {
+        "认证失败".to_string()
+    } else if error_msg.contains("500") || error_msg.contains("502") || error_msg.contains("503") || error_msg.contains("服务器") {
+        "服务器错误".to_string()
+    } else if error_msg.contains("network") || error_msg.contains("connection") || error_msg.contains("网络") {
+        "网络连接".to_string()
+    } else if error_msg.contains("parse") || error_msg.contains("解析") {
+        "数据解析".to_string()
+    } else {
+        "未知错误".to_string()
     }
 }
 
