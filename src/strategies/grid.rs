@@ -186,6 +186,30 @@ impl StopLossStatus {
     }
 }
 
+// 动态网格参数结构体
+#[derive(Debug, Clone)]
+struct DynamicGridParams {
+    current_min_spacing: f64,
+    current_max_spacing: f64,
+    current_trade_amount: f64,
+    last_optimization_time: SystemTime,
+    optimization_count: u32,
+    performance_window: Vec<f64>, // 滑动窗口性能记录
+}
+
+impl DynamicGridParams {
+    fn new(grid_config: &crate::config::GridConfig) -> Self {
+        Self {
+            current_min_spacing: grid_config.min_grid_spacing,
+            current_max_spacing: grid_config.max_grid_spacing,
+            current_trade_amount: grid_config.trade_amount,
+            last_optimization_time: SystemTime::now(),
+            optimization_count: 0,
+            performance_window: Vec::new(),
+        }
+    }
+}
+
 // 网格状态结构体
 #[derive(Debug, Clone)]
 struct GridState {
@@ -204,6 +228,7 @@ struct GridState {
     last_margin_check: SystemTime,              // 上次保证金检查时间
     connection_retry_count: u32,                // 连接重试次数
     last_order_batch_time: SystemTime,          // 上次批量下单时间
+    dynamic_params: DynamicGridParams,          // 动态网格参数
 }
 
 // 市场趋势枚举
@@ -1205,14 +1230,15 @@ async fn create_dynamic_grid(
         && allocated_buy_funds < max_buy_funds
         && buy_count < grid_config.grid_count
     {
-        // 动态计算网格间距，应用振幅调整
-        let dynamic_spacing = grid_config.min_grid_spacing
+        // 动态计算网格间距，使用优化后的参数和振幅调整
+        let dynamic_spacing = grid_state.dynamic_params.current_min_spacing
             * fund_allocation.buy_spacing_adjustment
             * amplitude_adjustment;
         current_buy_price = current_buy_price - (current_buy_price * dynamic_spacing);
 
-        // 计算当前网格资金
-        let mut current_grid_funds = fund_allocation.buy_order_funds
+        // 计算当前网格资金，使用动态交易金额
+        let dynamic_trade_amount = grid_state.dynamic_params.current_trade_amount;
+        let mut current_grid_funds = (fund_allocation.buy_order_funds * dynamic_trade_amount / grid_config.trade_amount)
             * (1.0 - (current_price - current_buy_price) / current_price * 3.0);
         current_grid_funds = current_grid_funds.max(fund_allocation.buy_order_funds * 0.5);
 
@@ -1410,8 +1436,8 @@ async fn create_dynamic_grid(
         && allocated_sell_quantity < max_sell_quantity
         && sell_count < grid_config.grid_count
     {
-        // 动态计算网格间距，应用振幅调整
-        let dynamic_spacing = grid_config.min_grid_spacing
+        // 动态计算网格间距，使用优化后的参数和振幅调整
+        let dynamic_spacing = grid_state.dynamic_params.current_min_spacing
             * fund_allocation.sell_spacing_adjustment
             * amplitude_adjustment;
         current_sell_price = current_sell_price + (current_sell_price * dynamic_spacing);
@@ -1588,25 +1614,47 @@ async fn execute_stop_loss(
     } else if stop_result.action.is_partial_stop() && stop_result.stop_quantity > 0.0 {
         grid_state.stop_loss_status = StopLossStatus::Monitoring;
         
-        // 部分清仓 - 使用滑点容忍度设置限价
-        let stop_price = if grid_state.position_avg_price > 0.0 {
+        // 部分清仓 - 智能滑点处理
+        let base_price = if grid_state.position_avg_price > 0.0 {
             grid_state.position_avg_price
         } else {
             current_price
         };
         
-        // 考虑滑点的卖出价格
-        let sell_price_with_slippage = stop_price * (1.0 - grid_config.slippage_tolerance);
+        // 智能滑点计算：根据市场波动率和紧急程度调整
+        let market_volatility = grid_state.historical_volatility.max(0.001); // 最小波动率0.1%
+        let urgency_multiplier = match stop_result.action {
+            StopLossAction::FullStop => 2.0,     // 全部止损时使用更大滑点
+            StopLossAction::PartialStop => 1.5,  // 部分止损时使用中等滑点
+            _ => 1.0,
+        };
+        
+        // 动态滑点 = 基础滑点 + 市场波动率调整 + 紧急程度调整
+        let dynamic_slippage = grid_config.slippage_tolerance 
+            + (market_volatility * 0.5) 
+            + (grid_config.slippage_tolerance * (urgency_multiplier - 1.0));
+        let final_slippage = dynamic_slippage.min(0.05); // 最大滑点5%
+        
+        let sell_price_with_slippage = base_price * (1.0 - final_slippage);
+        
+        info!("🎯 智能滑点计算 - 基础价格: {:.4}, 基础滑点: {:.2}%, 市场波动率: {:.2}%, 紧急系数: {:.1}, 最终滑点: {:.2}%, 目标价格: {:.4}",
+            base_price, 
+            grid_config.slippage_tolerance * 100.0,
+            market_volatility * 100.0,
+            urgency_multiplier,
+            final_slippage * 100.0,
+            sell_price_with_slippage
+        );
         
         let market_sell_order = ClientOrderRequest {
             asset: grid_config.trading_asset.clone(),
             is_buy: false,
             reduce_only: true,
-            limit_px: sell_price_with_slippage, // 使用滑点容忍度
+            limit_px: sell_price_with_slippage,
             sz: stop_result.stop_quantity,
             cloid: None,
             order_type: ClientOrder::Limit(ClientLimit {
-                tif: "Ioc".to_string(),
+                tif: "Ioc".to_string(), // IOC确保快速成交或取消
             }),
         };
         
@@ -2056,6 +2104,7 @@ pub async fn run_grid_strategy(
         last_margin_check: SystemTime::now(),
         connection_retry_count: 0,
         last_order_batch_time: SystemTime::now(),
+        dynamic_params: DynamicGridParams::new(grid_config),
     };
 
     let mut active_orders: Vec<u64> = Vec::new();
@@ -2184,10 +2233,16 @@ pub async fn run_grid_strategy(
                     {
                         info!("🔄 开始定期重平衡...");
 
-                        // 在重平衡前优化参数
+                        // 在重平衡前自动优化参数
                         if grid_state.performance_history.len() >= 20 {
-                            info!("📈 基于历史表现分析网格参数优化建议");
-                            analyze_grid_performance_and_suggest_optimization(grid_config, &grid_state);
+                            info!("📈 开始自动网格参数优化");
+                            let optimization_applied = auto_optimize_grid_parameters(&mut grid_state, grid_config);
+                            
+                            if !optimization_applied {
+                                // 如果没有应用自动优化，则显示建议
+                                info!("📊 显示网格参数优化建议");
+                                analyze_grid_performance_and_suggest_optimization(grid_config, &grid_state);
+                            }
                             
                             // 创建一个临时的配置副本进行优化分析
                             let mut temp_min_spacing = grid_config.min_grid_spacing;
@@ -3581,6 +3636,164 @@ async fn check_order_status_in_batches(
     );
     
     Ok(())
+}
+
+// 自动优化网格参数
+fn auto_optimize_grid_parameters(
+    grid_state: &mut GridState,
+    grid_config: &crate::config::GridConfig,
+) -> bool {
+    let now = SystemTime::now();
+    
+    // 检查是否需要优化（每24小时最多优化一次）
+    if now.duration_since(grid_state.dynamic_params.last_optimization_time)
+        .unwrap_or_default().as_secs() < 24 * 60 * 60 {
+        return false;
+    }
+    
+    // 需要足够的历史数据
+    if grid_state.performance_history.len() < 20 {
+        info!("📊 历史数据不足({})，跳过自动优化", grid_state.performance_history.len());
+        return false;
+    }
+    
+    // 分析最近的表现
+    let recent_records: Vec<&PerformanceRecord> = grid_state
+        .performance_history
+        .iter()
+        .rev()
+        .take(30) // 分析最近30笔交易
+        .collect();
+    
+    let recent_profit: f64 = recent_records.iter().map(|r| r.profit).sum();
+    let recent_win_rate = recent_records
+        .iter()
+        .filter(|r| r.profit > 0.0)
+        .count() as f64 / recent_records.len() as f64;
+    
+    let avg_profit_per_trade = recent_profit / recent_records.len() as f64;
+    
+    // 计算性能评分 (0-100)
+    let profit_score = if recent_profit > 0.0 { 50.0 } else { 0.0 };
+    let win_rate_score = recent_win_rate * 30.0;
+    let consistency_score = if avg_profit_per_trade > 0.0 { 20.0 } else { 0.0 };
+    let performance_score = profit_score + win_rate_score + consistency_score;
+    
+    info!("📊 性能评分分析:");
+    info!("   最近30笔交易利润: {:.2}", recent_profit);
+    info!("   胜率: {:.1}%", recent_win_rate * 100.0);
+    info!("   平均每笔利润: {:.2}", avg_profit_per_trade);
+    info!("   综合评分: {:.1}/100", performance_score);
+    
+    // 根据性能评分决定优化策略
+    let mut optimization_applied = false;
+    let original_min_spacing = grid_state.dynamic_params.current_min_spacing;
+    let original_max_spacing = grid_state.dynamic_params.current_max_spacing;
+    let original_trade_amount = grid_state.dynamic_params.current_trade_amount;
+    
+    if performance_score >= 70.0 {
+        // 表现优秀：适度增加网格间距和交易金额以获得更大利润
+        let spacing_multiplier = 1.03; // 增加3%
+        let amount_multiplier = 1.02;  // 增加2%
+        
+        grid_state.dynamic_params.current_min_spacing = 
+            (original_min_spacing * spacing_multiplier)
+            .min(grid_config.max_grid_spacing * 0.8); // 不超过最大间距的80%
+        
+        grid_state.dynamic_params.current_max_spacing = 
+            (original_max_spacing * spacing_multiplier)
+            .min(grid_config.max_grid_spacing);
+        
+        grid_state.dynamic_params.current_trade_amount = 
+            (original_trade_amount * amount_multiplier)
+            .min(grid_state.total_capital * 0.1); // 不超过总资金的10%
+        
+        info!("🚀 性能优秀，执行积极优化策略");
+        optimization_applied = true;
+        
+    } else if performance_score <= 30.0 {
+        // 表现不佳：减少网格间距和交易金额以降低风险
+        let spacing_multiplier = 0.97; // 减少3%
+        let amount_multiplier = 0.95;  // 减少5%
+        
+        grid_state.dynamic_params.current_min_spacing = 
+            (original_min_spacing * spacing_multiplier)
+            .max(grid_config.min_grid_spacing * 0.5); // 不低于最小间距的50%
+        
+        grid_state.dynamic_params.current_max_spacing = 
+            (original_max_spacing * spacing_multiplier)
+            .max(grid_state.dynamic_params.current_min_spacing * 1.5);
+        
+        grid_state.dynamic_params.current_trade_amount = 
+            (original_trade_amount * amount_multiplier)
+            .max(grid_config.trade_amount * 0.3); // 不低于原始金额的30%
+        
+        info!("⚠️ 性能不佳，执行保守优化策略");
+        optimization_applied = true;
+        
+    } else {
+        // 表现中等：微调参数
+        let market_volatility = grid_state.historical_volatility;
+        
+        if market_volatility > 0.02 { // 高波动市场
+            // 增加网格间距以适应波动
+            let spacing_multiplier = 1.01;
+            grid_state.dynamic_params.current_min_spacing = 
+                (original_min_spacing * spacing_multiplier)
+                .min(grid_config.max_grid_spacing * 0.8);
+            grid_state.dynamic_params.current_max_spacing = 
+                (original_max_spacing * spacing_multiplier)
+                .min(grid_config.max_grid_spacing);
+            
+            info!("📈 高波动市场，微调网格间距");
+            optimization_applied = true;
+        } else if market_volatility < 0.005 { // 低波动市场
+            // 减少网格间距以增加交易频率
+            let spacing_multiplier = 0.99;
+            grid_state.dynamic_params.current_min_spacing = 
+                (original_min_spacing * spacing_multiplier)
+                .max(grid_config.min_grid_spacing * 0.8);
+            grid_state.dynamic_params.current_max_spacing = 
+                (original_max_spacing * spacing_multiplier)
+                .max(grid_state.dynamic_params.current_min_spacing * 1.5);
+            
+            info!("📉 低波动市场，微调网格间距");
+            optimization_applied = true;
+        }
+    }
+    
+    if optimization_applied {
+        grid_state.dynamic_params.last_optimization_time = now;
+        grid_state.dynamic_params.optimization_count += 1;
+        
+        info!("✅ 自动优化完成 (第{}次):", grid_state.dynamic_params.optimization_count);
+        info!("   最小网格间距: {:.4}% -> {:.4}% ({:+.2}%)", 
+            original_min_spacing * 100.0,
+            grid_state.dynamic_params.current_min_spacing * 100.0,
+            (grid_state.dynamic_params.current_min_spacing / original_min_spacing - 1.0) * 100.0
+        );
+        info!("   最大网格间距: {:.4}% -> {:.4}% ({:+.2}%)", 
+            original_max_spacing * 100.0,
+            grid_state.dynamic_params.current_max_spacing * 100.0,
+            (grid_state.dynamic_params.current_max_spacing / original_max_spacing - 1.0) * 100.0
+        );
+        info!("   交易金额: {:.2} -> {:.2} ({:+.2}%)", 
+            original_trade_amount,
+            grid_state.dynamic_params.current_trade_amount,
+            (grid_state.dynamic_params.current_trade_amount / original_trade_amount - 1.0) * 100.0
+        );
+        
+        // 记录性能评分到滑动窗口
+        grid_state.dynamic_params.performance_window.push(performance_score);
+        if grid_state.dynamic_params.performance_window.len() > 10 {
+            grid_state.dynamic_params.performance_window.remove(0);
+        }
+        
+        true
+    } else {
+        info!("📊 性能中等，暂不执行自动优化");
+        false
+    }
 }
 
 // 分析网格性能并提供优化建议
