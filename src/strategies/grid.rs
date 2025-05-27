@@ -4,7 +4,7 @@ use hyperliquid_rust_sdk::{
     ExchangeDataStatus, ExchangeResponseStatus, InfoClient, Message, Subscription, UserData,
 };
 use log::{error, info, warn};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -108,14 +108,327 @@ mod system_time_serde {
     }
 }
 
+// 批处理任务优化器
+#[derive(Debug, Clone)]
+struct BatchTaskOptimizer {
+    last_execution_times: VecDeque<Duration>,
+    optimal_batch_size: usize,
+    adjustment_factor: f64,
+    min_batch_size: usize,
+    max_batch_size: usize,
+    target_execution_time: Duration,
+    performance_window_size: usize,
+    consecutive_adjustments: u32,
+    last_adjustment_time: Instant,
+    adjustment_cooldown: Duration,
+    performance_trend: f64, // 正值表示性能改善，负值表示性能下降
+}
+
+impl BatchTaskOptimizer {
+    /// 创建新的批处理优化器
+    fn new(initial_batch_size: usize, target_execution_time: Duration) -> Self {
+        Self {
+            last_execution_times: VecDeque::new(),
+            optimal_batch_size: initial_batch_size,
+            adjustment_factor: 0.1, // 10%的调整幅度
+            min_batch_size: 1,
+            max_batch_size: 200,
+            target_execution_time,
+            performance_window_size: 10,
+            consecutive_adjustments: 0,
+            last_adjustment_time: Instant::now(),
+            adjustment_cooldown: Duration::from_secs(30), // 30秒调整冷却时间
+            performance_trend: 0.0,
+        }
+    }
+
+    /// 基于历史执行时间自动调整最优批次大小
+    fn optimize_batch_size(&mut self, task_count: usize) -> usize {
+        // 如果任务数量小于最小批次大小，直接返回任务数量
+        if task_count <= self.min_batch_size {
+            return task_count;
+        }
+
+        // 检查是否在调整冷却期内
+        if self.last_adjustment_time.elapsed() < self.adjustment_cooldown {
+            return self.optimal_batch_size.min(task_count);
+        }
+
+        // 如果没有足够的历史数据，使用当前最优批次大小
+        if self.last_execution_times.len() < 3 {
+            return self.optimal_batch_size.min(task_count);
+        }
+
+        // 计算平均执行时间和性能趋势
+        let avg_execution_time = self.calculate_average_execution_time();
+        let performance_variance = self.calculate_performance_variance();
+
+        // 更新性能趋势
+        self.update_performance_trend(avg_execution_time);
+
+        // 决定是否需要调整批次大小
+        let should_adjust = self.should_adjust_batch_size(avg_execution_time, performance_variance);
+
+        if should_adjust {
+            let new_batch_size = self.calculate_new_batch_size(avg_execution_time, task_count);
+
+            if new_batch_size != self.optimal_batch_size {
+                info!(
+                    "📊 批处理优化器调整: {} -> {} (平均执行时间: {:.2}秒, 目标: {:.2}秒)",
+                    self.optimal_batch_size,
+                    new_batch_size,
+                    avg_execution_time.as_secs_f64(),
+                    self.target_execution_time.as_secs_f64()
+                );
+
+                self.optimal_batch_size = new_batch_size;
+                self.last_adjustment_time = Instant::now();
+                self.consecutive_adjustments += 1;
+
+                // 如果连续调整次数过多，增加调整冷却时间
+                if self.consecutive_adjustments > 5 {
+                    self.adjustment_cooldown = Duration::from_secs(60);
+                    info!("⚠️ 连续调整次数过多，增加冷却时间到60秒");
+                }
+            }
+        } else {
+            // 重置连续调整计数
+            if self.consecutive_adjustments > 0 {
+                self.consecutive_adjustments = 0;
+                self.adjustment_cooldown = Duration::from_secs(30); // 重置冷却时间
+            }
+        }
+
+        self.optimal_batch_size.min(task_count)
+    }
+
+    /// 记录执行时间，用于未来优化
+    fn record_execution_time(&mut self, duration: Duration) {
+        self.last_execution_times.push_back(duration);
+
+        // 保持窗口大小
+        if self.last_execution_times.len() > self.performance_window_size {
+            self.last_execution_times.pop_front();
+        }
+
+        // 记录性能统计
+        if self.last_execution_times.len() >= 3 {
+            let avg_time = self.calculate_average_execution_time();
+            let variance = self.calculate_performance_variance();
+
+            // 每10次记录输出一次性能统计
+            if self.last_execution_times.len() % 10 == 0 {
+                info!(
+                    "📈 批处理性能统计: 平均时间={:.2}秒, 方差={:.4}, 当前批次大小={}, 趋势={}",
+                    avg_time.as_secs_f64(),
+                    variance,
+                    self.optimal_batch_size,
+                    if self.performance_trend > 0.0 {
+                        "改善"
+                    } else if self.performance_trend < 0.0 {
+                        "下降"
+                    } else {
+                        "稳定"
+                    }
+                );
+            }
+        }
+    }
+
+    /// 计算平均执行时间
+    fn calculate_average_execution_time(&self) -> Duration {
+        if self.last_execution_times.is_empty() {
+            return self.target_execution_time;
+        }
+
+        let total_duration: Duration = self.last_execution_times.iter().sum();
+        total_duration / self.last_execution_times.len() as u32
+    }
+
+    /// 计算性能方差
+    fn calculate_performance_variance(&self) -> f64 {
+        if self.last_execution_times.len() < 2 {
+            return 0.0;
+        }
+
+        let avg = self.calculate_average_execution_time().as_secs_f64();
+        let variance = self
+            .last_execution_times
+            .iter()
+            .map(|d| {
+                let diff = d.as_secs_f64() - avg;
+                diff * diff
+            })
+            .sum::<f64>()
+            / self.last_execution_times.len() as f64;
+
+        variance.sqrt()
+    }
+
+    /// 更新性能趋势
+    fn update_performance_trend(&mut self, current_avg: Duration) {
+        if self.last_execution_times.len() < 5 {
+            return;
+        }
+
+        // 计算最近一半和前一半的平均时间
+        let mid_point = self.last_execution_times.len() / 2;
+        let recent_times: Vec<Duration> = self
+            .last_execution_times
+            .iter()
+            .skip(mid_point)
+            .cloned()
+            .collect();
+        let earlier_times: Vec<Duration> = self
+            .last_execution_times
+            .iter()
+            .take(mid_point)
+            .cloned()
+            .collect();
+
+        let recent_avg = recent_times.iter().sum::<Duration>() / recent_times.len() as u32;
+        let earlier_avg = earlier_times.iter().sum::<Duration>() / earlier_times.len() as u32;
+
+        // 计算趋势（负值表示性能改善，正值表示性能下降）
+        self.performance_trend =
+            (recent_avg.as_secs_f64() - earlier_avg.as_secs_f64()) / earlier_avg.as_secs_f64();
+    }
+
+    /// 判断是否应该调整批次大小
+    fn should_adjust_batch_size(&self, avg_execution_time: Duration, variance: f64) -> bool {
+        let target_time = self.target_execution_time.as_secs_f64();
+        let current_time = avg_execution_time.as_secs_f64();
+
+        // 如果执行时间偏离目标时间超过20%，或者方差过大，则需要调整
+        let time_deviation = (current_time - target_time).abs() / target_time;
+        let high_variance = variance > target_time * 0.3; // 方差超过目标时间的30%
+
+        time_deviation > 0.2 || high_variance
+    }
+
+    /// 计算新的批次大小
+    fn calculate_new_batch_size(&self, avg_execution_time: Duration, task_count: usize) -> usize {
+        let target_time = self.target_execution_time.as_secs_f64();
+        let current_time = avg_execution_time.as_secs_f64();
+
+        let mut new_size = self.optimal_batch_size;
+
+        if current_time > target_time * 1.2 {
+            // 执行时间过长，减少批次大小
+            let reduction_factor = 1.0 - self.adjustment_factor;
+            new_size = ((self.optimal_batch_size as f64) * reduction_factor) as usize;
+
+            // 如果性能趋势持续下降，加大调整幅度
+            if self.performance_trend > 0.1 {
+                new_size = ((new_size as f64) * 0.9) as usize;
+            }
+        } else if current_time < target_time * 0.8 {
+            // 执行时间过短，可以增加批次大小
+            let increase_factor = 1.0 + self.adjustment_factor;
+            new_size = ((self.optimal_batch_size as f64) * increase_factor) as usize;
+
+            // 如果性能趋势持续改善，可以更积极地增加批次大小
+            if self.performance_trend < -0.1 {
+                new_size = ((new_size as f64) * 1.1) as usize;
+            }
+        }
+
+        // 应用边界限制
+        new_size = new_size
+            .max(self.min_batch_size)
+            .min(self.max_batch_size)
+            .min(task_count);
+
+        // 避免过于频繁的小幅调整
+        let change_ratio = (new_size as f64 - self.optimal_batch_size as f64).abs()
+            / self.optimal_batch_size as f64;
+        if change_ratio < 0.05 {
+            // 变化小于5%，不进行调整
+            return self.optimal_batch_size;
+        }
+
+        new_size
+    }
+
+    /// 获取当前性能报告
+    fn get_performance_report(&self) -> String {
+        if self.last_execution_times.is_empty() {
+            return "批处理优化器: 暂无性能数据".to_string();
+        }
+
+        let avg_time = self.calculate_average_execution_time();
+        let variance = self.calculate_performance_variance();
+        let efficiency = if avg_time.as_secs_f64() > 0.0 {
+            self.target_execution_time.as_secs_f64() / avg_time.as_secs_f64() * 100.0
+        } else {
+            100.0
+        };
+
+        format!(
+            "批处理优化器性能报告:\n\
+            - 当前批次大小: {}\n\
+            - 平均执行时间: {:.2}秒\n\
+            - 目标执行时间: {:.2}秒\n\
+            - 性能方差: {:.4}\n\
+            - 执行效率: {:.1}%\n\
+            - 性能趋势: {}\n\
+            - 连续调整次数: {}\n\
+            - 历史记录数: {}",
+            self.optimal_batch_size,
+            avg_time.as_secs_f64(),
+            self.target_execution_time.as_secs_f64(),
+            variance,
+            efficiency,
+            if self.performance_trend > 0.05 {
+                "下降"
+            } else if self.performance_trend < -0.05 {
+                "改善"
+            } else {
+                "稳定"
+            },
+            self.consecutive_adjustments,
+            self.last_execution_times.len()
+        )
+    }
+
+    /// 重置优化器状态
+    fn reset(&mut self) {
+        self.last_execution_times.clear();
+        self.consecutive_adjustments = 0;
+        self.performance_trend = 0.0;
+        self.adjustment_cooldown = Duration::from_secs(30);
+        info!("🔄 批处理优化器已重置");
+    }
+
+    /// 设置新的目标执行时间
+    fn set_target_execution_time(&mut self, target: Duration) {
+        self.target_execution_time = target;
+        info!(
+            "🎯 批处理优化器目标时间已更新为: {:.2}秒",
+            target.as_secs_f64()
+        );
+    }
+
+    /// 设置批次大小范围
+    fn set_batch_size_range(&mut self, min_size: usize, max_size: usize) {
+        self.min_batch_size = min_size;
+        self.max_batch_size = max_size;
+
+        // 确保当前批次大小在新范围内
+        self.optimal_batch_size = self.optimal_batch_size.max(min_size).min(max_size);
+
+        info!("📏 批处理优化器大小范围已更新: {} - {}", min_size, max_size);
+    }
+}
+
 // 订单状态枚举
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 enum OrderStatus {
-    Pending,    // 待处理
-    Active,     // 活跃
-    Filled,     // 已成交
-    Cancelled,  // 已取消
-    Rejected,   // 被拒绝
+    Pending,         // 待处理
+    Active,          // 活跃
+    Filled,          // 已成交
+    Cancelled,       // 已取消
+    Rejected,        // 被拒绝
     PartiallyFilled, // 部分成交
 }
 
@@ -152,7 +465,9 @@ struct OrderInfo {
 // ============================================================================
 
 /// 订单优先级枚举
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 enum OrderPriority {
     High,   // 高优先级，如止损单、紧急平仓单
     Normal, // 普通网格单
@@ -210,10 +525,10 @@ impl OrderPriority {
 /// 订单过期策略
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 enum ExpiryStrategy {
-    Cancel,           // 过期后取消订单
-    Reprice,          // 过期后重新定价
-    Extend,           // 延长过期时间
-    ConvertToMarket,  // 转换为市价单（仅限高优先级）
+    Cancel,          // 过期后取消订单
+    Reprice,         // 过期后重新定价
+    Extend,          // 延长过期时间
+    ConvertToMarket, // 转换为市价单（仅限高优先级）
 }
 
 impl ExpiryStrategy {
@@ -248,25 +563,25 @@ impl ExpiryStrategy {
 struct PrioritizedOrderInfo {
     // 基础订单信息
     base_info: OrderInfo,
-    
+
     // 优先级管理
     priority: OrderPriority,
-    
+
     // 过期管理
     #[serde(with = "system_time_serde")]
     created_time: SystemTime,
     expiry_time: Option<SystemTime>,
     expiry_strategy: ExpiryStrategy,
-    
+
     // 订单状态
     order_id: Option<u64>,
     retry_count: u32,
     last_retry_time: Option<SystemTime>,
-    
+
     // 市场条件
-    distance_from_current_price: f64,  // 与当前价格的距离（百分比）
-    market_urgency: f64,               // 市场紧急度评分 (0-100)
-    
+    distance_from_current_price: f64, // 与当前价格的距离（百分比）
+    market_urgency: f64,              // 市场紧急度评分 (0-100)
+
     // 执行统计
     execution_attempts: u32,
     total_wait_time: Duration,
@@ -282,11 +597,13 @@ impl PrioritizedOrderInfo {
         current_price: f64,
     ) -> Self {
         let created_time = SystemTime::now();
-        let expiry_time = Some(created_time + Duration::from_secs(priority.suggested_timeout_seconds()));
-        
+        let expiry_time =
+            Some(created_time + Duration::from_secs(priority.suggested_timeout_seconds()));
+
         // 计算与当前价格的距离
-        let distance_from_current_price = ((base_info.price - current_price) / current_price * 100.0).abs();
-        
+        let distance_from_current_price =
+            ((base_info.price - current_price) / current_price * 100.0).abs();
+
         Self {
             base_info,
             priority,
@@ -310,22 +627,29 @@ impl PrioritizedOrderInfo {
         current_price: f64,
         timeout_seconds: Option<u64>,
     ) -> Self {
-        let mut order = Self::new(base_info, OrderPriority::High, ExpiryStrategy::ConvertToMarket, current_price);
-        
+        let mut order = Self::new(
+            base_info,
+            OrderPriority::High,
+            ExpiryStrategy::ConvertToMarket,
+            current_price,
+        );
+
         if let Some(timeout) = timeout_seconds {
             order.expiry_time = Some(order.created_time + Duration::from_secs(timeout));
         }
-        
+
         order.market_urgency = 90.0; // 高紧急度
         order
     }
 
     /// 创建低优先级订单（远离价格的网格单）
-    fn new_low_priority(
-        base_info: OrderInfo,
-        current_price: f64,
-    ) -> Self {
-        let mut order = Self::new(base_info, OrderPriority::Low, ExpiryStrategy::Cancel, current_price);
+    fn new_low_priority(base_info: OrderInfo, current_price: f64) -> Self {
+        let mut order = Self::new(
+            base_info,
+            OrderPriority::Low,
+            ExpiryStrategy::Cancel,
+            current_price,
+        );
         order.market_urgency = 20.0; // 低紧急度
         order
     }
@@ -342,7 +666,8 @@ impl PrioritizedOrderInfo {
     /// 获取剩余时间（秒）
     fn remaining_seconds(&self) -> Option<u64> {
         if let Some(expiry_time) = self.expiry_time {
-            expiry_time.duration_since(SystemTime::now())
+            expiry_time
+                .duration_since(SystemTime::now())
                 .ok()
                 .map(|d| d.as_secs())
         } else {
@@ -365,8 +690,9 @@ impl PrioritizedOrderInfo {
         let volatility_factor = (volatility * 100.0).min(50.0);
         let price_change_factor = (price_change.abs() * 100.0).min(30.0);
         let distance_factor = (100.0 - self.distance_from_current_price).max(0.0) * 0.2;
-        
-        self.market_urgency = (volatility_factor + price_change_factor + distance_factor).min(100.0);
+
+        self.market_urgency =
+            (volatility_factor + price_change_factor + distance_factor).min(100.0);
     }
 
     /// 记录执行尝试
@@ -392,16 +718,16 @@ impl PrioritizedOrderInfo {
         let urgency_score = self.market_urgency * 0.4;
         let distance_penalty = self.distance_from_current_price * 0.1;
         let time_bonus = if self.is_expired() { 20.0 } else { 0.0 };
-        
+
         (base_priority + urgency_score - distance_penalty + time_bonus).max(0.0)
     }
 
     /// 判断是否需要立即处理
     fn needs_immediate_attention(&self) -> bool {
-        self.priority.is_high() || 
-        self.is_expired() || 
-        self.market_urgency > 80.0 ||
-        self.retry_count > 3
+        self.priority.is_high()
+            || self.is_expired()
+            || self.market_urgency > 80.0
+            || self.retry_count > 3
     }
 
     /// 获取建议的处理策略
@@ -425,13 +751,13 @@ struct OrderManager {
     max_orders: usize,
     last_cleanup_time: SystemTime,
     cleanup_interval: Duration,
-    
+
     // 统计信息
     total_orders_created: u64,
     total_orders_expired: u64,
     total_orders_repriced: u64,
     total_high_priority_orders: u64,
-    
+
     // 性能指标
     average_execution_time: Duration,
     success_rate: f64,
@@ -462,7 +788,7 @@ impl OrderManager {
         if self.prioritized_orders.len() >= self.max_orders {
             // 尝试清理过期订单
             self.cleanup_expired_orders();
-            
+
             // 如果仍然超过限制，移除最低优先级的订单
             if self.prioritized_orders.len() >= self.max_orders {
                 self.remove_lowest_priority_order();
@@ -474,30 +800,44 @@ impl OrderManager {
         if order.priority.is_high() {
             self.total_high_priority_orders += 1;
         }
-        
+
         // 更新优先级分布
-        *self.priority_distribution.entry(order.priority.clone()).or_insert(0) += 1;
+        *self
+            .priority_distribution
+            .entry(order.priority.clone())
+            .or_insert(0) += 1;
 
         // 插入订单（按优先级排序）
-        let insert_pos = self.prioritized_orders
-            .binary_search_by(|a| order.get_priority_score().partial_cmp(&a.get_priority_score()).unwrap_or(std::cmp::Ordering::Equal))
+        let insert_pos = self
+            .prioritized_orders
+            .binary_search_by(|a| {
+                order
+                    .get_priority_score()
+                    .partial_cmp(&a.get_priority_score())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .unwrap_or_else(|pos| pos);
-        
+
         self.prioritized_orders.insert(insert_pos, order);
-        
-        info!("📋 添加订单到管理器 - 当前订单数: {}, 总创建数: {}", 
-            self.prioritized_orders.len(), self.total_orders_created);
-        
+
+        info!(
+            "📋 添加订单到管理器 - 当前订单数: {}, 总创建数: {}",
+            self.prioritized_orders.len(),
+            self.total_orders_created
+        );
+
         Ok(())
     }
 
     /// 获取下一个要处理的订单
     fn get_next_order(&mut self) -> Option<&mut PrioritizedOrderInfo> {
         // 按优先级评分排序，返回最高优先级的订单
-        self.prioritized_orders.sort_by(|a, b| 
-            b.get_priority_score().partial_cmp(&a.get_priority_score()).unwrap_or(std::cmp::Ordering::Equal)
-        );
-        
+        self.prioritized_orders.sort_by(|a, b| {
+            b.get_priority_score()
+                .partial_cmp(&a.get_priority_score())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
         self.prioritized_orders.first_mut()
     }
 
@@ -520,13 +860,18 @@ impl OrderManager {
     /// 清理过期订单
     fn cleanup_expired_orders(&mut self) -> Vec<PrioritizedOrderInfo> {
         let now = SystemTime::now();
-        
+
         // 如果还没到清理时间，跳过
-        if now.duration_since(self.last_cleanup_time).unwrap_or_default() < self.cleanup_interval {
+        if now
+            .duration_since(self.last_cleanup_time)
+            .unwrap_or_default()
+            < self.cleanup_interval
+        {
             return Vec::new();
         }
 
-        let (expired, remaining): (Vec<_>, Vec<_>) = self.prioritized_orders
+        let (expired, remaining): (Vec<_>, Vec<_>) = self
+            .prioritized_orders
             .drain(..)
             .partition(|order| order.is_expired());
 
@@ -535,8 +880,11 @@ impl OrderManager {
         self.last_cleanup_time = now;
 
         if !expired.is_empty() {
-            info!("🧹 清理过期订单 - 清理数量: {}, 剩余订单: {}", 
-                expired.len(), self.prioritized_orders.len());
+            info!(
+                "🧹 清理过期订单 - 清理数量: {}, 剩余订单: {}",
+                expired.len(),
+                self.prioritized_orders.len()
+            );
         }
 
         expired
@@ -549,19 +897,25 @@ impl OrderManager {
         }
 
         // 找到优先级最低的订单
-        let min_pos = self.prioritized_orders
+        let min_pos = self
+            .prioritized_orders
             .iter()
             .enumerate()
-            .min_by(|(_, a), (_, b)| 
-                a.get_priority_score().partial_cmp(&b.get_priority_score()).unwrap_or(std::cmp::Ordering::Equal)
-            )
+            .min_by(|(_, a), (_, b)| {
+                a.get_priority_score()
+                    .partial_cmp(&b.get_priority_score())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .map(|(pos, _)| pos)?;
 
         let removed = self.prioritized_orders.remove(min_pos);
-        
-        warn!("⚠️ 移除最低优先级订单 - 优先级: {}, 剩余订单: {}", 
-            removed.priority.as_str(), self.prioritized_orders.len());
-        
+
+        warn!(
+            "⚠️ 移除最低优先级订单 - 优先级: {}, 剩余订单: {}",
+            removed.priority.as_str(),
+            self.prioritized_orders.len()
+        );
+
         Some(removed)
     }
 
@@ -569,9 +923,9 @@ impl OrderManager {
     fn update_market_conditions(&mut self, current_price: f64, volatility: f64, price_change: f64) {
         for order in &mut self.prioritized_orders {
             // 更新与当前价格的距离
-            order.distance_from_current_price = 
+            order.distance_from_current_price =
                 ((order.base_info.price - current_price) / current_price * 100.0).abs();
-            
+
             // 更新市场紧急度
             order.update_market_urgency(volatility, price_change);
         }
@@ -586,9 +940,11 @@ impl OrderManager {
 
     /// 移除订单
     fn remove_order(&mut self, order_id: u64) -> Option<PrioritizedOrderInfo> {
-        if let Some(pos) = self.prioritized_orders
+        if let Some(pos) = self
+            .prioritized_orders
             .iter()
-            .position(|order| order.order_id == Some(order_id)) {
+            .position(|order| order.order_id == Some(order_id))
+        {
             Some(self.prioritized_orders.remove(pos))
         } else {
             None
@@ -597,16 +953,31 @@ impl OrderManager {
 
     /// 获取订单统计报告
     fn get_statistics_report(&self) -> String {
-        let high_priority_count = self.prioritized_orders.iter()
-            .filter(|o| o.priority.is_high()).count();
-        let normal_priority_count = self.prioritized_orders.iter()
-            .filter(|o| o.priority == OrderPriority::Normal).count();
-        let low_priority_count = self.prioritized_orders.iter()
-            .filter(|o| o.priority.is_low()).count();
-        let expired_count = self.prioritized_orders.iter()
-            .filter(|o| o.is_expired()).count();
-        let urgent_count = self.prioritized_orders.iter()
-            .filter(|o| o.needs_immediate_attention()).count();
+        let high_priority_count = self
+            .prioritized_orders
+            .iter()
+            .filter(|o| o.priority.is_high())
+            .count();
+        let normal_priority_count = self
+            .prioritized_orders
+            .iter()
+            .filter(|o| o.priority == OrderPriority::Normal)
+            .count();
+        let low_priority_count = self
+            .prioritized_orders
+            .iter()
+            .filter(|o| o.priority.is_low())
+            .count();
+        let expired_count = self
+            .prioritized_orders
+            .iter()
+            .filter(|o| o.is_expired())
+            .count();
+        let urgent_count = self
+            .prioritized_orders
+            .iter()
+            .filter(|o| o.needs_immediate_attention())
+            .count();
 
         format!(
             "📊 订单管理器统计报告\n\
@@ -617,11 +988,17 @@ impl OrderManager {
             ├─ 成功率: {:.1}% | 平均执行时间: {:.2}秒\n\
             └─ 最大容量: {} | 使用率: {:.1}%",
             self.prioritized_orders.len(),
-            high_priority_count, normal_priority_count, low_priority_count,
-            expired_count, urgent_count,
-            self.total_orders_created, self.total_orders_expired, self.total_orders_repriced,
-            self.success_rate, self.average_execution_time.as_secs_f64(),
-            self.max_orders, 
+            high_priority_count,
+            normal_priority_count,
+            low_priority_count,
+            expired_count,
+            urgent_count,
+            self.total_orders_created,
+            self.total_orders_expired,
+            self.total_orders_repriced,
+            self.success_rate,
+            self.average_execution_time.as_secs_f64(),
+            self.max_orders,
             (self.prioritized_orders.len() as f64 / self.max_orders as f64) * 100.0
         )
     }
@@ -650,10 +1027,15 @@ async fn create_order_with_priority(
     grid_config: &crate::config::GridConfig,
 ) -> Result<u64, GridStrategyError> {
     let start_time = SystemTime::now();
-    
+
     // 记录订单创建尝试
-    info!("🎯 创建{}订单 - 价格: {:.4}, 数量: {:.4}, 优先级: {}", 
-        if order_info.base_info.price > 0.0 { "买入" } else { "卖出" },
+    info!(
+        "🎯 创建{}订单 - 价格: {:.4}, 数量: {:.4}, 优先级: {}",
+        if order_info.base_info.price > 0.0 {
+            "买入"
+        } else {
+            "卖出"
+        },
         order_info.base_info.price,
         order_info.base_info.quantity,
         order_info.priority.as_str()
@@ -661,9 +1043,9 @@ async fn create_order_with_priority(
 
     // 根据优先级调整订单参数
     let (timeout, retry_count) = match order_info.priority {
-        OrderPriority::High => (Duration::from_secs(10), 5),   // 高优先级：10秒超时，5次重试
+        OrderPriority::High => (Duration::from_secs(10), 5), // 高优先级：10秒超时，5次重试
         OrderPriority::Normal => (Duration::from_secs(30), 3), // 普通：30秒超时，3次重试
-        OrderPriority::Low => (Duration::from_secs(60), 1),    // 低优先级：60秒超时，1次重试
+        OrderPriority::Low => (Duration::from_secs(60), 1),  // 低优先级：60秒超时，1次重试
     };
 
     // 创建订单请求
@@ -694,52 +1076,87 @@ async fn create_order_with_priority(
             }),
             cloid: None,
         };
-        
+
         match tokio::time::timeout(timeout, exchange_client.order(order_request, None)).await {
             Ok(Ok(ExchangeResponseStatus::Ok(response))) => {
                 if let Some(data) = response.data {
                     if !data.statuses.is_empty() {
                         if let ExchangeDataStatus::Resting(order) = &data.statuses[0] {
                             let execution_time = start_time.elapsed().unwrap_or_default();
-                            info!("✅ {}订单创建成功 - ID: {}, 执行时间: {:.2}秒, 尝试次数: {}", 
-                                order_info.priority.as_str(), order.oid, execution_time.as_secs_f64(), attempt);
-                            
+                            info!(
+                                "✅ {}订单创建成功 - ID: {}, 执行时间: {:.2}秒, 尝试次数: {}",
+                                order_info.priority.as_str(),
+                                order.oid,
+                                execution_time.as_secs_f64(),
+                                attempt
+                            );
+
                             return Ok(order.oid);
                         } else {
                             let error_msg = format!("订单响应中未找到订单ID");
-                            warn!("⚠️ {}订单创建失败 - 尝试 {}/{}: {}", 
-                                order_info.priority.as_str(), attempt, retry_count, error_msg);
+                            warn!(
+                                "⚠️ {}订单创建失败 - 尝试 {}/{}: {}",
+                                order_info.priority.as_str(),
+                                attempt,
+                                retry_count,
+                                error_msg
+                            );
                             last_error = Some(GridStrategyError::OrderError(error_msg));
                         }
                     } else {
                         let error_msg = format!("订单响应中未找到数据");
-                        warn!("⚠️ {}订单创建失败 - 尝试 {}/{}: {}", 
-                            order_info.priority.as_str(), attempt, retry_count, error_msg);
+                        warn!(
+                            "⚠️ {}订单创建失败 - 尝试 {}/{}: {}",
+                            order_info.priority.as_str(),
+                            attempt,
+                            retry_count,
+                            error_msg
+                        );
                         last_error = Some(GridStrategyError::OrderError(error_msg));
                     }
                 } else {
                     let error_msg = format!("订单响应中未找到订单ID");
-                    warn!("⚠️ {}订单创建失败 - 尝试 {}/{}: {}", 
-                        order_info.priority.as_str(), attempt, retry_count, error_msg);
+                    warn!(
+                        "⚠️ {}订单创建失败 - 尝试 {}/{}: {}",
+                        order_info.priority.as_str(),
+                        attempt,
+                        retry_count,
+                        error_msg
+                    );
                     last_error = Some(GridStrategyError::OrderError(error_msg));
                 }
             }
             Ok(Ok(ExchangeResponseStatus::Err(err_response))) => {
                 let error_msg = format!("订单被交易所拒绝: {:?}", err_response);
-                warn!("⚠️ {}订单创建失败 - 尝试 {}/{}: {}", 
-                    order_info.priority.as_str(), attempt, retry_count, error_msg);
+                warn!(
+                    "⚠️ {}订单创建失败 - 尝试 {}/{}: {}",
+                    order_info.priority.as_str(),
+                    attempt,
+                    retry_count,
+                    error_msg
+                );
                 last_error = Some(GridStrategyError::OrderError(error_msg));
             }
             Ok(Err(e)) => {
                 let error_msg = format!("订单创建失败: {}", e);
-                warn!("⚠️ {}订单创建失败 - 尝试 {}/{}: {}", 
-                    order_info.priority.as_str(), attempt, retry_count, error_msg);
+                warn!(
+                    "⚠️ {}订单创建失败 - 尝试 {}/{}: {}",
+                    order_info.priority.as_str(),
+                    attempt,
+                    retry_count,
+                    error_msg
+                );
                 last_error = Some(GridStrategyError::OrderError(error_msg));
             }
             Err(_) => {
                 let error_msg = format!("订单创建超时 ({:.1}秒)", timeout.as_secs_f64());
-                warn!("⚠️ {}订单创建超时 - 尝试 {}/{}: {}", 
-                    order_info.priority.as_str(), attempt, retry_count, error_msg);
+                warn!(
+                    "⚠️ {}订单创建超时 - 尝试 {}/{}: {}",
+                    order_info.priority.as_str(),
+                    attempt,
+                    retry_count,
+                    error_msg
+                );
                 last_error = Some(GridStrategyError::OrderError(error_msg));
             }
         }
@@ -752,13 +1169,16 @@ async fn create_order_with_priority(
     }
 
     // 所有尝试都失败了
-    let final_error = last_error.unwrap_or_else(|| 
-        GridStrategyError::OrderError("未知订单创建错误".to_string())
+    let final_error =
+        last_error.unwrap_or_else(|| GridStrategyError::OrderError("未知订单创建错误".to_string()));
+
+    error!(
+        "❌ {}订单创建最终失败 - 已尝试{}次: {}",
+        order_info.priority.as_str(),
+        retry_count,
+        final_error
     );
-    
-    error!("❌ {}订单创建最终失败 - 已尝试{}次: {}", 
-        order_info.priority.as_str(), retry_count, final_error);
-    
+
     Err(final_error)
 }
 
@@ -770,7 +1190,7 @@ async fn check_expired_orders(
     current_price: f64,
 ) -> Result<(), GridStrategyError> {
     let expired_orders = order_manager.cleanup_expired_orders();
-    
+
     if expired_orders.is_empty() {
         return Ok(());
     }
@@ -792,7 +1212,7 @@ async fn check_expired_orders(
                     }
                 }
             }
-            
+
             ExpiryStrategy::Reprice => {
                 // 重新定价订单
                 if let Some(order_id) = expired_order.order_id {
@@ -817,13 +1237,21 @@ async fn check_expired_orders(
                     expired_order.record_retry();
 
                     // 重新创建订单
-                    match create_order_with_priority(exchange_client, expired_order.clone(), grid_config).await {
+                    match create_order_with_priority(
+                        exchange_client,
+                        expired_order.clone(),
+                        grid_config,
+                    )
+                    .await
+                    {
                         Ok(new_order_id) => {
                             expired_order.set_order_id(new_order_id);
                             order_manager.add_order(expired_order)?;
                             order_manager.total_orders_repriced += 1;
-                            info!("✅ 成功重定价订单 - 新ID: {}, 新价格: {:.4}", 
-                                new_order_id, new_price);
+                            info!(
+                                "✅ 成功重定价订单 - 新ID: {}, 新价格: {:.4}",
+                                new_order_id, new_price
+                            );
                         }
                         Err(e) => {
                             warn!("⚠️ 重定价订单失败: {}", e);
@@ -831,7 +1259,7 @@ async fn check_expired_orders(
                     }
                 }
             }
-            
+
             ExpiryStrategy::Extend => {
                 // 延长过期时间
                 let order_id = expired_order.order_id; // 保存订单ID用于日志
@@ -839,7 +1267,7 @@ async fn check_expired_orders(
                 order_manager.add_order(expired_order)?;
                 info!("⏰ 延长订单过期时间 - ID: {:?}", order_id);
             }
-            
+
             ExpiryStrategy::ConvertToMarket => {
                 // 转换为市价单（仅限高优先级）
                 if expired_order.priority.is_high() {
@@ -939,14 +1367,14 @@ struct ParameterCheckpoint {
 // 退出原因枚举
 #[derive(Debug, Clone, PartialEq)]
 enum ShutdownReason {
-    UserSignal,           // 用户信号 (SIGINT/SIGTERM)
-    StopLossTriggered,    // 止损触发
-    MarginInsufficient,   // 保证金不足
-    NetworkError,         // 网络错误
+    UserSignal,         // 用户信号 (SIGINT/SIGTERM)
+    StopLossTriggered,  // 止损触发
+    MarginInsufficient, // 保证金不足
+    NetworkError,       // 网络错误
     #[allow(dead_code)]
-    ConfigurationError,   // 配置错误
-    EmergencyShutdown,    // 紧急关闭
-    NormalExit,          // 正常退出
+    ConfigurationError, // 配置错误
+    EmergencyShutdown,  // 紧急关闭
+    NormalExit,         // 正常退出
 }
 
 impl ShutdownReason {
@@ -1006,7 +1434,7 @@ struct DynamicGridParams {
     current_trade_amount: f64,
     last_optimization_time: u64, // 改为Unix timestamp便于序列化
     optimization_count: u32,
-    performance_window: Vec<f64>, // 滑动窗口性能记录
+    performance_window: Vec<f64>,          // 滑动窗口性能记录
     checkpoints: Vec<ParameterCheckpoint>, // 回滚检查点
     last_checkpoint_time: u64,
     rollback_threshold: f64, // 回滚阈值（性能下降超过此值时回滚）
@@ -1018,11 +1446,17 @@ impl DynamicGridParams {
             current_min_spacing: grid_config.min_grid_spacing,
             current_max_spacing: grid_config.max_grid_spacing,
             current_trade_amount: grid_config.trade_amount,
-            last_optimization_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            last_optimization_time: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
             optimization_count: 0,
             performance_window: Vec::new(),
             checkpoints: Vec::new(),
-            last_checkpoint_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            last_checkpoint_time: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
             rollback_threshold: 15.0, // 性能下降超过15分时触发回滚
         }
     }
@@ -1033,66 +1467,79 @@ impl DynamicGridParams {
             Ok(content) => {
                 match serde_json::from_str::<DynamicGridParams>(&content) {
                     Ok(mut params) => {
-                        info!("✅ 成功加载动态参数 - 优化次数: {}, 检查点数: {}", 
-                            params.optimization_count, params.checkpoints.len());
-                        
+                        info!(
+                            "✅ 成功加载动态参数 - 优化次数: {}, 检查点数: {}",
+                            params.optimization_count,
+                            params.checkpoints.len()
+                        );
+
                         // 使用增强的参数验证
-                        let validation_result = validate_dynamic_parameters(&params, grid_config, "加载时");
+                        let validation_result =
+                            validate_dynamic_parameters(&params, grid_config, "加载时");
                         validation_result.log_results("动态参数加载");
-                        
+
                         // 如果验证失败，进行参数修复
                         if !validation_result.is_valid {
                             warn!("⚠️ 加载的动态参数验证失败，进行自动修复");
-                            
+
                             // 修复最小间距
-                            if params.current_min_spacing < grid_config.min_grid_spacing * 0.1 
-                                || params.current_min_spacing > grid_config.max_grid_spacing {
-                                warn!("🔧 修复最小间距: {:.4}% -> {:.4}%", 
+                            if params.current_min_spacing < grid_config.min_grid_spacing * 0.1
+                                || params.current_min_spacing > grid_config.max_grid_spacing
+                            {
+                                warn!(
+                                    "🔧 修复最小间距: {:.4}% -> {:.4}%",
                                     params.current_min_spacing * 100.0,
-                                    grid_config.min_grid_spacing * 100.0);
+                                    grid_config.min_grid_spacing * 100.0
+                                );
                                 params.current_min_spacing = grid_config.min_grid_spacing;
                             }
-                            
+
                             // 修复最大间距
-                            if params.current_max_spacing < params.current_min_spacing 
-                                || params.current_max_spacing > grid_config.max_grid_spacing * 2.0 {
-                                warn!("🔧 修复最大间距: {:.4}% -> {:.4}%", 
+                            if params.current_max_spacing < params.current_min_spacing
+                                || params.current_max_spacing > grid_config.max_grid_spacing * 2.0
+                            {
+                                warn!(
+                                    "🔧 修复最大间距: {:.4}% -> {:.4}%",
                                     params.current_max_spacing * 100.0,
-                                    grid_config.max_grid_spacing * 100.0);
+                                    grid_config.max_grid_spacing * 100.0
+                                );
                                 params.current_max_spacing = grid_config.max_grid_spacing;
                             }
-                            
+
                             // 修复交易金额
-                            if params.current_trade_amount < grid_config.trade_amount * 0.1 
-                                || params.current_trade_amount > grid_config.total_capital * 0.2 {
-                                warn!("🔧 修复交易金额: {:.2} -> {:.2}", 
-                                    params.current_trade_amount,
-                                    grid_config.trade_amount);
+                            if params.current_trade_amount < grid_config.trade_amount * 0.1
+                                || params.current_trade_amount > grid_config.total_capital * 0.2
+                            {
+                                warn!(
+                                    "🔧 修复交易金额: {:.2} -> {:.2}",
+                                    params.current_trade_amount, grid_config.trade_amount
+                                );
                                 params.current_trade_amount = grid_config.trade_amount;
                             }
-                            
+
                             // 修复回滚阈值
                             if params.rollback_threshold < 5.0 || params.rollback_threshold > 50.0 {
                                 warn!("🔧 修复回滚阈值: {:.1} -> 15.0", params.rollback_threshold);
                                 params.rollback_threshold = 15.0;
                             }
-                            
+
                             // 清理过多的检查点
                             if params.checkpoints.len() > 20 {
                                 let excess = params.checkpoints.len() - 10;
                                 params.checkpoints.drain(0..excess);
                                 warn!("🔧 清理{}个过期检查点", excess);
                             }
-                            
+
                             // 清理过多的性能窗口数据
                             if params.performance_window.len() > 50 {
                                 let excess = params.performance_window.len() - 20;
                                 params.performance_window.drain(0..excess);
                                 warn!("🔧 清理{}个过期性能数据", excess);
                             }
-                            
+
                             // 重新验证修复后的参数
-                            let fixed_validation = validate_dynamic_parameters(&params, grid_config, "修复后");
+                            let fixed_validation =
+                                validate_dynamic_parameters(&params, grid_config, "修复后");
                             if fixed_validation.is_valid {
                                 info!("✅ 参数修复成功");
                             } else {
@@ -1100,7 +1547,7 @@ impl DynamicGridParams {
                                 return Self::new(grid_config);
                             }
                         }
-                        
+
                         params
                     }
                     Err(e) => {
@@ -1119,21 +1566,25 @@ impl DynamicGridParams {
     // 保存参数到文件
     fn save_to_file(&self, file_path: &str) -> Result<(), GridStrategyError> {
         match serde_json::to_string_pretty(self) {
-            Ok(content) => {
-                match std::fs::write(file_path, content) {
-                    Ok(_) => {
-                        info!("💾 动态参数已保存到文件: {}", file_path);
-                        Ok(())
-                    }
-                    Err(e) => {
-                        error!("❌ 保存动态参数失败: {:?}", e);
-                        Err(GridStrategyError::ConfigError(format!("保存参数失败: {:?}", e)))
-                    }
+            Ok(content) => match std::fs::write(file_path, content) {
+                Ok(_) => {
+                    info!("💾 动态参数已保存到文件: {}", file_path);
+                    Ok(())
                 }
-            }
+                Err(e) => {
+                    error!("❌ 保存动态参数失败: {:?}", e);
+                    Err(GridStrategyError::ConfigError(format!(
+                        "保存参数失败: {:?}",
+                        e
+                    )))
+                }
+            },
             Err(e) => {
                 error!("❌ 序列化动态参数失败: {:?}", e);
-                Err(GridStrategyError::ConfigError(format!("序列化参数失败: {:?}", e)))
+                Err(GridStrategyError::ConfigError(format!(
+                    "序列化参数失败: {:?}",
+                    e
+                )))
             }
         }
     }
@@ -1144,21 +1595,31 @@ impl DynamicGridParams {
             min_spacing: self.current_min_spacing,
             max_spacing: self.current_max_spacing,
             trade_amount: self.current_trade_amount,
-            checkpoint_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            checkpoint_time: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
             performance_before: current_performance,
             reason: reason.clone(),
         };
-        
+
         self.checkpoints.push(checkpoint);
-        self.last_checkpoint_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        
+        self.last_checkpoint_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
         // 保持最多10个检查点
         if self.checkpoints.len() > 10 {
             self.checkpoints.remove(0);
         }
-        
-        info!("📍 创建参数检查点 - 原因: {}, 性能: {:.1}, 检查点数: {}", 
-            reason, current_performance, self.checkpoints.len());
+
+        info!(
+            "📍 创建参数检查点 - 原因: {}, 性能: {:.1}, 检查点数: {}",
+            reason,
+            current_performance,
+            self.checkpoints.len()
+        );
     }
 
     // 检查是否需要回滚
@@ -1166,19 +1627,22 @@ impl DynamicGridParams {
         if self.checkpoints.is_empty() {
             return None;
         }
-        
+
         let latest_checkpoint = self.checkpoints.last().unwrap();
         let performance_decline = latest_checkpoint.performance_before - current_performance;
-        
+
         // 检查时间条件：优化后至少6小时才考虑回滚
         let time_since_checkpoint = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_secs() - latest_checkpoint.checkpoint_time;
-        
+            .as_secs()
+            - latest_checkpoint.checkpoint_time;
+
         if time_since_checkpoint >= 6 * 60 * 60 && performance_decline > self.rollback_threshold {
-            info!("🔄 检测到性能下降 {:.1}分，超过阈值 {:.1}分，建议回滚", 
-                performance_decline, self.rollback_threshold);
+            info!(
+                "🔄 检测到性能下降 {:.1}分，超过阈值 {:.1}分，建议回滚",
+                performance_decline, self.rollback_threshold
+            );
             Some(latest_checkpoint)
         } else {
             None
@@ -1190,20 +1654,28 @@ impl DynamicGridParams {
         info!("🔄 执行参数回滚:");
         info!("   回滚原因: {}", checkpoint.reason);
         info!("   回滚前性能: {:.1}", checkpoint.performance_before);
-        info!("   最小间距: {:.4}% -> {:.4}%", 
-            self.current_min_spacing * 100.0, checkpoint.min_spacing * 100.0);
-        info!("   最大间距: {:.4}% -> {:.4}%", 
-            self.current_max_spacing * 100.0, checkpoint.max_spacing * 100.0);
-        info!("   交易金额: {:.2} -> {:.2}", 
-            self.current_trade_amount, checkpoint.trade_amount);
-        
+        info!(
+            "   最小间距: {:.4}% -> {:.4}%",
+            self.current_min_spacing * 100.0,
+            checkpoint.min_spacing * 100.0
+        );
+        info!(
+            "   最大间距: {:.4}% -> {:.4}%",
+            self.current_max_spacing * 100.0,
+            checkpoint.max_spacing * 100.0
+        );
+        info!(
+            "   交易金额: {:.2} -> {:.2}",
+            self.current_trade_amount, checkpoint.trade_amount
+        );
+
         self.current_min_spacing = checkpoint.min_spacing;
         self.current_max_spacing = checkpoint.max_spacing;
         self.current_trade_amount = checkpoint.trade_amount;
-        
+
         // 移除已回滚的检查点
         self.checkpoints.pop();
-        
+
         info!("✅ 参数回滚完成");
     }
 }
@@ -1225,11 +1697,11 @@ struct GridState {
     performance_history: Vec<PerformanceRecord>, // 性能历史记录
     current_metrics: PerformanceMetrics,         // 当前性能指标
     #[serde(with = "system_time_serde")]
-    last_margin_check: SystemTime,              // 上次保证金检查时间
-    connection_retry_count: u32,                // 连接重试次数
+    last_margin_check: SystemTime, // 上次保证金检查时间
+    connection_retry_count: u32,                 // 连接重试次数
     #[serde(with = "system_time_serde")]
-    last_order_batch_time: SystemTime,          // 上次批量下单时间
-    dynamic_params: DynamicGridParams,          // 动态网格参数
+    last_order_batch_time: SystemTime, // 上次批量下单时间
+    dynamic_params: DynamicGridParams,           // 动态网格参数
 }
 
 // 市场趋势枚举
@@ -1286,7 +1758,10 @@ impl MarketState {
     }
 
     fn requires_conservative_strategy(&self) -> bool {
-        matches!(self, MarketState::Extreme | MarketState::Flash | MarketState::ThinLiquidity)
+        matches!(
+            self,
+            MarketState::Extreme | MarketState::Flash | MarketState::ThinLiquidity
+        )
     }
 
     fn should_pause_trading(&self) -> bool {
@@ -1347,12 +1822,12 @@ struct MarketAnalysis {
     rsi: f64,
     short_ma: f64,
     long_ma: f64,
-    price_change_5min: f64, // 5分钟价格变化率
+    price_change_5min: f64,    // 5分钟价格变化率
     market_state: MarketState, // 市场状态
-    liquidity_score: f64,   // 流动性评分 (0-100)
-    price_stability: f64,   // 价格稳定性 (0-100)
+    liquidity_score: f64,      // 流动性评分 (0-100)
+    price_stability: f64,      // 价格稳定性 (0-100)
     #[allow(dead_code)]
-    volume_anomaly: f64,    // 成交量异常度 (0-100)
+    volume_anomaly: f64, // 成交量异常度 (0-100)
 }
 
 // 动态资金分配结果
@@ -1420,16 +1895,16 @@ struct StopLossResult {
 /// 风险事件类型
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 enum RiskEventType {
-    MarginInsufficient,    // 保证金不足
-    MaxDrawdownExceeded,   // 最大回撤超限
-    DailyLossExceeded,     // 每日亏损超限
-    PositionSizeExceeded,  // 持仓规模超限
-    VolatilitySpike,       // 波动率激增
-    LiquidityDrop,         // 流动性下降
-    NetworkIssue,          // 网络问题
-    OrderFailure,          // 订单失败
-    PriceGap,              // 价格跳空
-    SystemOverload,        // 系统过载
+    MarginInsufficient,   // 保证金不足
+    MaxDrawdownExceeded,  // 最大回撤超限
+    DailyLossExceeded,    // 每日亏损超限
+    PositionSizeExceeded, // 持仓规模超限
+    VolatilitySpike,      // 波动率激增
+    LiquidityDrop,        // 流动性下降
+    NetworkIssue,         // 网络问题
+    OrderFailure,         // 订单失败
+    PriceGap,             // 价格跳空
+    SystemOverload,       // 系统过载
 }
 
 impl RiskEventType {
@@ -1466,16 +1941,16 @@ impl RiskEventType {
 
     fn severity_level(&self) -> u8 {
         match self {
-            RiskEventType::MarginInsufficient => 5,    // 最高风险
-            RiskEventType::MaxDrawdownExceeded => 5,   // 最高风险
-            RiskEventType::DailyLossExceeded => 4,     // 高风险
-            RiskEventType::PositionSizeExceeded => 4,  // 高风险
-            RiskEventType::VolatilitySpike => 3,       // 中等风险
-            RiskEventType::LiquidityDrop => 3,         // 中等风险
-            RiskEventType::PriceGap => 3,              // 中等风险
-            RiskEventType::NetworkIssue => 2,          // 低风险
-            RiskEventType::OrderFailure => 2,          // 低风险
-            RiskEventType::SystemOverload => 2,        // 低风险
+            RiskEventType::MarginInsufficient => 5,   // 最高风险
+            RiskEventType::MaxDrawdownExceeded => 5,  // 最高风险
+            RiskEventType::DailyLossExceeded => 4,    // 高风险
+            RiskEventType::PositionSizeExceeded => 4, // 高风险
+            RiskEventType::VolatilitySpike => 3,      // 中等风险
+            RiskEventType::LiquidityDrop => 3,        // 中等风险
+            RiskEventType::PriceGap => 3,             // 中等风险
+            RiskEventType::NetworkIssue => 2,         // 低风险
+            RiskEventType::OrderFailure => 2,         // 低风险
+            RiskEventType::SystemOverload => 2,       // 低风险
         }
     }
 
@@ -1551,16 +2026,16 @@ impl RiskEvent {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct RiskCheckResult {
-    overall_risk_level: u8,        // 1-5级风险等级
-    should_pause_trading: bool,    // 是否应暂停交易
-    should_reduce_position: bool,  // 是否应减仓
-    should_emergency_exit: bool,   // 是否应紧急退出
-    new_events: Vec<RiskEvent>,    // 新发现的风险事件
-    recommendations: Vec<String>,  // 风险控制建议
-    margin_ratio: f64,             // 当前保证金率
-    drawdown_ratio: f64,           // 当前回撤率
-    daily_loss_ratio: f64,         // 当前日亏损率
-    position_risk_score: f64,      // 持仓风险评分 (0-100)
+    overall_risk_level: u8,       // 1-5级风险等级
+    should_pause_trading: bool,   // 是否应暂停交易
+    should_reduce_position: bool, // 是否应减仓
+    should_emergency_exit: bool,  // 是否应紧急退出
+    new_events: Vec<RiskEvent>,   // 新发现的风险事件
+    recommendations: Vec<String>, // 风险控制建议
+    margin_ratio: f64,            // 当前保证金率
+    drawdown_ratio: f64,          // 当前回撤率
+    daily_loss_ratio: f64,        // 当前日亏损率
+    position_risk_score: f64,     // 持仓风险评分 (0-100)
 }
 
 impl RiskCheckResult {
@@ -1583,19 +2058,19 @@ impl RiskCheckResult {
         if event.is_critical() {
             self.overall_risk_level = self.overall_risk_level.max(event.severity);
         }
-        
+
         if event.event_type.should_pause_trading() {
             self.should_pause_trading = true;
         }
-        
+
         if event.event_type.requires_immediate_action() {
             self.should_reduce_position = true;
         }
-        
+
         if event.severity >= 5 {
             self.should_emergency_exit = true;
         }
-        
+
         self.new_events.push(event);
     }
 
@@ -1661,16 +2136,16 @@ impl RiskControlModule {
         user_address: ethers::types::Address,
     ) -> Result<RiskCheckResult, GridStrategyError> {
         let now = SystemTime::now();
-        
+
         // 检查是否到了检查时间
         if now.duration_since(self.last_check_time).unwrap_or_default() < self.check_interval {
             return Ok(RiskCheckResult::new());
         }
-        
+
         self.last_check_time = now;
-        
+
         let mut result = RiskCheckResult::new();
-        
+
         // 获取当前状态
         let (current_capital, position_quantity, _realized_profit, max_drawdown) = {
             let state = self.grid_state.lock().unwrap();
@@ -1681,19 +2156,21 @@ impl RiskControlModule {
                 state.current_metrics.max_drawdown,
             )
         };
-        
+
         // 1. 检查保证金率
         match self.check_margin_ratio(info_client, user_address).await {
             Ok(margin_ratio) => {
                 result.margin_ratio = margin_ratio;
                 self.last_margin_ratio = margin_ratio;
-                
+
                 if margin_ratio < self.grid_config.margin_safety_threshold {
                     let event = RiskEvent::new(
                         RiskEventType::MarginInsufficient,
-                        format!("保证金率({:.1}%)低于安全阈值({:.1}%)", 
-                            margin_ratio * 100.0, 
-                            self.grid_config.margin_safety_threshold * 100.0),
+                        format!(
+                            "保证金率({:.1}%)低于安全阈值({:.1}%)",
+                            margin_ratio * 100.0,
+                            self.grid_config.margin_safety_threshold * 100.0
+                        ),
                         margin_ratio,
                         self.grid_config.margin_safety_threshold,
                     );
@@ -1703,7 +2180,7 @@ impl RiskControlModule {
             Err(e) => {
                 warn!("⚠️ 保证金率检查失败: {:?}", e);
                 self.consecutive_failures += 1;
-                
+
                 if self.consecutive_failures >= 3 {
                     let event = RiskEvent::new(
                         RiskEventType::NetworkIssue,
@@ -1715,58 +2192,65 @@ impl RiskControlModule {
                 }
             }
         }
-        
+
         // 2. 检查最大回撤
         result.drawdown_ratio = max_drawdown;
         if max_drawdown > self.grid_config.max_drawdown {
             let event = RiskEvent::new(
                 RiskEventType::MaxDrawdownExceeded,
-                format!("最大回撤({:.2}%)超过限制({:.2}%)", 
-                    max_drawdown * 100.0, 
-                    self.grid_config.max_drawdown * 100.0),
+                format!(
+                    "最大回撤({:.2}%)超过限制({:.2}%)",
+                    max_drawdown * 100.0,
+                    self.grid_config.max_drawdown * 100.0
+                ),
                 max_drawdown,
                 self.grid_config.max_drawdown,
             );
             result.add_event(event);
         }
-        
+
         // 3. 检查每日亏损
-        let daily_loss_ratio = (self.daily_start_capital - current_capital) / self.daily_start_capital;
+        let daily_loss_ratio =
+            (self.daily_start_capital - current_capital) / self.daily_start_capital;
         result.daily_loss_ratio = daily_loss_ratio;
-        
+
         if daily_loss_ratio > self.grid_config.max_daily_loss {
             let event = RiskEvent::new(
                 RiskEventType::DailyLossExceeded,
-                format!("每日亏损({:.2}%)超过限制({:.2}%)", 
-                    daily_loss_ratio * 100.0, 
-                    self.grid_config.max_daily_loss * 100.0),
+                format!(
+                    "每日亏损({:.2}%)超过限制({:.2}%)",
+                    daily_loss_ratio * 100.0,
+                    self.grid_config.max_daily_loss * 100.0
+                ),
                 daily_loss_ratio,
                 self.grid_config.max_daily_loss,
             );
             result.add_event(event);
         }
-        
+
         // 4. 检查持仓规模
         let position_value = position_quantity.abs() * current_price;
         let position_ratio = position_value / current_capital;
         result.position_risk_score = position_ratio * 100.0;
-        
+
         if position_value > self.grid_config.max_position {
             let event = RiskEvent::new(
                 RiskEventType::PositionSizeExceeded,
-                format!("持仓价值({:.2})超过最大限制({:.2})", 
-                    position_value, 
-                    self.grid_config.max_position),
+                format!(
+                    "持仓价值({:.2})超过最大限制({:.2})",
+                    position_value, self.grid_config.max_position
+                ),
                 position_value,
                 self.grid_config.max_position,
             );
             result.add_event(event);
         }
-        
+
         // 5. 检查市场波动率
         if price_history.len() >= 10 {
             let volatility = calculate_market_volatility(price_history);
-            if volatility > 0.15 { // 15%的波动率阈值
+            if volatility > 0.15 {
+                // 15%的波动率阈值
                 let event = RiskEvent::new(
                     RiskEventType::VolatilitySpike,
                     format!("市场波动率({:.2}%)异常高", volatility * 100.0),
@@ -1776,13 +2260,14 @@ impl RiskControlModule {
                 result.add_event(event);
             }
         }
-        
+
         // 6. 检查价格跳空
         if price_history.len() >= 2 {
             let last_price = price_history[price_history.len() - 2];
             let price_gap = ((current_price - last_price) / last_price).abs();
-            
-            if price_gap > 0.05 { // 5%的价格跳空阈值
+
+            if price_gap > 0.05 {
+                // 5%的价格跳空阈值
                 let event = RiskEvent::new(
                     RiskEventType::PriceGap,
                     format!("价格跳空({:.2}%)过大", price_gap * 100.0),
@@ -1792,10 +2277,10 @@ impl RiskControlModule {
                 result.add_event(event);
             }
         }
-        
+
         // 7. 生成风险控制建议
         self.generate_recommendations(&mut result);
-        
+
         // 8. 记录风险指标历史
         self.risk_metrics_history.push((
             now,
@@ -1803,24 +2288,33 @@ impl RiskControlModule {
             result.drawdown_ratio,
             result.daily_loss_ratio,
         ));
-        
+
         // 保留最近100条记录
         if self.risk_metrics_history.len() > 100 {
             self.risk_metrics_history.remove(0);
         }
-        
+
         // 9. 检查是否需要重置每日统计
-        if now.duration_since(self.daily_start_time).unwrap_or_default().as_secs() >= 24 * 60 * 60 {
+        if now
+            .duration_since(self.daily_start_time)
+            .unwrap_or_default()
+            .as_secs()
+            >= 24 * 60 * 60
+        {
             self.reset_daily_stats();
         }
-        
+
         Ok(result)
     }
 
     /// 处理风险事件
     async fn handle_risk_event(&mut self, mut event: RiskEvent) -> Result<(), GridStrategyError> {
-        info!("🚨 处理风险事件: {} - {}", event.event_type.as_str(), event.description);
-        
+        info!(
+            "🚨 处理风险事件: {} - {}",
+            event.event_type.as_str(),
+            event.description
+        );
+
         let action = match event.event_type {
             RiskEventType::MarginInsufficient => {
                 self.stop_trading.store(true, Ordering::SeqCst);
@@ -1834,37 +2328,23 @@ impl RiskControlModule {
                 self.stop_trading.store(true, Ordering::SeqCst);
                 "每日亏损超限，暂停交易".to_string()
             }
-            RiskEventType::PositionSizeExceeded => {
-                "建议减仓，降低持仓风险".to_string()
-            }
-            RiskEventType::VolatilitySpike => {
-                "市场波动加剧，建议减少网格密度".to_string()
-            }
-            RiskEventType::LiquidityDrop => {
-                "流动性下降，建议暂停新订单".to_string()
-            }
-            RiskEventType::NetworkIssue => {
-                "网络问题，增加重试机制".to_string()
-            }
-            RiskEventType::OrderFailure => {
-                "订单失败，检查订单参数".to_string()
-            }
-            RiskEventType::PriceGap => {
-                "价格跳空，暂停交易等待市场稳定".to_string()
-            }
-            RiskEventType::SystemOverload => {
-                "系统过载，降低交易频率".to_string()
-            }
+            RiskEventType::PositionSizeExceeded => "建议减仓，降低持仓风险".to_string(),
+            RiskEventType::VolatilitySpike => "市场波动加剧，建议减少网格密度".to_string(),
+            RiskEventType::LiquidityDrop => "流动性下降，建议暂停新订单".to_string(),
+            RiskEventType::NetworkIssue => "网络问题，增加重试机制".to_string(),
+            RiskEventType::OrderFailure => "订单失败，检查订单参数".to_string(),
+            RiskEventType::PriceGap => "价格跳空，暂停交易等待市场稳定".to_string(),
+            RiskEventType::SystemOverload => "系统过载，降低交易频率".to_string(),
         };
-        
+
         event.mark_handled(action.clone());
         self.risk_events.push(event);
-        
+
         // 保留最近50个风险事件
         if self.risk_events.len() > 50 {
             self.risk_events.remove(0);
         }
-        
+
         info!("✅ 风险事件处理完成: {}", action);
         Ok(())
     }
@@ -1876,21 +2356,24 @@ impl RiskControlModule {
         } else if result.margin_ratio < 2.0 {
             result.add_recommendation("保证金率偏低，建议适当减仓".to_string());
         }
-        
+
         if result.drawdown_ratio > 0.8 * self.grid_config.max_drawdown {
             result.add_recommendation("回撤接近限制，建议降低风险敞口".to_string());
         }
-        
+
         if result.daily_loss_ratio > 0.8 * self.grid_config.max_daily_loss {
             result.add_recommendation("日亏损接近限制，建议暂停交易".to_string());
         }
-        
+
         if result.position_risk_score > 80.0 {
             result.add_recommendation("持仓风险过高，建议分批减仓".to_string());
         }
-        
+
         if self.consecutive_failures > 0 {
-            result.add_recommendation(format!("连续{}次检查失败，建议检查网络连接", self.consecutive_failures));
+            result.add_recommendation(format!(
+                "连续{}次检查失败，建议检查网络连接",
+                self.consecutive_failures
+            ));
         }
     }
 
@@ -1905,7 +2388,7 @@ impl RiskControlModule {
                 let margin_summary = &account_info.margin_summary;
                 let account_value = margin_summary.account_value.parse().unwrap_or(0.0);
                 let total_margin_used = margin_summary.total_margin_used.parse().unwrap_or(0.0);
-                
+
                 if total_margin_used > 0.0 {
                     Ok(account_value / total_margin_used)
                 } else {
@@ -1926,11 +2409,11 @@ impl RiskControlModule {
             let state = self.grid_state.lock().unwrap();
             state.available_funds + state.position_quantity * 0.0 // 需要当前价格
         };
-        
+
         self.daily_start_capital = current_capital;
         self.daily_start_time = SystemTime::now();
         self.consecutive_failures = 0;
-        
+
         info!("🔄 每日风险统计已重置");
     }
 
@@ -1947,7 +2430,7 @@ impl RiskControlModule {
     fn get_risk_report(&self) -> String {
         let recent_events = self.get_recent_events(24);
         let critical_events = recent_events.iter().filter(|e| e.is_critical()).count();
-        
+
         format!(
             "=== 风险控制报告 ===\n\
             最近24小时风险事件: {}\n\
@@ -1972,12 +2455,12 @@ impl RiskControlModule {
 /// 连接状态枚举
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 enum ConnectionStatus {
-    Connected,       // 已连接
-    Disconnected,    // 已断开
-    Connecting,      // 连接中
-    Reconnecting,    // 重连中
-    Failed,          // 连接失败
-    Unstable,        // 连接不稳定
+    Connected,    // 已连接
+    Disconnected, // 已断开
+    Connecting,   // 连接中
+    Reconnecting, // 重连中
+    Failed,       // 连接失败
+    Unstable,     // 连接不稳定
 }
 
 impl ConnectionStatus {
@@ -2030,16 +2513,16 @@ impl ConnectionStatus {
 /// 连接事件类型
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 enum ConnectionEventType {
-    Connected,           // 连接成功
-    Disconnected,        // 连接断开
-    ReconnectAttempt,    // 重连尝试
-    ReconnectSuccess,    // 重连成功
-    ReconnectFailed,     // 重连失败
-    HeartbeatTimeout,    // 心跳超时
-    DataReceived,        // 数据接收
-    ErrorOccurred,       // 错误发生
-    QualityDegraded,     // 连接质量下降
-    QualityImproved,     // 连接质量改善
+    Connected,        // 连接成功
+    Disconnected,     // 连接断开
+    ReconnectAttempt, // 重连尝试
+    ReconnectSuccess, // 重连成功
+    ReconnectFailed,  // 重连失败
+    HeartbeatTimeout, // 心跳超时
+    DataReceived,     // 数据接收
+    ErrorOccurred,    // 错误发生
+    QualityDegraded,  // 连接质量下降
+    QualityImproved,  // 连接质量改善
 }
 
 impl ConnectionEventType {
@@ -2171,12 +2654,12 @@ impl ConnectionEvent {
 /// 连接质量指标
 #[derive(Debug, Clone)]
 struct ConnectionQuality {
-    average_latency_ms: f64,      // 平均延迟
-    packet_loss_rate: f64,        // 丢包率 (0-1)
-    connection_stability: f64,    // 连接稳定性 (0-100)
-    data_throughput: f64,         // 数据吞吐量
-    error_rate: f64,              // 错误率 (0-1)
-    uptime_percentage: f64,       // 在线时间百分比 (0-100)
+    average_latency_ms: f64,   // 平均延迟
+    packet_loss_rate: f64,     // 丢包率 (0-1)
+    connection_stability: f64, // 连接稳定性 (0-100)
+    data_throughput: f64,      // 数据吞吐量
+    error_rate: f64,           // 错误率 (0-1)
+    uptime_percentage: f64,    // 在线时间百分比 (0-100)
 }
 
 impl ConnectionQuality {
@@ -2196,7 +2679,8 @@ impl ConnectionQuality {
     fn update_latency(&mut self, latency_ms: u64) {
         // 使用指数移动平均
         let alpha = 0.1;
-        self.average_latency_ms = alpha * latency_ms as f64 + (1.0 - alpha) * self.average_latency_ms;
+        self.average_latency_ms =
+            alpha * latency_ms as f64 + (1.0 - alpha) * self.average_latency_ms;
     }
 
     /// 记录错误
@@ -2230,7 +2714,9 @@ impl ConnectionQuality {
         let error_score = (1.0 - self.error_rate) * 100.0;
         let stability_score = self.connection_stability;
 
-        (latency_score * 0.3 + error_score * 0.4 + stability_score * 0.3).min(100.0).max(0.0)
+        (latency_score * 0.3 + error_score * 0.4 + stability_score * 0.3)
+            .min(100.0)
+            .max(0.0)
     }
 
     /// 判断连接质量是否良好
@@ -2252,19 +2738,19 @@ struct ConnectionManager {
     last_data_received: Instant,
     reconnect_count: u32,
     status: ConnectionStatus,
-    
+
     // 连接配置
     heartbeat_interval: Duration,
     heartbeat_timeout: Duration,
     max_reconnect_attempts: u32,
     reconnect_base_delay: Duration,
     max_reconnect_delay: Duration,
-    
+
     // 连接质量监控
     quality: ConnectionQuality,
     events: Vec<ConnectionEvent>,
     max_events: usize,
-    
+
     // 统计信息
     total_connections: u32,
     total_disconnections: u32,
@@ -2273,7 +2759,7 @@ struct ConnectionManager {
     connection_start_time: Instant,
     total_downtime: Duration,
     last_disconnect_time: Option<Instant>,
-    
+
     // 自适应参数
     adaptive_heartbeat: bool,
     dynamic_timeout: bool,
@@ -2289,18 +2775,18 @@ impl ConnectionManager {
             last_data_received: now,
             reconnect_count: 0,
             status: ConnectionStatus::Disconnected,
-            
+
             // 默认配置
             heartbeat_interval: Duration::from_secs(30),
             heartbeat_timeout: Duration::from_secs(60),
             max_reconnect_attempts: 10,
             reconnect_base_delay: Duration::from_secs(1),
             max_reconnect_delay: Duration::from_secs(60),
-            
+
             quality: ConnectionQuality::new(),
             events: Vec::new(),
             max_events: 100,
-            
+
             total_connections: 0,
             total_disconnections: 0,
             total_reconnect_attempts: 0,
@@ -2308,7 +2794,7 @@ impl ConnectionManager {
             connection_start_time: now,
             total_downtime: Duration::ZERO,
             last_disconnect_time: None,
-            
+
             adaptive_heartbeat: true,
             dynamic_timeout: true,
             connection_degraded: false,
@@ -2322,62 +2808,65 @@ impl ConnectionManager {
         user_address: ethers::types::Address,
     ) -> Result<bool, GridStrategyError> {
         let check_start = Instant::now();
-        
+
         // 1. 检查心跳超时
         if self.last_heartbeat.elapsed() > self.heartbeat_timeout {
             self.record_event(ConnectionEvent::new(
                 ConnectionEventType::HeartbeatTimeout,
                 format!("心跳超时: {}秒", self.last_heartbeat.elapsed().as_secs()),
             ));
-            
+
             self.status = ConnectionStatus::Unstable;
             self.quality.record_error();
-            
+
             // 尝试重连
             return self.attempt_reconnect(info_client, user_address).await;
         }
-        
+
         // 2. 检查数据接收超时
         if self.last_data_received.elapsed() > self.heartbeat_timeout * 2 {
             self.record_event(ConnectionEvent::new(
                 ConnectionEventType::QualityDegraded,
-                format!("数据接收超时: {}秒", self.last_data_received.elapsed().as_secs()),
+                format!(
+                    "数据接收超时: {}秒",
+                    self.last_data_received.elapsed().as_secs()
+                ),
             ));
-            
+
             self.connection_degraded = true;
             self.quality.record_error();
         }
-        
+
         // 3. 执行实际连接测试
         match self.test_connection(info_client, user_address).await {
             Ok(latency_ms) => {
                 let check_duration = check_start.elapsed();
-                
+
                 // 更新连接状态
                 if self.status != ConnectionStatus::Connected {
                     self.on_connection_established();
                 }
-                
+
                 // 更新质量指标
                 self.quality.update_latency(latency_ms);
                 self.quality.record_success();
-                
+
                 // 记录数据接收
                 self.last_data_received = Instant::now();
                 self.last_heartbeat = Instant::now();
-                
+
                 // 记录事件
                 self.record_event(ConnectionEvent::with_latency(
                     ConnectionEventType::DataReceived,
                     format!("连接检查成功，延迟: {}ms", latency_ms),
                     latency_ms,
                 ));
-                
+
                 // 自适应调整
                 if self.adaptive_heartbeat {
                     self.adjust_heartbeat_interval(latency_ms);
                 }
-                
+
                 // 重置连接降级标志
                 if self.connection_degraded && self.quality.is_good() {
                     self.connection_degraded = false;
@@ -2386,7 +2875,7 @@ impl ConnectionManager {
                         "连接质量已恢复".to_string(),
                     ));
                 }
-                
+
                 info!(
                     "连接检查成功 - 状态: {}, 延迟: {}ms, 质量评分: {:.1}, 检查耗时: {}ms",
                     self.status.as_str(),
@@ -2394,13 +2883,13 @@ impl ConnectionManager {
                     self.quality.overall_score(),
                     check_duration.as_millis()
                 );
-                
+
                 Ok(true)
             }
             Err(e) => {
                 // 连接失败
                 self.on_connection_lost(&e);
-                
+
                 // 尝试重连
                 self.attempt_reconnect(info_client, user_address).await
             }
@@ -2417,27 +2906,32 @@ impl ConnectionManager {
             self.reconnect_count += 1;
             self.total_reconnect_attempts += 1;
             self.status = ConnectionStatus::Reconnecting;
-            
+
             // 计算重连延迟（指数退避）
             let delay = self.calculate_reconnect_delay();
-            
+
             self.record_event(
                 ConnectionEvent::new(
                     ConnectionEventType::ReconnectAttempt,
-                    format!("开始第{}次重连尝试，延迟{}秒", self.reconnect_count, delay.as_secs()),
-                ).with_retry_count(self.reconnect_count)
+                    format!(
+                        "开始第{}次重连尝试，延迟{}秒",
+                        self.reconnect_count,
+                        delay.as_secs()
+                    ),
+                )
+                .with_retry_count(self.reconnect_count),
             );
-            
+
             info!(
                 "开始重连尝试 - 第{}/{}次，延迟: {}秒",
                 self.reconnect_count,
                 self.max_reconnect_attempts,
                 delay.as_secs()
             );
-            
+
             // 等待重连延迟
             sleep(delay).await;
-            
+
             // 执行重连
             match self.reconnect(info_client, user_address).await {
                 Ok(()) => {
@@ -2450,34 +2944,39 @@ impl ConnectionManager {
                         format!("第{}次重连失败", self.reconnect_count),
                         e.to_string(),
                     ));
-                    
+
                     warn!(
                         "重连失败 - 第{}/{}次: {}",
                         self.reconnect_count, self.max_reconnect_attempts, e
                     );
-                    
+
                     // 继续下一次重连尝试
                 }
             }
         }
-        
+
         // 达到最大重试次数
         self.status = ConnectionStatus::Failed;
         self.record_event(
             ConnectionEvent::new(
                 ConnectionEventType::ReconnectFailed,
-                format!("重连失败，已达到最大重试次数: {}", self.max_reconnect_attempts),
-            ).with_retry_count(self.reconnect_count)
+                format!(
+                    "重连失败，已达到最大重试次数: {}",
+                    self.max_reconnect_attempts
+                ),
+            )
+            .with_retry_count(self.reconnect_count),
         );
-        
+
         error!(
             "连接重连失败 - 已达到最大重试次数: {}, 总重连尝试: {}",
             self.max_reconnect_attempts, self.total_reconnect_attempts
         );
-        
-        Err(GridStrategyError::NetworkError(
-            format!("连接重连失败，已达到最大重试次数: {}", self.max_reconnect_attempts)
-        ))
+
+        Err(GridStrategyError::NetworkError(format!(
+            "连接重连失败，已达到最大重试次数: {}",
+            self.max_reconnect_attempts
+        )))
     }
 
     /// 执行重连
@@ -2488,7 +2987,7 @@ impl ConnectionManager {
     ) -> Result<(), GridStrategyError> {
         // 注意：这里我们不能重新创建客户端，因为客户端是在外部创建的
         // 我们只能测试现有连接是否恢复
-        
+
         match self.test_connection(info_client, user_address).await {
             Ok(latency_ms) => {
                 self.quality.update_latency(latency_ms);
@@ -2509,7 +3008,7 @@ impl ConnectionManager {
         user_address: ethers::types::Address,
     ) -> Result<u64, GridStrategyError> {
         let start_time = Instant::now();
-        
+
         // 使用账户信息查询作为连接测试
         match get_account_info(info_client, user_address).await {
             Ok(_) => {
@@ -2526,26 +3025,26 @@ impl ConnectionManager {
             self.status,
             ConnectionStatus::Disconnected | ConnectionStatus::Failed
         );
-        
+
         self.status = ConnectionStatus::Connected;
         self.last_heartbeat = Instant::now();
         self.last_data_received = Instant::now();
-        
+
         if was_disconnected {
             self.total_connections += 1;
-            
+
             // 计算停机时间
             if let Some(disconnect_time) = self.last_disconnect_time {
                 self.total_downtime += disconnect_time.elapsed();
                 self.last_disconnect_time = None;
             }
         }
-        
+
         self.record_event(ConnectionEvent::new(
             ConnectionEventType::Connected,
             "连接已建立".to_string(),
         ));
-        
+
         info!(
             "连接已建立 - 总连接次数: {}, 质量评分: {:.1}",
             self.total_connections,
@@ -2559,16 +3058,16 @@ impl ConnectionManager {
             self.total_disconnections += 1;
             self.last_disconnect_time = Some(Instant::now());
         }
-        
+
         self.status = ConnectionStatus::Disconnected;
         self.quality.record_error();
-        
+
         self.record_event(ConnectionEvent::with_error(
             ConnectionEventType::Disconnected,
             "连接已断开".to_string(),
             error.to_string(),
         ));
-        
+
         warn!(
             "连接已断开 - 总断开次数: {}, 错误: {}",
             self.total_disconnections, error
@@ -2582,20 +3081,21 @@ impl ConnectionManager {
         self.status = ConnectionStatus::Connected;
         self.last_heartbeat = Instant::now();
         self.last_data_received = Instant::now();
-        
+
         // 计算停机时间
         if let Some(disconnect_time) = self.last_disconnect_time {
             self.total_downtime += disconnect_time.elapsed();
             self.last_disconnect_time = None;
         }
-        
+
         self.record_event(
             ConnectionEvent::new(
                 ConnectionEventType::ReconnectSuccess,
                 format!("重连成功，尝试次数: {}", self.total_reconnect_attempts),
-            ).with_retry_count(self.total_reconnect_attempts)
+            )
+            .with_retry_count(self.total_reconnect_attempts),
         );
-        
+
         info!(
             "重连成功 - 成功重连次数: {}/{}, 质量评分: {:.1}",
             self.successful_reconnects,
@@ -2608,11 +3108,11 @@ impl ConnectionManager {
     fn calculate_reconnect_delay(&self) -> Duration {
         let base_delay_ms = self.reconnect_base_delay.as_millis() as u64;
         let max_delay_ms = self.max_reconnect_delay.as_millis() as u64;
-        
+
         // 指数退避：delay = base * 2^(retry_count - 1)
         let delay_ms = base_delay_ms * 2_u64.pow((self.reconnect_count - 1).min(10));
         let final_delay_ms = delay_ms.min(max_delay_ms);
-        
+
         Duration::from_millis(final_delay_ms)
     }
 
@@ -2621,7 +3121,7 @@ impl ConnectionManager {
         if !self.adaptive_heartbeat {
             return;
         }
-        
+
         let new_interval = if latency_ms < 50 {
             Duration::from_secs(45) // 延迟低，可以延长心跳间隔
         } else if latency_ms < 100 {
@@ -2631,7 +3131,7 @@ impl ConnectionManager {
         } else {
             Duration::from_secs(15) // 延迟很高，频繁检查
         };
-        
+
         if new_interval != self.heartbeat_interval {
             self.heartbeat_interval = new_interval;
             info!(
@@ -2645,7 +3145,7 @@ impl ConnectionManager {
     /// 记录连接事件
     fn record_event(&mut self, event: ConnectionEvent) {
         self.events.push(event);
-        
+
         // 限制事件数量
         if self.events.len() > self.max_events {
             self.events.remove(0);
@@ -2737,7 +3237,11 @@ impl ConnectionManager {
             self.total_downtime.as_secs() / 60,
             self.last_heartbeat.elapsed().as_secs(),
             self.last_data_received.elapsed().as_secs(),
-            if self.connection_degraded { "是" } else { "否" },
+            if self.connection_degraded {
+                "是"
+            } else {
+                "否"
+            },
             recent_errors.len(),
             self.reconnect_count,
             self.max_reconnect_attempts
@@ -2754,7 +3258,7 @@ impl ConnectionManager {
         self.total_downtime = Duration::ZERO;
         self.events.clear();
         self.quality = ConnectionQuality::new();
-        
+
         info!("连接管理器统计信息已重置");
     }
 
@@ -2765,15 +3269,15 @@ impl ConnectionManager {
         user_address: ethers::types::Address,
     ) -> Result<(), GridStrategyError> {
         info!("强制重连开始");
-        
+
         self.status = ConnectionStatus::Reconnecting;
         self.reconnect_count = 0; // 重置重连计数
-        
+
         self.record_event(ConnectionEvent::new(
             ConnectionEventType::ReconnectAttempt,
             "强制重连".to_string(),
         ));
-        
+
         match self.reconnect(info_client, user_address).await {
             Ok(()) => {
                 self.on_reconnect_success();
@@ -2889,14 +3393,14 @@ fn calculate_rsi(prices: &[f64], period: usize) -> f64 {
 
 // 检测市场状态
 fn detect_market_state(
-    price_history: &[f64], 
+    price_history: &[f64],
     volatility: f64,
     price_change_5min: f64,
     rsi: f64,
 ) -> (MarketState, f64, f64, f64) {
     let mut liquidity_score = 100.0;
     let mut volume_anomaly = 0.0;
-    
+
     // 1. 基于波动率判断
     let (volatility_state, mut price_stability) = if volatility > 0.08 {
         // 极端波动 (日波动率 > 8%)
@@ -2917,46 +3421,62 @@ fn detect_market_state(
         // 正常波动
         (MarketState::Normal, 80.0)
     };
-    
+
     // 2. 基于短期价格变化判断闪崩/闪涨
     let flash_threshold = 0.05; // 5分钟内5%的变化
     if price_change_5min.abs() > flash_threshold {
         price_stability = 5.0;
         volume_anomaly = 95.0;
         liquidity_score = 20.0;
-        return (MarketState::Flash, liquidity_score, price_stability, volume_anomaly);
+        return (
+            MarketState::Flash,
+            liquidity_score,
+            price_stability,
+            volume_anomaly,
+        );
     }
-    
+
     // 3. 基于RSI判断极端状态
     if rsi > 85.0 || rsi < 15.0 {
         // RSI极端值，可能是超买超卖
         price_stability = (price_stability * 0.7_f64).max(20.0_f64);
         volume_anomaly = (volume_anomaly + 20.0_f64).min(100.0_f64);
-        
+
         if volatility > 0.05 {
-            return (MarketState::Extreme, liquidity_score, price_stability, volume_anomaly);
+            return (
+                MarketState::Extreme,
+                liquidity_score,
+                price_stability,
+                volume_anomaly,
+            );
         }
     }
-    
+
     // 4. 流动性评估
     if price_history.len() >= 10 {
-        let recent_prices = &price_history[price_history.len()-10..];
-        let price_gaps: Vec<f64> = recent_prices.windows(2)
+        let recent_prices = &price_history[price_history.len() - 10..];
+        let price_gaps: Vec<f64> = recent_prices
+            .windows(2)
             .map(|w| (w[1] / w[0] - 1.0).abs())
             .collect();
-        
+
         let avg_gap = price_gaps.iter().sum::<f64>() / price_gaps.len() as f64;
         let max_gap = price_gaps.iter().fold(0.0_f64, |a, &b| a.max(b));
-        
+
         // 如果价格跳跃过大，可能是流动性不足
         if max_gap > 0.02 || avg_gap > 0.005 {
             liquidity_score = f64::max(100.0 - max_gap * 2000.0, 10.0);
             if liquidity_score < 40.0 {
-                return (MarketState::ThinLiquidity, liquidity_score, price_stability, volume_anomaly);
+                return (
+                    MarketState::ThinLiquidity,
+                    liquidity_score,
+                    price_stability,
+                    volume_anomaly,
+                );
             }
         }
     }
-    
+
     // 5. 综合判断
     let final_state = match volatility_state {
         MarketState::Extreme => {
@@ -2968,8 +3488,13 @@ fn detect_market_state(
         }
         other => other,
     };
-    
-    (final_state, liquidity_score, price_stability, volume_anomaly)
+
+    (
+        final_state,
+        liquidity_score,
+        price_stability,
+        volume_anomaly,
+    )
 }
 
 // 分析市场趋势
@@ -3013,7 +3538,7 @@ fn analyze_market_trend(price_history: &[f64]) -> MarketAnalysis {
     };
 
     // 检测市场状态
-    let (market_state, liquidity_score, price_stability, volume_anomaly) = 
+    let (market_state, liquidity_score, price_stability, volume_anomaly) =
         detect_market_state(price_history, volatility, price_change_5min, rsi);
 
     MarketAnalysis {
@@ -3293,8 +3818,6 @@ impl ValidationResult {
     }
 }
 
-
-
 // 验证网格配置参数
 fn validate_grid_config(grid_config: &crate::config::GridConfig) -> Result<(), GridStrategyError> {
     // 检查基本参数
@@ -3426,10 +3949,10 @@ fn validate_grid_config(grid_config: &crate::config::GridConfig) -> Result<(), G
     // 进行增强的一致性检查
     let validation_result = validate_grid_config_enhanced(grid_config);
     validation_result.log_results("网格配置");
-    
+
     if !validation_result.is_valid {
         return Err(GridStrategyError::ConfigError(
-            "网格配置验证失败，请检查参数设置".to_string()
+            "网格配置验证失败，请检查参数设置".to_string(),
         ));
     }
 
@@ -3440,7 +3963,7 @@ fn validate_grid_config(grid_config: &crate::config::GridConfig) -> Result<(), G
 // 增强的网格配置验证
 fn validate_grid_config_enhanced(grid_config: &crate::config::GridConfig) -> ValidationResult {
     let mut result = ValidationResult::new();
-    
+
     // 1. 网格间距与手续费的关系验证
     let min_profitable_spacing = grid_config.fee_rate * 3.0; // 至少是手续费的3倍才能盈利
     if grid_config.min_grid_spacing < min_profitable_spacing {
@@ -3456,7 +3979,7 @@ fn validate_grid_config_enhanced(grid_config: &crate::config::GridConfig) -> Val
             min_profitable_spacing * 1.5 * 100.0
         ));
     }
-    
+
     // 2. 网格间距比例验证
     let spacing_ratio = grid_config.max_grid_spacing / grid_config.min_grid_spacing;
     if spacing_ratio > 10.0 {
@@ -3472,7 +3995,7 @@ fn validate_grid_config_enhanced(grid_config: &crate::config::GridConfig) -> Val
         ));
         result.add_suggestion("建议将最大网格间距设置为最小间距的2-5倍".to_string());
     }
-    
+
     // 3. 资金分配合理性验证
     let max_possible_orders = (grid_config.total_capital / grid_config.trade_amount) as u32;
     if grid_config.grid_count > max_possible_orders {
@@ -3490,7 +4013,7 @@ fn validate_grid_config_enhanced(grid_config: &crate::config::GridConfig) -> Val
             max_possible_orders / 2
         ));
     }
-    
+
     // 4. 风险参数一致性验证
     if grid_config.max_single_loss > grid_config.max_drawdown {
         result.add_error(format!(
@@ -3499,7 +4022,7 @@ fn validate_grid_config_enhanced(grid_config: &crate::config::GridConfig) -> Val
             grid_config.max_drawdown * 100.0
         ));
     }
-    
+
     if grid_config.max_daily_loss > grid_config.max_drawdown {
         result.add_warning(format!(
             "每日最大亏损({:.1}%)超过最大回撤({:.1}%)，可能过于激进",
@@ -3507,7 +4030,7 @@ fn validate_grid_config_enhanced(grid_config: &crate::config::GridConfig) -> Val
             grid_config.max_drawdown * 100.0
         ));
     }
-    
+
     // 5. 杠杆与风险的匹配验证
     if grid_config.leverage > 5 && grid_config.max_drawdown > 0.2 {
         result.add_warning(format!(
@@ -3517,7 +4040,7 @@ fn validate_grid_config_enhanced(grid_config: &crate::config::GridConfig) -> Val
         ));
         result.add_suggestion("建议在高杠杆时降低最大回撤阈值".to_string());
     }
-    
+
     // 6. 保证金安全阈值验证
     let recommended_margin_threshold = 1.0 / grid_config.leverage as f64 * 3.0; // 杠杆倒数的3倍
     if grid_config.margin_safety_threshold < recommended_margin_threshold {
@@ -3527,7 +4050,7 @@ fn validate_grid_config_enhanced(grid_config: &crate::config::GridConfig) -> Val
             recommended_margin_threshold * 100.0
         ));
     }
-    
+
     // 7. 最小利润与网格间距的关系验证
     let min_profit_rate = grid_config.min_profit / grid_config.trade_amount;
     if min_profit_rate > grid_config.min_grid_spacing * 0.5 {
@@ -3538,7 +4061,7 @@ fn validate_grid_config_enhanced(grid_config: &crate::config::GridConfig) -> Val
         ));
         result.add_suggestion("建议降低最小利润要求或增加网格间距".to_string());
     }
-    
+
     // 8. 时间参数合理性验证
     if grid_config.check_interval < 5 {
         result.add_warning(format!(
@@ -3553,7 +4076,7 @@ fn validate_grid_config_enhanced(grid_config: &crate::config::GridConfig) -> Val
         ));
         result.add_suggestion("建议将检查间隔设置为10-60秒".to_string());
     }
-    
+
     // 9. 批量订单参数验证
     if grid_config.max_orders_per_batch > 50 {
         result.add_warning(format!(
@@ -3562,7 +4085,7 @@ fn validate_grid_config_enhanced(grid_config: &crate::config::GridConfig) -> Val
         ));
         result.add_suggestion("建议将批量订单数量控制在20-50之间".to_string());
     }
-    
+
     if grid_config.order_batch_delay_ms < 100 {
         result.add_warning(format!(
             "批量订单延迟({} ms)过短，可能触发API限制",
@@ -3570,7 +4093,7 @@ fn validate_grid_config_enhanced(grid_config: &crate::config::GridConfig) -> Val
         ));
         result.add_suggestion("建议将批量订单延迟设置为200ms以上".to_string());
     }
-    
+
     result
 }
 
@@ -3581,25 +4104,28 @@ fn validate_dynamic_parameters(
     context: &str,
 ) -> ValidationResult {
     let mut result = ValidationResult::new();
-    
+
     // 1. 基本范围验证
     if dynamic_params.current_min_spacing <= 0.0 {
         result.add_error("动态最小网格间距必须大于0".to_string());
     }
-    
+
     if dynamic_params.current_max_spacing <= dynamic_params.current_min_spacing {
         result.add_error("动态最大网格间距必须大于最小间距".to_string());
     }
-    
+
     if dynamic_params.current_trade_amount <= 0.0 {
         result.add_error("动态交易金额必须大于0".to_string());
     }
-    
+
     // 2. 与原始配置的偏离度验证
-    let min_spacing_deviation = (dynamic_params.current_min_spacing / grid_config.min_grid_spacing - 1.0).abs();
-    let max_spacing_deviation = (dynamic_params.current_max_spacing / grid_config.max_grid_spacing - 1.0).abs();
-    let trade_amount_deviation = (dynamic_params.current_trade_amount / grid_config.trade_amount - 1.0).abs();
-    
+    let min_spacing_deviation =
+        (dynamic_params.current_min_spacing / grid_config.min_grid_spacing - 1.0).abs();
+    let max_spacing_deviation =
+        (dynamic_params.current_max_spacing / grid_config.max_grid_spacing - 1.0).abs();
+    let trade_amount_deviation =
+        (dynamic_params.current_trade_amount / grid_config.trade_amount - 1.0).abs();
+
     if min_spacing_deviation > 0.5 {
         result.add_warning(format!(
             "最小网格间距偏离原始配置{:.1}%，当前: {:.4}%，原始: {:.4}%",
@@ -3608,7 +4134,7 @@ fn validate_dynamic_parameters(
             grid_config.min_grid_spacing * 100.0
         ));
     }
-    
+
     if max_spacing_deviation > 0.5 {
         result.add_warning(format!(
             "最大网格间距偏离原始配置{:.1}%，当前: {:.4}%，原始: {:.4}%",
@@ -3617,7 +4143,7 @@ fn validate_dynamic_parameters(
             grid_config.max_grid_spacing * 100.0
         ));
     }
-    
+
     if trade_amount_deviation > 0.3 {
         result.add_warning(format!(
             "交易金额偏离原始配置{:.1}%，当前: {:.2}，原始: {:.2}",
@@ -3626,13 +4152,13 @@ fn validate_dynamic_parameters(
             grid_config.trade_amount
         ));
     }
-    
+
     // 3. 安全边界验证
     let min_safe_spacing = grid_config.fee_rate * 2.5;
     let max_safe_spacing = grid_config.max_grid_spacing * 2.0;
     let min_safe_amount = grid_config.trade_amount * 0.1;
     let max_safe_amount = grid_config.total_capital * 0.2;
-    
+
     if dynamic_params.current_min_spacing < min_safe_spacing {
         result.add_error(format!(
             "动态最小网格间距({:.4}%)低于安全下限({:.4}%)",
@@ -3640,7 +4166,7 @@ fn validate_dynamic_parameters(
             min_safe_spacing * 100.0
         ));
     }
-    
+
     if dynamic_params.current_max_spacing > max_safe_spacing {
         result.add_error(format!(
             "动态最大网格间距({:.4}%)超过安全上限({:.4}%)",
@@ -3648,23 +4174,21 @@ fn validate_dynamic_parameters(
             max_safe_spacing * 100.0
         ));
     }
-    
+
     if dynamic_params.current_trade_amount < min_safe_amount {
         result.add_error(format!(
             "动态交易金额({:.2})低于安全下限({:.2})",
-            dynamic_params.current_trade_amount,
-            min_safe_amount
+            dynamic_params.current_trade_amount, min_safe_amount
         ));
     }
-    
+
     if dynamic_params.current_trade_amount > max_safe_amount {
         result.add_error(format!(
             "动态交易金额({:.2})超过安全上限({:.2})",
-            dynamic_params.current_trade_amount,
-            max_safe_amount
+            dynamic_params.current_trade_amount, max_safe_amount
         ));
     }
-    
+
     // 4. 手续费覆盖验证
     let min_profitable_spacing = grid_config.fee_rate * 3.0;
     if dynamic_params.current_min_spacing < min_profitable_spacing {
@@ -3674,7 +4198,7 @@ fn validate_dynamic_parameters(
             min_profitable_spacing * 100.0
         ));
     }
-    
+
     // 5. 网格间距比例验证
     let spacing_ratio = dynamic_params.current_max_spacing / dynamic_params.current_min_spacing;
     if spacing_ratio > 15.0 {
@@ -3690,7 +4214,7 @@ fn validate_dynamic_parameters(
         ));
         result.add_suggestion("建议调整参数使间距比例至少为1.5:1".to_string());
     }
-    
+
     // 6. 优化频率验证
     if dynamic_params.optimization_count > 100 {
         result.add_warning(format!(
@@ -3699,7 +4223,7 @@ fn validate_dynamic_parameters(
         ));
         result.add_suggestion("建议检查优化逻辑，避免过度频繁的参数调整".to_string());
     }
-    
+
     // 7. 检查点数量验证
     if dynamic_params.checkpoints.len() > 20 {
         result.add_warning(format!(
@@ -3707,7 +4231,7 @@ fn validate_dynamic_parameters(
             dynamic_params.checkpoints.len()
         ));
     }
-    
+
     // 8. 性能窗口验证
     if dynamic_params.performance_window.len() > 50 {
         result.add_warning(format!(
@@ -3715,7 +4239,7 @@ fn validate_dynamic_parameters(
             dynamic_params.performance_window.len()
         ));
     }
-    
+
     // 9. 回滚阈值验证
     if dynamic_params.rollback_threshold > 50.0 {
         result.add_warning(format!(
@@ -3730,7 +4254,7 @@ fn validate_dynamic_parameters(
         ));
         result.add_suggestion("建议将回滚阈值设置在10-30之间".to_string());
     }
-    
+
     // 10. 上下文特定验证
     match context {
         "优化前" => {
@@ -3751,14 +4275,14 @@ fn validate_dynamic_parameters(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs();
-            
+
             if current_time - dynamic_params.last_optimization_time > 7 * 24 * 60 * 60 {
                 result.add_suggestion("参数已超过7天未优化，建议检查是否需要更新".to_string());
             }
         }
         _ => {}
     }
-    
+
     result
 }
 
@@ -3770,12 +4294,15 @@ fn validate_parameter_optimization(
     performance_score: f64,
 ) -> ValidationResult {
     let mut result = ValidationResult::new();
-    
+
     // 1. 计算参数变化幅度
-    let min_spacing_change = (new_params.current_min_spacing / old_params.current_min_spacing - 1.0).abs();
-    let max_spacing_change = (new_params.current_max_spacing / old_params.current_max_spacing - 1.0).abs();
-    let trade_amount_change = (new_params.current_trade_amount / old_params.current_trade_amount - 1.0).abs();
-    
+    let min_spacing_change =
+        (new_params.current_min_spacing / old_params.current_min_spacing - 1.0).abs();
+    let max_spacing_change =
+        (new_params.current_max_spacing / old_params.current_max_spacing - 1.0).abs();
+    let trade_amount_change =
+        (new_params.current_trade_amount / old_params.current_trade_amount - 1.0).abs();
+
     // 2. 验证变化幅度的合理性
     if min_spacing_change > 0.2 {
         result.add_warning(format!(
@@ -3784,28 +4311,28 @@ fn validate_parameter_optimization(
         ));
         result.add_suggestion("建议单次优化的参数调整幅度控制在10%以内".to_string());
     }
-    
+
     if max_spacing_change > 0.2 {
         result.add_warning(format!(
             "最大网格间距变化幅度过大({:.1}%)，可能导致策略不稳定",
             max_spacing_change * 100.0
         ));
     }
-    
+
     if trade_amount_change > 0.15 {
         result.add_warning(format!(
             "交易金额变化幅度过大({:.1}%)，可能影响风险控制",
             trade_amount_change * 100.0
         ));
     }
-    
+
     // 3. 验证优化方向的合理性
     if performance_score < 30.0 {
         // 低性能时应该保守调整
         if min_spacing_change > 0.1 || max_spacing_change > 0.1 || trade_amount_change > 0.1 {
             result.add_warning("性能较差时建议更保守地调整参数".to_string());
         }
-        
+
         if new_params.current_trade_amount > old_params.current_trade_amount {
             result.add_warning("性能较差时不建议增加交易金额".to_string());
         }
@@ -3815,28 +4342,29 @@ fn validate_parameter_optimization(
             result.add_suggestion("性能良好时可以适度增加参数调整幅度以获得更好收益".to_string());
         }
     }
-    
+
     // 4. 验证新参数的一致性
     let new_validation = validate_dynamic_parameters(new_params, grid_config, "优化后");
     if !new_validation.is_valid {
         result.add_error("优化后的参数不满足基本要求".to_string());
         result.errors.extend(new_validation.errors);
     }
-    
+
     // 5. 验证优化频率
-    let time_since_last_optimization = new_params.last_optimization_time - old_params.last_optimization_time;
+    let time_since_last_optimization =
+        new_params.last_optimization_time - old_params.last_optimization_time;
     if time_since_last_optimization < 12 * 60 * 60 {
         result.add_warning(format!(
             "距离上次优化时间过短({:.1}小时)，可能存在过度优化",
             time_since_last_optimization as f64 / 3600.0
         ));
     }
-    
+
     // 6. 验证检查点创建
     if new_params.checkpoints.len() <= old_params.checkpoints.len() {
         result.add_warning("优化后未创建新的检查点，无法回滚".to_string());
     }
-    
+
     result
 }
 
@@ -4143,8 +4671,12 @@ async fn close_all_positions(
                 tif: "Ioc".to_string(), // 使用IOC确保快速成交
             }),
         };
-        info!("🔄 清仓多头 - 数量: {:.4}, 价格: {:.4} (含滑点: {:.2}%)", 
-            long_position, sell_price, grid_config.slippage_tolerance * 100.0);
+        info!(
+            "🔄 清仓多头 - 数量: {:.4}, 价格: {:.4} (含滑点: {:.2}%)",
+            long_position,
+            sell_price,
+            grid_config.slippage_tolerance * 100.0
+        );
         if let Err(e) = exchange_client.order(order, None).await {
             return Err(GridStrategyError::OrderError(format!(
                 "清仓多头失败: {:?}",
@@ -4152,7 +4684,7 @@ async fn close_all_positions(
             )));
         }
     }
-    
+
     if short_position > 0.0 {
         // 空头清仓：买入时考虑向上滑点
         let buy_price = current_price * (1.0 + grid_config.slippage_tolerance);
@@ -4167,8 +4699,12 @@ async fn close_all_positions(
                 tif: "Ioc".to_string(), // 使用IOC确保快速成交
             }),
         };
-        info!("🔄 清仓空头 - 数量: {:.4}, 价格: {:.4} (含滑点: {:.2}%)", 
-            short_position, buy_price, grid_config.slippage_tolerance * 100.0);
+        info!(
+            "🔄 清仓空头 - 数量: {:.4}, 价格: {:.4} (含滑点: {:.2}%)",
+            short_position,
+            buy_price,
+            grid_config.slippage_tolerance * 100.0
+        );
         if let Err(e) = exchange_client.order(order, None).await {
             return Err(GridStrategyError::OrderError(format!(
                 "清仓空头失败: {:?}",
@@ -4176,7 +4712,7 @@ async fn close_all_positions(
             )));
         }
     }
-    
+
     Ok(())
 }
 
@@ -4207,7 +4743,7 @@ async fn create_dynamic_grid(
 
     // 分析市场状态
     let market_analysis = analyze_market_trend(price_history);
-    
+
     info!(
         "📊 市场状态检测 - 状态: {}, 风险等级: {}, 流动性: {:.1}, 稳定性: {:.1}",
         market_analysis.market_state.as_str(),
@@ -4218,9 +4754,11 @@ async fn create_dynamic_grid(
 
     // 检查是否应暂停交易
     if market_analysis.market_state.should_pause_trading() {
-        warn!("🚨 市场状态异常，暂停网格交易: {} ({})", 
-              market_analysis.market_state.as_str(),
-              market_analysis.market_state.as_english());
+        warn!(
+            "🚨 市场状态异常，暂停网格交易: {} ({})",
+            market_analysis.market_state.as_str(),
+            market_analysis.market_state.as_english()
+        );
         return Ok(());
     }
 
@@ -4248,16 +4786,21 @@ async fn create_dynamic_grid(
     // 基于市场状态调整网格策略
     let grid_reduction = market_analysis.market_state.grid_reduction_factor();
     let adjusted_grid_count = (grid_config.grid_count as f64 * grid_reduction) as u32;
-    
-    if market_analysis.market_state.requires_conservative_strategy() {
+
+    if market_analysis
+        .market_state
+        .requires_conservative_strategy()
+    {
         // 保守策略：减少资金使用，增加间距
         fund_allocation.buy_spacing_adjustment *= 1.2;
         fund_allocation.sell_spacing_adjustment *= 1.2;
         fund_allocation.buy_order_funds *= 0.8;
         fund_allocation.sell_order_funds *= 0.8;
-        
-        warn!("⚠️ 启用保守策略 - 网格缩减: {:.0}%, 间距增加: 20%", 
-              (1.0 - grid_reduction) * 100.0);
+
+        warn!(
+            "⚠️ 启用保守策略 - 网格缩减: {:.0}%, 间距增加: 20%",
+            (1.0 - grid_reduction) * 100.0
+        );
     }
 
     info!(
@@ -4273,7 +4816,7 @@ async fn create_dynamic_grid(
     let max_buy_funds = grid_state.available_funds * 0.7; // 最多使用70%资金做买单
     let mut allocated_buy_funds = 0.0;
     let mut buy_count = 0;
-    
+
     // 收集要批量创建的买单
     let mut pending_buy_orders: Vec<ClientOrderRequest> = Vec::new();
     let mut pending_buy_order_info: Vec<OrderInfo> = Vec::new();
@@ -4290,7 +4833,8 @@ async fn create_dynamic_grid(
 
         // 计算当前网格资金，使用动态交易金额
         let dynamic_trade_amount = grid_state.dynamic_params.current_trade_amount;
-        let mut current_grid_funds = (fund_allocation.buy_order_funds * dynamic_trade_amount / grid_config.trade_amount)
+        let mut current_grid_funds = (fund_allocation.buy_order_funds * dynamic_trade_amount
+            / grid_config.trade_amount)
             * (1.0 - (current_price - current_buy_price) / current_price * 3.0);
         current_grid_funds = current_grid_funds.max(fund_allocation.buy_order_funds * 0.5);
 
@@ -4340,7 +4884,7 @@ async fn create_dynamic_grid(
                 potential_sell_price: Some(potential_sell_price),
                 allocated_funds: current_grid_funds,
             });
-            
+
             allocated_buy_funds += current_grid_funds;
             buy_count += 1;
         }
@@ -4350,14 +4894,18 @@ async fn create_dynamic_grid(
     if !pending_buy_orders.is_empty() {
         let order_count = pending_buy_orders.len();
         info!("📦 开始增强批量创建{}个买单", order_count);
-        
+
         // 资源预检查
         if order_count > 200 {
             warn!("⚠️ 买单数量较多({}个)，将启用保守模式", order_count);
         }
-        
+
         // 使用超时控制的批量创建
         let creation_timeout = Duration::from_secs(if order_count > 100 { 600 } else { 300 });
+        let mut temp_batch_optimizer = BatchTaskOptimizer::new(
+            grid_config.max_orders_per_batch.max(5),
+            Duration::from_secs(3),
+        );
         let creation_result = tokio::time::timeout(
             creation_timeout,
             create_orders_in_batches(
@@ -4365,56 +4913,62 @@ async fn create_dynamic_grid(
                 pending_buy_orders,
                 grid_config,
                 grid_state,
-            )
-        ).await;
-        
+                &mut temp_batch_optimizer,
+            ),
+        )
+        .await;
+
         match creation_result {
             Ok(Ok((created_order_ids, failed_order_infos))) => {
                 // 批量创建成功
                 let success_count = created_order_ids.len();
                 let success_rate = success_count as f64 / order_count as f64 * 100.0;
-                
+
                 // 将创建成功的订单添加到管理列表
                 for (i, order_id) in created_order_ids.iter().enumerate() {
                     if i < pending_buy_order_info.len() {
                         active_orders.push(*order_id);
                         buy_orders.insert(*order_id, pending_buy_order_info[i].clone());
-                        
-                        info!("🟢 买单创建成功: ID={}, 价格={:.4}, 数量={:.4}, 资金={:.2}",
-                            order_id, 
+
+                        info!(
+                            "🟢 买单创建成功: ID={}, 价格={:.4}, 数量={:.4}, 资金={:.2}",
+                            order_id,
                             pending_buy_order_info[i].price,
                             pending_buy_order_info[i].quantity,
                             pending_buy_order_info[i].allocated_funds
                         );
                     }
                 }
-                
-                info!("✅ 批量买单创建完成: {}/{} (成功率: {:.1}%)", 
-                    success_count, order_count, success_rate);
-                
+
+                info!(
+                    "✅ 批量买单创建完成: {}/{} (成功率: {:.1}%)",
+                    success_count, order_count, success_rate
+                );
+
                 // 处理失败的订单进行重试
                 if !failed_order_infos.is_empty() && failed_order_infos.len() <= 20 {
                     info!("🔄 开始重试{}个失败的买单", failed_order_infos.len());
-                    
-                    let retry_result = retry_failed_order_infos(
-                        exchange_client,
-                        failed_order_infos,
-                        grid_config,
-                    ).await;
-                    
+
+                    let retry_result =
+                        retry_failed_order_infos(exchange_client, failed_order_infos, grid_config)
+                            .await;
+
                     match retry_result {
                         Ok(retry_successful_ids) => {
                             // 将重试成功的订单也添加到管理列表
                             for order_id in retry_successful_ids {
                                 active_orders.push(order_id);
                                 // 注意：这里我们使用默认的OrderInfo，因为重试时没有详细信息
-                                buy_orders.insert(order_id, OrderInfo {
-                                    price: 0.0, // 这些值需要从重试的订单信息中获取
-                                    quantity: 0.0,
-                                    cost_price: None,
-                                    potential_sell_price: None,
-                                    allocated_funds: 0.0,
-                                });
+                                buy_orders.insert(
+                                    order_id,
+                                    OrderInfo {
+                                        price: 0.0, // 这些值需要从重试的订单信息中获取
+                                        quantity: 0.0,
+                                        cost_price: None,
+                                        potential_sell_price: None,
+                                        allocated_funds: 0.0,
+                                    },
+                                );
                                 info!("🔄✅ 重试买单成功: ID={}", order_id);
                             }
                         }
@@ -4423,10 +4977,13 @@ async fn create_dynamic_grid(
                         }
                     }
                 }
-                
+
                 // 根据成功率调整后续策略
                 if success_rate < 70.0 {
-                    warn!("⚠️ 买单创建成功率较低({:.1}%)，调整资金分配策略", success_rate);
+                    warn!(
+                        "⚠️ 买单创建成功率较低({:.1}%)，调整资金分配策略",
+                        success_rate
+                    );
                     // 按实际成功比例调整已分配资金
                     allocated_buy_funds *= success_rate / 100.0;
                     buy_count = success_count as u32;
@@ -4436,7 +4993,7 @@ async fn create_dynamic_grid(
             }
             Ok(Err(e)) => {
                 error!("❌ 批量买单创建失败: {:?}", e);
-                
+
                 // 智能错误恢复策略
                 if pending_buy_order_info.len() <= 20 {
                     warn!("🔄 订单数量较少，尝试单个创建模式");
@@ -4447,8 +5004,9 @@ async fn create_dynamic_grid(
                         active_orders,
                         buy_orders,
                         true, // is_buy_order
-                    ).await;
-                    
+                    )
+                    .await;
+
                     match recovery_result {
                         Ok(recovery_count) => {
                             info!("🔄✅ 单个创建模式成功创建{}个买单", recovery_count);
@@ -4471,14 +5029,14 @@ async fn create_dynamic_grid(
             }
             Err(_timeout) => {
                 error!("⏰ 批量买单创建超时({}秒)", creation_timeout.as_secs());
-                
+
                 // 超时后的保守恢复策略
                 warn!("🔄 超时后尝试创建少量关键买单");
                 let critical_orders: Vec<_> = pending_buy_order_info
                     .into_iter()
                     .take(10) // 只创建前10个最重要的订单
                     .collect();
-                
+
                 if !critical_orders.is_empty() {
                     let recovery_result = create_orders_individually(
                         exchange_client,
@@ -4487,8 +5045,9 @@ async fn create_dynamic_grid(
                         active_orders,
                         buy_orders,
                         true,
-                    ).await;
-                    
+                    )
+                    .await;
+
                     match recovery_result {
                         Ok(recovery_count) => {
                             info!("🔄✅ 关键买单创建成功: {}", recovery_count);
@@ -4511,7 +5070,7 @@ async fn create_dynamic_grid(
     let max_sell_quantity = grid_state.position_quantity * 0.8; // 最多卖出80%持仓
     let mut allocated_sell_quantity = 0.0;
     let mut sell_count = 0;
-    
+
     // 收集要批量创建的卖单
     let mut pending_sell_orders: Vec<ClientOrderRequest> = Vec::new();
     let mut pending_sell_order_info: Vec<OrderInfo> = Vec::new();
@@ -4582,7 +5141,7 @@ async fn create_dynamic_grid(
                 potential_sell_price: None,
                 allocated_funds: 0.0,
             });
-            
+
             allocated_sell_quantity += formatted_quantity;
             sell_count += 1;
         }
@@ -4592,28 +5151,40 @@ async fn create_dynamic_grid(
     if !pending_sell_orders.is_empty() {
         let sell_order_count = pending_sell_orders.len();
         info!("📦 开始批量创建{}个卖单", sell_order_count);
-        
+
+        let mut temp_batch_optimizer = BatchTaskOptimizer::new(
+            grid_config.max_orders_per_batch.max(5),
+            Duration::from_secs(3),
+        );
         match create_orders_in_batches(
             exchange_client,
             pending_sell_orders,
             grid_config,
             grid_state,
-        ).await {
+            &mut temp_batch_optimizer,
+        )
+        .await
+        {
             Ok((created_order_ids, _failed_sell_order_infos)) => {
                 // 将创建成功的订单添加到管理列表
                 for (i, order_id) in created_order_ids.iter().enumerate() {
                     if i < pending_sell_order_info.len() {
                         active_orders.push(*order_id);
                         sell_orders.insert(*order_id, pending_sell_order_info[i].clone());
-                        
-                        info!("🔴 卖单创建成功: ID={}, 价格={:.4}, 数量={:.4}",
-                            order_id, 
+
+                        info!(
+                            "🔴 卖单创建成功: ID={}, 价格={:.4}, 数量={:.4}",
+                            order_id,
                             pending_sell_order_info[i].price,
                             pending_sell_order_info[i].quantity
                         );
                     }
                 }
-                info!("✅ 批量卖单创建完成: {}/{}", created_order_ids.len(), sell_order_count);
+                info!(
+                    "✅ 批量卖单创建完成: {}/{}",
+                    created_order_ids.len(),
+                    sell_order_count
+                );
             }
             Err(e) => {
                 warn!("❌ 批量卖单创建失败: {:?}", e);
@@ -4653,7 +5224,7 @@ async fn execute_stop_loss(
 
     if stop_result.action.is_full_stop() {
         grid_state.stop_loss_status = StopLossStatus::Monitoring;
-        
+
         // 使用专门的清仓函数
         if grid_state.position_quantity > 0.0 {
             // 估算当前价格（使用更安全的方法）
@@ -4697,39 +5268,39 @@ async fn execute_stop_loss(
         sell_orders.clear();
     } else if stop_result.action.is_partial_stop() && stop_result.stop_quantity > 0.0 {
         grid_state.stop_loss_status = StopLossStatus::Monitoring;
-        
+
         // 部分清仓 - 智能滑点处理
         let base_price = if grid_state.position_avg_price > 0.0 {
             grid_state.position_avg_price
         } else {
             current_price
         };
-        
+
         // 智能滑点计算：根据市场波动率和紧急程度调整
         let market_volatility = grid_state.historical_volatility.max(0.001); // 最小波动率0.1%
         let urgency_multiplier = match stop_result.action {
-            StopLossAction::FullStop => 2.0,     // 全部止损时使用更大滑点
-            StopLossAction::PartialStop => 1.5,  // 部分止损时使用中等滑点
+            StopLossAction::FullStop => 2.0,    // 全部止损时使用更大滑点
+            StopLossAction::PartialStop => 1.5, // 部分止损时使用中等滑点
             _ => 1.0,
         };
-        
+
         // 动态滑点 = 基础滑点 + 市场波动率调整 + 紧急程度调整
-        let dynamic_slippage = grid_config.slippage_tolerance 
-            + (market_volatility * 0.5) 
+        let dynamic_slippage = grid_config.slippage_tolerance
+            + (market_volatility * 0.5)
             + (grid_config.slippage_tolerance * (urgency_multiplier - 1.0));
         let final_slippage = dynamic_slippage.min(0.05); // 最大滑点5%
-        
+
         let sell_price_with_slippage = base_price * (1.0 - final_slippage);
-        
+
         info!("🎯 智能滑点计算 - 基础价格: {:.4}, 基础滑点: {:.2}%, 市场波动率: {:.2}%, 紧急系数: {:.1}, 最终滑点: {:.2}%, 目标价格: {:.4}",
-            base_price, 
+            base_price,
             grid_config.slippage_tolerance * 100.0,
             market_volatility * 100.0,
             urgency_multiplier,
             final_slippage * 100.0,
             sell_price_with_slippage
         );
-        
+
         let market_sell_order = ClientOrderRequest {
             asset: grid_config.trading_asset.clone(),
             is_buy: false,
@@ -4741,9 +5312,12 @@ async fn execute_stop_loss(
                 tif: "Ioc".to_string(), // IOC确保快速成交或取消
             }),
         };
-        
-        info!("🔄 执行部分止损 - 价格: {:.4} (含滑点: {:.2}%)", 
-            sell_price_with_slippage, grid_config.slippage_tolerance * 100.0);
+
+        info!(
+            "🔄 执行部分止损 - 价格: {:.4} (含滑点: {:.2}%)",
+            sell_price_with_slippage,
+            grid_config.slippage_tolerance * 100.0
+        );
 
         match exchange_client.order(market_sell_order, None).await {
             Ok(_) => {
@@ -4838,20 +5412,29 @@ async fn rebalance_grid(
         // 上升趋势：增加买单密度，减少卖单密度
         adjusted_fund_allocation.buy_spacing_adjustment *= 0.8 * risk_adjustment;
         adjusted_fund_allocation.sell_spacing_adjustment *= 1.2;
-        info!("📈 检测到{}趋势({}), 调整买单密度", 
-            market_analysis.trend.as_str(), market_analysis.trend.as_english());
+        info!(
+            "📈 检测到{}趋势({}), 调整买单密度",
+            market_analysis.trend.as_str(),
+            market_analysis.trend.as_english()
+        );
     } else if market_analysis.trend.is_bearish() {
         // 下降趋势：减少买单密度，增加卖单密度
         adjusted_fund_allocation.buy_spacing_adjustment *= 1.2;
         adjusted_fund_allocation.sell_spacing_adjustment *= 0.8 * risk_adjustment;
-        info!("📉 检测到{}趋势({}), 调整卖单密度", 
-            market_analysis.trend.as_str(), market_analysis.trend.as_english());
+        info!(
+            "📉 检测到{}趋势({}), 调整卖单密度",
+            market_analysis.trend.as_str(),
+            market_analysis.trend.as_english()
+        );
     } else if market_analysis.trend.is_sideways() {
         // 震荡趋势：保持均衡的网格密度，应用风险调整
         adjusted_fund_allocation.buy_spacing_adjustment *= risk_adjustment;
         adjusted_fund_allocation.sell_spacing_adjustment *= risk_adjustment;
-        info!("📊 检测到{}趋势({}), 保持均衡网格", 
-            market_analysis.trend.as_str(), market_analysis.trend.as_english());
+        info!(
+            "📊 检测到{}趋势({}), 保持均衡网格",
+            market_analysis.trend.as_str(),
+            market_analysis.trend.as_english()
+        );
     }
 
     // 使用 RSI 指标调整交易激进程度
@@ -5097,7 +5680,7 @@ pub async fn run_grid_strategy(
 ) -> Result<(), GridStrategyError> {
     env_logger::init();
     let grid_config = &app_config.grid;
-    
+
     // 设置信号处理
     let (shutdown_flag, cancellation_token) = setup_signal_handler();
     let start_time = SystemTime::now();
@@ -5167,22 +5750,22 @@ pub async fn run_grid_strategy(
     }
 
     // ===== 状态恢复与初始化 =====
-    
+
     // 1. 创建状态备份
     if let Err(e) = backup_state_files() {
         warn!("⚠️ 创建状态备份失败: {:?}", e);
     }
-    
+
     // 2. 清理过期备份文件（保留7天）
     if let Err(e) = cleanup_old_backups(7) {
         warn!("⚠️ 清理过期备份失败: {:?}", e);
     }
-    
+
     // 3. 尝试加载网格状态
     let mut grid_state = match load_grid_state("grid_state.json")? {
         Some(loaded_state) => {
             info!("🔄 检测到已保存的网格状态，正在恢复...");
-            
+
             // 验证加载的状态是否与当前配置兼容
             if let Err(e) = validate_loaded_state(&loaded_state, grid_config) {
                 warn!("⚠️ 状态验证失败: {:?}", e);
@@ -5216,7 +5799,10 @@ pub async fn run_grid_strategy(
                     last_margin_check: SystemTime::now(),
                     connection_retry_count: 0,
                     last_order_batch_time: SystemTime::now(),
-                    dynamic_params: DynamicGridParams::load_from_file("dynamic_grid_params.json", grid_config),
+                    dynamic_params: DynamicGridParams::load_from_file(
+                        "dynamic_grid_params.json",
+                        grid_config,
+                    ),
                 }
             } else {
                 info!("✅ 网格状态验证通过，继续使用已保存状态");
@@ -5226,9 +5812,12 @@ pub async fn run_grid_strategy(
                 info!("   - 持仓数量: {:.4}", loaded_state.position_quantity);
                 info!("   - 持仓均价: {:.4}", loaded_state.position_avg_price);
                 info!("   - 已实现利润: {:.2}", loaded_state.realized_profit);
-                info!("   - 历史交易数: {}", loaded_state.performance_history.len());
+                info!(
+                    "   - 历史交易数: {}",
+                    loaded_state.performance_history.len()
+                );
                 info!("   - 止损状态: {}", loaded_state.stop_loss_status.as_str());
-                
+
                 // 更新一些时间相关的字段
                 let mut state = loaded_state;
                 state.last_margin_check = SystemTime::now();
@@ -5268,13 +5857,16 @@ pub async fn run_grid_strategy(
                 last_margin_check: SystemTime::now(),
                 connection_retry_count: 0,
                 last_order_batch_time: SystemTime::now(),
-                dynamic_params: DynamicGridParams::load_from_file("dynamic_grid_params.json", grid_config),
+                dynamic_params: DynamicGridParams::load_from_file(
+                    "dynamic_grid_params.json",
+                    grid_config,
+                ),
             }
         }
     };
 
     // 4. 尝试加载订单状态
-    let (mut active_orders, mut buy_orders, mut sell_orders) = 
+    let (mut active_orders, mut buy_orders, mut sell_orders) =
         match load_orders_state("orders_state.json")? {
             Some((orders, buys, sells)) => {
                 info!("🔄 检测到已保存的订单状态，正在恢复...");
@@ -5282,7 +5874,7 @@ pub async fn run_grid_strategy(
                 info!("   - 活跃订单: {}", orders.len());
                 info!("   - 买单: {}", buys.len());
                 info!("   - 卖单: {}", sells.len());
-                
+
                 // 注意：这里恢复的订单可能已经不存在或状态已改变
                 // 在后续的订单状态检查中会自动同步
                 (orders, buys, sells)
@@ -5294,16 +5886,25 @@ pub async fn run_grid_strategy(
         };
 
     // ===== 初始化风险控制模块 =====
-    
+
     // 创建风险控制标志
     let stop_trading_flag = Arc::new(AtomicBool::new(false));
-    
+
     info!("🛡️ 风险控制模块已初始化");
     info!("   - 检查间隔: 30秒");
-    info!("   - 保证金安全阈值: {:.1}%", grid_config.margin_safety_threshold * 100.0);
-    info!("   - 最大回撤限制: {:.1}%", grid_config.max_drawdown * 100.0);
-    info!("   - 每日最大亏损: {:.1}%", grid_config.max_daily_loss * 100.0);
-    
+    info!(
+        "   - 保证金安全阈值: {:.1}%",
+        grid_config.margin_safety_threshold * 100.0
+    );
+    info!(
+        "   - 最大回撤限制: {:.1}%",
+        grid_config.max_drawdown * 100.0
+    );
+    info!(
+        "   - 每日最大亏损: {:.1}%",
+        grid_config.max_daily_loss * 100.0
+    );
+
     // 风险控制状态
     let mut last_risk_check = SystemTime::now();
     let mut risk_events: Vec<RiskEvent> = Vec::new();
@@ -5313,28 +5914,80 @@ pub async fn run_grid_strategy(
     let mut last_margin_ratio = 100.0f64;
 
     // ===== 初始化订单优先级管理器 =====
-    
+
     let mut order_manager = OrderManager::new((grid_config.grid_count * 2) as usize); // 最大订单数为网格数的2倍
-    
+
     info!("📋 订单优先级管理器已初始化");
     info!("   - 最大订单数: {}", order_manager.max_orders);
-    info!("   - 清理间隔: {}分钟", order_manager.cleanup_interval.as_secs() / 60);
-    info!("   - 优先级分布: {:?}", order_manager.get_priority_distribution());
+    info!(
+        "   - 清理间隔: {}分钟",
+        order_manager.cleanup_interval.as_secs() / 60
+    );
+    info!(
+        "   - 优先级分布: {:?}",
+        order_manager.get_priority_distribution()
+    );
+
+    // ===== 初始化批处理优化器 =====
+
+    let mut batch_optimizer = BatchTaskOptimizer::new(
+        grid_config.max_orders_per_batch.max(5), // 初始批次大小，最少5个
+        Duration::from_secs(3),                  // 目标执行时间3秒
+    );
+
+    // 根据配置设置批次大小范围
+    batch_optimizer.set_batch_size_range(1, grid_config.max_orders_per_batch.max(100));
+
+    info!("⚡ 批处理优化器已初始化");
+    info!("   - 初始批次大小: {}", batch_optimizer.optimal_batch_size);
+    info!(
+        "   - 目标执行时间: {:.2}秒",
+        batch_optimizer.target_execution_time.as_secs_f64()
+    );
+    info!(
+        "   - 批次大小范围: {} - {}",
+        batch_optimizer.min_batch_size, batch_optimizer.max_batch_size
+    );
 
     // ===== 初始化连接管理器 =====
-    
+
     let mut connection_manager = ConnectionManager::new();
-    
+
     info!("🔗 连接管理器已初始化");
-    info!("   - 心跳间隔: {}秒", connection_manager.heartbeat_interval.as_secs());
-    info!("   - 心跳超时: {}秒", connection_manager.heartbeat_timeout.as_secs());
-    info!("   - 最大重连次数: {}", connection_manager.max_reconnect_attempts);
-    info!("   - 重连基础延迟: {}秒", connection_manager.reconnect_base_delay.as_secs());
-    info!("   - 最大重连延迟: {}秒", connection_manager.max_reconnect_delay.as_secs());
-    info!("   - 自适应心跳: {}", if connection_manager.adaptive_heartbeat { "启用" } else { "禁用" });
-    
+    info!(
+        "   - 心跳间隔: {}秒",
+        connection_manager.heartbeat_interval.as_secs()
+    );
+    info!(
+        "   - 心跳超时: {}秒",
+        connection_manager.heartbeat_timeout.as_secs()
+    );
+    info!(
+        "   - 最大重连次数: {}",
+        connection_manager.max_reconnect_attempts
+    );
+    info!(
+        "   - 重连基础延迟: {}秒",
+        connection_manager.reconnect_base_delay.as_secs()
+    );
+    info!(
+        "   - 最大重连延迟: {}秒",
+        connection_manager.max_reconnect_delay.as_secs()
+    );
+    info!(
+        "   - 自适应心跳: {}",
+        if connection_manager.adaptive_heartbeat {
+            "启用"
+        } else {
+            "禁用"
+        }
+    );
+
     // 初始连接检查
-    match connection_manager.check_connection(&info_client, user_address).await {
+    match connection_manager
+        .check_connection(&info_client, user_address)
+        .await
+    {
         Ok(true) => {
             info!("✅ 初始连接检查成功");
         }
@@ -5345,7 +5998,7 @@ pub async fn run_grid_strategy(
             warn!("⚠️ 初始连接检查出错: {}, 系统将继续运行", e);
         }
     }
-    
+
     let mut last_connection_check = Instant::now();
     let mut last_connection_report = Instant::now();
 
@@ -5379,14 +6032,14 @@ pub async fn run_grid_strategy(
 
     loop {
         let now = SystemTime::now();
-        
+
         // 检查是否收到退出信号
         if shutdown_flag.load(Ordering::SeqCst) {
             info!("🔔 检测到退出信号，开始安全退出流程...");
-            
+
             // 获取当前价格用于清仓
             let current_price = last_price.unwrap_or(0.0);
-            
+
             if let Err(e) = safe_shutdown(
                 &exchange_client,
                 grid_config,
@@ -5397,10 +6050,12 @@ pub async fn run_grid_strategy(
                 current_price,
                 ShutdownReason::UserSignal,
                 start_time,
-            ).await {
+            )
+            .await
+            {
                 error!("❌ 安全退出过程中发生错误: {:?}", e);
             }
-            
+
             break;
         }
 
@@ -5486,7 +6141,7 @@ pub async fn run_grid_strategy(
 
                         if stop_result.action.is_full_stop() {
                             error!("🛑 策略已全部止损，开始安全退出");
-                            
+
                             if let Err(e) = safe_shutdown(
                                 &exchange_client,
                                 grid_config,
@@ -5497,17 +6152,22 @@ pub async fn run_grid_strategy(
                                 current_price,
                                 ShutdownReason::StopLossTriggered,
                                 start_time,
-                            ).await {
+                            )
+                            .await
+                            {
                                 error!("❌ 安全退出过程中发生错误: {:?}", e);
                             }
-                            
+
                             break;
                         }
                     }
 
                     // 检查止损状态是否允许继续交易
                     if !grid_state.stop_loss_status.can_continue_trading() {
-                        warn!("⚠️ 止损状态({})不允许继续交易", grid_state.stop_loss_status.as_str());
+                        warn!(
+                            "⚠️ 止损状态({})不允许继续交易",
+                            grid_state.stop_loss_status.as_str()
+                        );
                         if grid_state.stop_loss_status.is_failed() {
                             error!("❌ 止损执行失败，策略退出");
                             break;
@@ -5516,32 +6176,36 @@ pub async fn run_grid_strategy(
 
                     // 1.5. 风险控制检查
                     let risk_check_interval = Duration::from_secs(30); // 30秒检查一次
-                    if now.duration_since(last_risk_check).unwrap_or_default() >= risk_check_interval {
+                    if now.duration_since(last_risk_check).unwrap_or_default()
+                        >= risk_check_interval
+                    {
                         last_risk_check = now;
-                        
+
                         // 执行风险检查
                         let mut new_risk_events = Vec::new();
                         let mut should_pause_trading = false;
                         let mut should_emergency_exit = false;
-                        
+
                         // 检查保证金率
                         match check_margin_ratio(&info_client, user_address, grid_config).await {
                             Ok(margin_ratio) => {
                                 last_margin_ratio = margin_ratio;
                                 consecutive_failures = 0; // 重置失败计数
-                                
+
                                 if margin_ratio < grid_config.margin_safety_threshold {
                                     let event = RiskEvent::new(
                                         RiskEventType::MarginInsufficient,
-                                        format!("保证金率({:.1}%)低于安全阈值({:.1}%)", 
-                                            margin_ratio * 100.0, 
-                                            grid_config.margin_safety_threshold * 100.0),
+                                        format!(
+                                            "保证金率({:.1}%)低于安全阈值({:.1}%)",
+                                            margin_ratio * 100.0,
+                                            grid_config.margin_safety_threshold * 100.0
+                                        ),
                                         margin_ratio,
                                         grid_config.margin_safety_threshold,
                                     );
                                     new_risk_events.push(event);
                                     should_pause_trading = true;
-                                    
+
                                     if margin_ratio < grid_config.margin_safety_threshold * 0.8 {
                                         should_emergency_exit = true;
                                     }
@@ -5550,7 +6214,7 @@ pub async fn run_grid_strategy(
                             Err(e) => {
                                 warn!("⚠️ 保证金率检查失败: {:?}", e);
                                 consecutive_failures += 1;
-                                
+
                                 if consecutive_failures >= 3 {
                                     let event = RiskEvent::new(
                                         RiskEventType::NetworkIssue,
@@ -5562,56 +6226,64 @@ pub async fn run_grid_strategy(
                                 }
                             }
                         }
-                        
+
                         // 检查最大回撤
                         if grid_state.current_metrics.max_drawdown > grid_config.max_drawdown {
                             let event = RiskEvent::new(
                                 RiskEventType::MaxDrawdownExceeded,
-                                format!("最大回撤({:.2}%)超过限制({:.2}%)", 
-                                    grid_state.current_metrics.max_drawdown * 100.0, 
-                                    grid_config.max_drawdown * 100.0),
+                                format!(
+                                    "最大回撤({:.2}%)超过限制({:.2}%)",
+                                    grid_state.current_metrics.max_drawdown * 100.0,
+                                    grid_config.max_drawdown * 100.0
+                                ),
                                 grid_state.current_metrics.max_drawdown,
                                 grid_config.max_drawdown,
                             );
                             new_risk_events.push(event);
                             should_pause_trading = true;
                         }
-                        
+
                         // 检查每日亏损
-                        let current_capital = grid_state.available_funds + grid_state.position_quantity * current_price;
-                        let daily_loss_ratio = (daily_start_capital - current_capital) / daily_start_capital;
-                        
+                        let current_capital = grid_state.available_funds
+                            + grid_state.position_quantity * current_price;
+                        let daily_loss_ratio =
+                            (daily_start_capital - current_capital) / daily_start_capital;
+
                         if daily_loss_ratio > grid_config.max_daily_loss {
                             let event = RiskEvent::new(
                                 RiskEventType::DailyLossExceeded,
-                                format!("每日亏损({:.2}%)超过限制({:.2}%)", 
-                                    daily_loss_ratio * 100.0, 
-                                    grid_config.max_daily_loss * 100.0),
+                                format!(
+                                    "每日亏损({:.2}%)超过限制({:.2}%)",
+                                    daily_loss_ratio * 100.0,
+                                    grid_config.max_daily_loss * 100.0
+                                ),
                                 daily_loss_ratio,
                                 grid_config.max_daily_loss,
                             );
                             new_risk_events.push(event);
                             should_pause_trading = true;
                         }
-                        
+
                         // 检查持仓规模
                         let position_value = grid_state.position_quantity.abs() * current_price;
                         if position_value > grid_config.max_position {
                             let event = RiskEvent::new(
                                 RiskEventType::PositionSizeExceeded,
-                                format!("持仓价值({:.2})超过最大限制({:.2})", 
-                                    position_value, 
-                                    grid_config.max_position),
+                                format!(
+                                    "持仓价值({:.2})超过最大限制({:.2})",
+                                    position_value, grid_config.max_position
+                                ),
                                 position_value,
                                 grid_config.max_position,
                             );
                             new_risk_events.push(event);
                         }
-                        
+
                         // 检查市场波动率
                         if price_history.len() >= 10 {
                             let volatility = calculate_market_volatility(&price_history);
-                            if volatility > 0.15 { // 15%的波动率阈值
+                            if volatility > 0.15 {
+                                // 15%的波动率阈值
                                 let event = RiskEvent::new(
                                     RiskEventType::VolatilitySpike,
                                     format!("市场波动率({:.2}%)异常高", volatility * 100.0),
@@ -5621,13 +6293,15 @@ pub async fn run_grid_strategy(
                                 new_risk_events.push(event);
                             }
                         }
-                        
+
                         // 检查价格跳空
                         if price_history.len() >= 2 {
                             let last_price_val = price_history[price_history.len() - 2];
-                            let price_gap = ((current_price - last_price_val) / last_price_val).abs();
-                            
-                            if price_gap > 0.05 { // 5%的价格跳空阈值
+                            let price_gap =
+                                ((current_price - last_price_val) / last_price_val).abs();
+
+                            if price_gap > 0.05 {
+                                // 5%的价格跳空阈值
                                 let event = RiskEvent::new(
                                     RiskEventType::PriceGap,
                                     format!("价格跳空({:.2}%)过大", price_gap * 100.0),
@@ -5638,11 +6312,15 @@ pub async fn run_grid_strategy(
                                 should_pause_trading = true;
                             }
                         }
-                        
+
                         // 处理新的风险事件
                         for mut event in new_risk_events {
-                            info!("🚨 检测到风险事件: {} - {}", event.event_type.as_str(), event.description);
-                            
+                            info!(
+                                "🚨 检测到风险事件: {} - {}",
+                                event.event_type.as_str(),
+                                event.description
+                            );
+
                             let action = match event.event_type {
                                 RiskEventType::MarginInsufficient => {
                                     stop_trading_flag.store(true, Ordering::SeqCst);
@@ -5667,22 +6345,22 @@ pub async fn run_grid_strategy(
                                 }
                                 _ => "风险事件已记录".to_string(),
                             };
-                            
+
                             event.mark_handled(action.clone());
                             risk_events.push(event);
-                            
+
                             info!("✅ 风险事件处理完成: {}", action);
                         }
-                        
+
                         // 保留最近50个风险事件
                         if risk_events.len() > 50 {
                             risk_events.drain(0..risk_events.len() - 50);
                         }
-                        
+
                         // 检查是否需要紧急退出
                         if should_emergency_exit {
                             error!("🚨 触发紧急风险控制，立即退出");
-                            
+
                             if let Err(e) = safe_shutdown(
                                 &exchange_client,
                                 grid_config,
@@ -5693,72 +6371,113 @@ pub async fn run_grid_strategy(
                                 current_price,
                                 ShutdownReason::EmergencyShutdown,
                                 start_time,
-                            ).await {
+                            )
+                            .await
+                            {
                                 error!("❌ 紧急退出过程中发生错误: {:?}", e);
                             }
-                            
+
                             break;
                         }
-                        
+
                         // 检查是否需要暂停交易
                         if should_pause_trading && !stop_trading_flag.load(Ordering::SeqCst) {
                             warn!("⚠️ 风险控制触发，暂停新的交易操作");
                             stop_trading_flag.store(true, Ordering::SeqCst);
                         }
 
-                    // 1.6. 订单优先级管理
-                    // 更新市场条件
-                    if price_history.len() >= 2 {
-                        let volatility = calculate_market_volatility(&price_history);
-                        let price_change = ((current_price - price_history[price_history.len() - 2]) / price_history[price_history.len() - 2]).abs();
-                        order_manager.update_market_conditions(current_price, volatility, price_change);
-                    }
+                        // 1.6. 订单优先级管理
+                        // 更新市场条件
+                        if price_history.len() >= 2 {
+                            let volatility = calculate_market_volatility(&price_history);
+                            let price_change = ((current_price
+                                - price_history[price_history.len() - 2])
+                                / price_history[price_history.len() - 2])
+                                .abs();
+                            order_manager.update_market_conditions(
+                                current_price,
+                                volatility,
+                                price_change,
+                            );
+                        }
 
-                    // 处理过期订单
-                    if let Err(e) = check_expired_orders(&exchange_client, &mut order_manager, grid_config, current_price).await {
-                        warn!("⚠️ 处理过期订单失败: {:?}", e);
-                    }
+                        // 处理过期订单
+                        if let Err(e) = check_expired_orders(
+                            &exchange_client,
+                            &mut order_manager,
+                            grid_config,
+                            current_price,
+                        )
+                        .await
+                        {
+                            warn!("⚠️ 处理过期订单失败: {:?}", e);
+                        }
 
-                    // 处理紧急订单
-                    let urgent_orders = order_manager.get_urgent_orders();
-                    if !urgent_orders.is_empty() {
-                        info!("🚨 检测到{}个紧急订单需要处理", urgent_orders.len());
-                        for urgent_order in urgent_orders {
-                            if urgent_order.needs_immediate_attention() {
-                                info!("⚡ 处理紧急订单: {} - 剩余时间: {:?}秒", 
-                                    urgent_order.priority.as_str(), 
-                                    urgent_order.remaining_seconds());
-                                
-                                // 这里可以添加紧急订单的特殊处理逻辑
-                                // 例如：提高订单优先级、使用市价单等
+                        // 处理紧急订单
+                        let urgent_orders = order_manager.get_urgent_orders();
+                        if !urgent_orders.is_empty() {
+                            info!("🚨 检测到{}个紧急订单需要处理", urgent_orders.len());
+                            for urgent_order in urgent_orders {
+                                if urgent_order.needs_immediate_attention() {
+                                    info!(
+                                        "⚡ 处理紧急订单: {} - 剩余时间: {:?}秒",
+                                        urgent_order.priority.as_str(),
+                                        urgent_order.remaining_seconds()
+                                    );
+
+                                    // 这里可以添加紧急订单的特殊处理逻辑
+                                    // 例如：提高订单优先级、使用市价单等
+                                }
                             }
                         }
-                    }
 
-                    // 定期清理过期订单（每5分钟）
-                    let cleanup_interval = Duration::from_secs(300);
-                    if SystemTime::now().duration_since(order_manager.last_cleanup_time).unwrap_or_default() >= cleanup_interval {
-                        let expired_count = order_manager.cleanup_expired_orders().len();
-                        if expired_count > 0 {
-                            info!("🧹 清理了{}个过期订单", expired_count);
+                        // 定期清理过期订单（每5分钟）
+                        let cleanup_interval = Duration::from_secs(300);
+                        if SystemTime::now()
+                            .duration_since(order_manager.last_cleanup_time)
+                            .unwrap_or_default()
+                            >= cleanup_interval
+                        {
+                            let expired_count = order_manager.cleanup_expired_orders().len();
+                            if expired_count > 0 {
+                                info!("🧹 清理了{}个过期订单", expired_count);
+                            }
                         }
-                    }
-                        
+
                         // 检查是否需要重置每日统计
-                        if now.duration_since(daily_start_time).unwrap_or_default().as_secs() >= 24 * 60 * 60 {
+                        if now
+                            .duration_since(daily_start_time)
+                            .unwrap_or_default()
+                            .as_secs()
+                            >= 24 * 60 * 60
+                        {
                             daily_start_capital = current_capital;
                             daily_start_time = now;
                             consecutive_failures = 0;
                             info!("🔄 每日风险统计已重置");
                         }
-                        
+
                         // 定期显示风险报告（每小时一次）
-                        if risk_events.len() > 0 && now.duration_since(daily_start_time).unwrap_or_default().as_secs() % 3600 < 30 {
-                            let recent_events: Vec<_> = risk_events.iter()
-                                .filter(|e| now.duration_since(e.timestamp).unwrap_or_default().as_secs() < 24 * 3600)
+                        if risk_events.len() > 0
+                            && now
+                                .duration_since(daily_start_time)
+                                .unwrap_or_default()
+                                .as_secs()
+                                % 3600
+                                < 30
+                        {
+                            let recent_events: Vec<_> = risk_events
+                                .iter()
+                                .filter(|e| {
+                                    now.duration_since(e.timestamp)
+                                        .unwrap_or_default()
+                                        .as_secs()
+                                        < 24 * 3600
+                                })
                                 .collect();
-                            let critical_events = recent_events.iter().filter(|e| e.is_critical()).count();
-                            
+                            let critical_events =
+                                recent_events.iter().filter(|e| e.is_critical()).count();
+
                             info!("📊 风险控制报告:");
                             info!("   - 最近24小时风险事件: {}", recent_events.len());
                             info!("   - 其中严重事件: {}", critical_events);
@@ -5766,7 +6485,7 @@ pub async fn run_grid_strategy(
                             info!("   - 最近保证金率: {:.2}%", last_margin_ratio * 100.0);
                         }
                     }
-                    
+
                     // 检查风险控制标志
                     if stop_trading_flag.load(Ordering::SeqCst) {
                         warn!("⚠️ 风险控制已激活，跳过交易操作");
@@ -5778,13 +6497,19 @@ pub async fn run_grid_strategy(
                     let connection_check_interval = Duration::from_secs(60); // 每分钟检查一次连接
                     if last_connection_check.elapsed() >= connection_check_interval {
                         last_connection_check = Instant::now();
-                        
-                        match connection_manager.check_connection(&info_client, user_address).await {
+
+                        match connection_manager
+                            .check_connection(&info_client, user_address)
+                            .await
+                        {
                             Ok(is_healthy) => {
                                 if !is_healthy {
                                     warn!("⚠️ 连接质量下降，尝试重连");
-                                    
-                                    match connection_manager.attempt_reconnect(&info_client, user_address).await {
+
+                                    match connection_manager
+                                        .attempt_reconnect(&info_client, user_address)
+                                        .await
+                                    {
                                         Ok(true) => {
                                             info!("✅ 连接重连成功");
                                         }
@@ -5793,12 +6518,14 @@ pub async fn run_grid_strategy(
                                         }
                                         Err(e) => {
                                             error!("❌ 连接重连过程出错: {}", e);
-                                            
+
                                             // 如果连接完全失败，考虑暂停交易
-                                            if connection_manager.get_status() == &ConnectionStatus::Failed {
+                                            if connection_manager.get_status()
+                                                == &ConnectionStatus::Failed
+                                            {
                                                 warn!("🚨 连接完全失败，暂停交易操作");
                                                 stop_trading_flag.store(true, Ordering::SeqCst);
-                                                
+
                                                 // 记录网络风险事件
                                                 let network_event = RiskEvent::new(
                                                     RiskEventType::NetworkIssue,
@@ -5820,7 +6547,7 @@ pub async fn run_grid_strategy(
                                 connection_manager.on_connection_lost(&e);
                             }
                         }
-                        
+
                         // 定期显示连接报告（每10分钟一次）
                         if last_connection_report.elapsed() >= Duration::from_secs(600) {
                             last_connection_report = Instant::now();
@@ -5842,18 +6569,22 @@ pub async fn run_grid_strategy(
                         // 在重平衡前自动优化参数
                         if grid_state.performance_history.len() >= 20 {
                             info!("📈 开始自动网格参数优化");
-                            let optimization_applied = auto_optimize_grid_parameters(&mut grid_state, grid_config);
-                            
+                            let optimization_applied =
+                                auto_optimize_grid_parameters(&mut grid_state, grid_config);
+
                             if !optimization_applied {
                                 // 如果没有应用自动优化，则显示建议
                                 info!("📊 显示网格参数优化建议");
-                                analyze_grid_performance_and_suggest_optimization(grid_config, &grid_state);
+                                analyze_grid_performance_and_suggest_optimization(
+                                    grid_config,
+                                    &grid_state,
+                                );
                             }
-                            
+
                             // 创建一个临时的配置副本进行优化分析
                             let mut temp_min_spacing = grid_config.min_grid_spacing;
                             let mut temp_max_spacing = grid_config.max_grid_spacing;
-                            
+
                             // 手动应用优化逻辑
                             if grid_state.performance_history.len() >= 10 {
                                 let recent_records: Vec<&PerformanceRecord> = grid_state
@@ -5862,14 +6593,13 @@ pub async fn run_grid_strategy(
                                     .rev()
                                     .take(20)
                                     .collect();
-                                
-                                let recent_profit: f64 = recent_records.iter().map(|r| r.profit).sum();
-                                let recent_win_rate = recent_records
-                                    .iter()
-                                    .filter(|r| r.profit > 0.0)
-                                    .count() as f64
-                                    / recent_records.len() as f64;
-                                
+
+                                let recent_profit: f64 =
+                                    recent_records.iter().map(|r| r.profit).sum();
+                                let recent_win_rate =
+                                    recent_records.iter().filter(|r| r.profit > 0.0).count() as f64
+                                        / recent_records.len() as f64;
+
                                 // 根据表现调整网格间距
                                 if recent_profit > 0.0 && recent_win_rate > 0.6 {
                                     // 表现良好，可以稍微增加网格间距以获得更大利润
@@ -5882,24 +6612,30 @@ pub async fn run_grid_strategy(
                                     temp_max_spacing *= 0.95;
                                     info!("🔧 参数优化建议 - 表现不佳，建议减少网格间距");
                                 }
-                                
+
                                 // 确保网格间距在合理范围内
                                 temp_min_spacing = temp_min_spacing.max(0.001).min(0.05);
                                 temp_max_spacing = temp_max_spacing.max(temp_min_spacing).min(0.1);
-                                
+
                                 // 显示优化建议
-                                if (temp_min_spacing - grid_config.min_grid_spacing).abs() > 0.0001 {
-                                    info!("🔧 参数优化建议 - 最小网格间距: {:.4}% -> {:.4}%", 
+                                if (temp_min_spacing - grid_config.min_grid_spacing).abs() > 0.0001
+                                {
+                                    info!(
+                                        "🔧 参数优化建议 - 最小网格间距: {:.4}% -> {:.4}%",
                                         grid_config.min_grid_spacing * 100.0,
-                                        temp_min_spacing * 100.0);
+                                        temp_min_spacing * 100.0
+                                    );
                                 }
-                                if (temp_max_spacing - grid_config.max_grid_spacing).abs() > 0.0001 {
-                                    info!("🔧 参数优化建议 - 最大网格间距: {:.4}% -> {:.4}%", 
+                                if (temp_max_spacing - grid_config.max_grid_spacing).abs() > 0.0001
+                                {
+                                    info!(
+                                        "🔧 参数优化建议 - 最大网格间距: {:.4}% -> {:.4}%",
                                         grid_config.max_grid_spacing * 100.0,
-                                        temp_max_spacing * 100.0);
+                                        temp_max_spacing * 100.0
+                                    );
                                 }
                             }
-                            
+
                             info!("💡 参数优化分析完成，建议在配置文件中手动调整参数");
                         }
 
@@ -5917,14 +6653,21 @@ pub async fn run_grid_strategy(
                     }
 
                     // 3. 定期检查订单状态（每30秒）
-                    if now.duration_since(grid_state.last_order_batch_time).unwrap().as_secs() >= 30 {
+                    if now
+                        .duration_since(grid_state.last_order_batch_time)
+                        .unwrap()
+                        .as_secs()
+                        >= 30
+                    {
                         if let Err(e) = check_order_status(
                             &info_client,
                             user_address,
                             &mut active_orders,
                             &mut buy_orders,
                             &mut sell_orders,
-                        ).await {
+                        )
+                        .await
+                        {
                             warn!("⚠️ 订单状态检查失败: {:?}", e);
                         }
                         grid_state.last_order_batch_time = now;
@@ -5946,11 +6689,15 @@ pub async fn run_grid_strategy(
                             &mut order_manager,
                         )
                         .await?;
-                        
+
                         // 如果配置了批量订单，可以在这里使用批量创建功能
-                        if grid_config.max_orders_per_batch > 1 && grid_config.order_batch_delay_ms > 0 {
-                            info!("💡 批量订单配置已启用 - 批次大小: {}, 延迟: {}ms", 
-                                grid_config.max_orders_per_batch, grid_config.order_batch_delay_ms);
+                        if grid_config.max_orders_per_batch > 1
+                            && grid_config.order_batch_delay_ms > 0
+                        {
+                            info!(
+                                "💡 批量订单配置已启用 - 批次大小: {}, 延迟: {}ms",
+                                grid_config.max_orders_per_batch, grid_config.order_batch_delay_ms
+                            );
                         }
                     }
 
@@ -5962,12 +6709,19 @@ pub async fn run_grid_strategy(
                     }
 
                     // 4.1 保证金监控（每5分钟检查一次）
-                    if now.duration_since(grid_state.last_margin_check).unwrap().as_secs() >= 300 {
+                    if now
+                        .duration_since(grid_state.last_margin_check)
+                        .unwrap()
+                        .as_secs()
+                        >= 300
+                    {
                         // 首先检查连接状态
                         match ensure_connection(&info_client, user_address, &mut grid_state).await {
                             Ok(true) => {
                                 // 连接正常，进行保证金检查
-                                match check_margin_ratio(&info_client, user_address, grid_config).await {
+                                match check_margin_ratio(&info_client, user_address, grid_config)
+                                    .await
+                                {
                                     Ok(margin_ratio) => {
                                         info!("💳 保证金率: {:.1}%", margin_ratio * 100.0);
                                         grid_state.last_margin_check = now;
@@ -5982,7 +6736,7 @@ pub async fn run_grid_strategy(
                                                 reason: "保证金不足".to_string(),
                                                 stop_quantity: grid_state.position_quantity,
                                             };
-                                                                                        if let Err(stop_err) = execute_stop_loss(
+                                            if let Err(stop_err) = execute_stop_loss(
                                                 &exchange_client,
                                                 grid_config,
                                                 &mut grid_state,
@@ -5991,10 +6745,12 @@ pub async fn run_grid_strategy(
                                                 &mut buy_orders,
                                                 &mut sell_orders,
                                                 current_price,
-                                            ).await {
+                                            )
+                                            .await
+                                            {
                                                 error!("❌ 紧急止损执行失败: {:?}", stop_err);
                                             }
-                                            
+
                                             // 保证金不足时安全退出
                                             if let Err(e) = safe_shutdown(
                                                 &exchange_client,
@@ -6006,11 +6762,13 @@ pub async fn run_grid_strategy(
                                                 current_price,
                                                 ShutdownReason::MarginInsufficient,
                                                 start_time,
-                                            ).await {
+                                            )
+                                            .await
+                                            {
                                                 error!("❌ 安全退出过程中发生错误: {:?}", e);
                                             }
-                                            
-                                break;
+
+                                            break;
                                         }
                                     }
                                 }
@@ -6023,7 +6781,7 @@ pub async fn run_grid_strategy(
                                 // 连接失败次数过多，退出策略
                                 if grid_state.connection_retry_count > 10 {
                                     error!("🚨 网络连接失败次数过多，开始安全退出");
-                                    
+
                                     let current_price = last_price.unwrap_or(0.0);
                                     if let Err(e) = safe_shutdown(
                                         &exchange_client,
@@ -6035,10 +6793,12 @@ pub async fn run_grid_strategy(
                                         current_price,
                                         ShutdownReason::NetworkError,
                                         start_time,
-                                    ).await {
+                                    )
+                                    .await
+                                    {
                                         error!("❌ 安全退出过程中发生错误: {:?}", e);
                                     }
-                                    
+
                                     break;
                                 }
                             }
@@ -6048,23 +6808,43 @@ pub async fn run_grid_strategy(
                     // 5. 定期状态报告和参数管理（每小时）
                     if now.duration_since(last_status_report).unwrap().as_secs() >= 3600 {
                         // 更新性能指标
-                        grid_state.current_metrics = calculate_performance_metrics(&grid_state, &price_history);
-                        
+                        grid_state.current_metrics =
+                            calculate_performance_metrics(&grid_state, &price_history);
+
                         // 检查是否需要回滚（基于当前性能）
-                        let current_performance_score = if grid_state.current_metrics.total_profit > 0.0 { 50.0 } else { 0.0 }
-                            + grid_state.current_metrics.win_rate * 30.0
-                            + if grid_state.current_metrics.total_profit / grid_state.current_metrics.total_trades.max(1) as f64 > 0.0 { 20.0 } else { 0.0 };
-                        
-                        if let Some(checkpoint) = grid_state.dynamic_params.should_rollback(current_performance_score) {
+                        let current_performance_score =
+                            if grid_state.current_metrics.total_profit > 0.0 {
+                                50.0
+                            } else {
+                                0.0
+                            } + grid_state.current_metrics.win_rate * 30.0
+                                + if grid_state.current_metrics.total_profit
+                                    / grid_state.current_metrics.total_trades.max(1) as f64
+                                    > 0.0
+                                {
+                                    20.0
+                                } else {
+                                    0.0
+                                };
+
+                        if let Some(checkpoint) = grid_state
+                            .dynamic_params
+                            .should_rollback(current_performance_score)
+                        {
                             warn!("🔄 定期检查发现性能下降，执行参数回滚");
                             let checkpoint_clone = checkpoint.clone();
-                            grid_state.dynamic_params.rollback_to_checkpoint(&checkpoint_clone);
-                            
+                            grid_state
+                                .dynamic_params
+                                .rollback_to_checkpoint(&checkpoint_clone);
+
                             // 保存回滚后的参数
-                            if let Err(e) = grid_state.dynamic_params.save_to_file("dynamic_grid_params.json") {
+                            if let Err(e) = grid_state
+                                .dynamic_params
+                                .save_to_file("dynamic_grid_params.json")
+                            {
                                 warn!("⚠️ 保存回滚参数失败: {:?}", e);
                             }
-                            
+
                             // 回滚后需要重新创建网格
                             info!("🔄 参数回滚后重新创建网格");
                             cancel_all_orders(&exchange_client, &mut active_orders).await?;
@@ -6072,11 +6852,14 @@ pub async fn run_grid_strategy(
                             sell_orders.clear();
                         } else {
                             // 定期保存当前参数状态
-                            if let Err(e) = grid_state.dynamic_params.save_to_file("dynamic_grid_params.json") {
+                            if let Err(e) = grid_state
+                                .dynamic_params
+                                .save_to_file("dynamic_grid_params.json")
+                            {
                                 warn!("⚠️ 定期保存动态参数失败: {:?}", e);
                             }
                         }
-                        
+
                         let report = generate_status_report(
                             &grid_state,
                             current_price,
@@ -6085,39 +6868,51 @@ pub async fn run_grid_strategy(
                             grid_config,
                         );
                         info!("\n{}", report);
-                        
+
                         // 输出详细性能指标
                         info!("📊 详细性能指标:");
-                        info!("   总交易数: {} (胜: {}, 负: {})", 
+                        info!(
+                            "   总交易数: {} (胜: {}, 负: {})",
                             grid_state.current_metrics.total_trades,
                             grid_state.current_metrics.winning_trades,
                             grid_state.current_metrics.losing_trades
                         );
-                        info!("   胜率: {:.1}%, 利润因子: {:.2}, 夏普比率: {:.2}", 
+                        info!(
+                            "   胜率: {:.1}%, 利润因子: {:.2}, 夏普比率: {:.2}",
                             grid_state.current_metrics.win_rate * 100.0,
                             grid_state.current_metrics.profit_factor,
                             grid_state.current_metrics.sharpe_ratio
                         );
-                        info!("   总利润: {:.2}, 最大回撤: {:.2}%", 
+                        info!(
+                            "   总利润: {:.2}, 最大回撤: {:.2}%",
                             grid_state.current_metrics.total_profit,
                             grid_state.current_metrics.max_drawdown * 100.0
                         );
-                        info!("   平均盈利: {:.2}, 平均亏损: {:.2}", 
+                        info!(
+                            "   平均盈利: {:.2}, 平均亏损: {:.2}",
                             grid_state.current_metrics.average_win,
                             grid_state.current_metrics.average_loss
                         );
-                        info!("   最大单笔盈利: {:.2}, 最大单笔亏损: {:.2}", 
+                        info!(
+                            "   最大单笔盈利: {:.2}, 最大单笔亏损: {:.2}",
                             grid_state.current_metrics.largest_win,
                             grid_state.current_metrics.largest_loss
                         );
-                        
+
                         // 订单优先级管理状态报告
                         let order_stats = order_manager.get_statistics_report();
                         info!("📋 订单优先级管理状态:");
                         for line in order_stats.lines() {
                             info!("   {}", line);
                         }
-                        
+
+                        // 批处理优化器状态报告
+                        let batch_report = batch_optimizer.get_performance_report();
+                        info!("⚡ 批处理优化器状态:");
+                        for line in batch_report.lines() {
+                            info!("   {}", line);
+                        }
+
                         last_status_report = now;
                     }
                 }
@@ -6227,10 +7022,11 @@ pub async fn run_grid_strategy(
                                         price: fill_price,
                                         action: "SELL".to_string(),
                                         profit,
-                                        total_capital: grid_state.available_funds + grid_state.position_quantity * fill_price,
+                                        total_capital: grid_state.available_funds
+                                            + grid_state.position_quantity * fill_price,
                                     };
                                     grid_state.performance_history.push(record.clone());
-                                    
+
                                     // 输出交易记录详情
                                     info!("📝 交易记录 - 时间: {:?}, 动作: {}, 价格: {:.4}, 利润: {:.2}, 总资产: {:.2}", 
                                         record.timestamp.duration_since(UNIX_EPOCH).unwrap().as_secs(),
@@ -6292,7 +7088,7 @@ pub async fn run_grid_strategy(
     if !shutdown_flag.load(Ordering::SeqCst) {
         info!("🏁 策略正常结束，执行安全退出");
         let current_price = last_price.unwrap_or(0.0);
-        
+
         if let Err(e) = safe_shutdown(
             &exchange_client,
             grid_config,
@@ -6303,7 +7099,9 @@ pub async fn run_grid_strategy(
             current_price,
             ShutdownReason::NormalExit,
             start_time,
-        ).await {
+        )
+        .await
+        {
             error!("❌ 安全退出过程中发生错误: {:?}", e);
         }
     }
@@ -6313,14 +7111,21 @@ pub async fn run_grid_strategy(
 }
 
 // 安全解析字符串为f64，支持空值和无效值处理
-fn safe_parse_f64(value: &str, field_name: &str, default_value: f64) -> Result<f64, GridStrategyError> {
+fn safe_parse_f64(
+    value: &str,
+    field_name: &str,
+    default_value: f64,
+) -> Result<f64, GridStrategyError> {
     // 处理空字符串或仅包含空白字符的情况
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        warn!("⚠️ 字段 '{}' 为空，使用默认值: {}", field_name, default_value);
+        warn!(
+            "⚠️ 字段 '{}' 为空，使用默认值: {}",
+            field_name, default_value
+        );
         return Ok(default_value);
     }
-    
+
     // 尝试解析数值
     match trimmed.parse::<f64>() {
         Ok(parsed_value) => {
@@ -6328,14 +7133,18 @@ fn safe_parse_f64(value: &str, field_name: &str, default_value: f64) -> Result<f
             if parsed_value.is_finite() && parsed_value >= 0.0 {
                 Ok(parsed_value)
             } else {
-                warn!("⚠️ 字段 '{}' 包含无效数值: {}，使用默认值: {}", 
-                    field_name, parsed_value, default_value);
+                warn!(
+                    "⚠️ 字段 '{}' 包含无效数值: {}，使用默认值: {}",
+                    field_name, parsed_value, default_value
+                );
                 Ok(default_value)
             }
         }
         Err(e) => {
-            warn!("⚠️ 字段 '{}' 解析失败: '{}' -> {:?}，使用默认值: {}", 
-                field_name, trimmed, e, default_value);
+            warn!(
+                "⚠️ 字段 '{}' 解析失败: '{}' -> {:?}，使用默认值: {}",
+                field_name, trimmed, e, default_value
+            );
             Ok(default_value)
         }
     }
@@ -6353,47 +7162,35 @@ async fn check_margin_ratio(
         Err(e) => {
             warn!("⚠️ 获取账户信息失败，无法检查保证金率: {:?}", e);
             return Err(GridStrategyError::ClientError(format!(
-                "获取账户信息失败: {:?}", e
+                "获取账户信息失败: {:?}",
+                e
             )));
         }
     };
-    
+
     // 检查margin_summary字段是否存在
     let margin_summary = &account_info.margin_summary;
-    
+
     // 安全解析账户价值
-    let account_value = safe_parse_f64(
-        &margin_summary.account_value,
-        "account_value",
-        0.0
-    )?;
-    
+    let account_value = safe_parse_f64(&margin_summary.account_value, "account_value", 0.0)?;
+
     // 安全解析已使用保证金
-    let total_margin_used = safe_parse_f64(
-        &margin_summary.total_margin_used,
-        "total_margin_used",
-        0.0
-    )?;
-    
+    let total_margin_used =
+        safe_parse_f64(&margin_summary.total_margin_used, "total_margin_used", 0.0)?;
+
     // 尝试解析其他相关字段以获得更完整的保证金信息
-    let total_ntl_pos = safe_parse_f64(
-        &margin_summary.total_ntl_pos,
-        "total_ntl_pos",
-        0.0
-    ).unwrap_or(0.0);
-    
-    let total_raw_usd = safe_parse_f64(
-        &margin_summary.total_raw_usd,
-        "total_raw_usd",
-        0.0
-    ).unwrap_or(0.0);
-    
+    let total_ntl_pos =
+        safe_parse_f64(&margin_summary.total_ntl_pos, "total_ntl_pos", 0.0).unwrap_or(0.0);
+
+    let total_raw_usd =
+        safe_parse_f64(&margin_summary.total_raw_usd, "total_raw_usd", 0.0).unwrap_or(0.0);
+
     info!("💳 保证金详细信息:");
     info!("   账户价值: {:.2}", account_value);
     info!("   已使用保证金: {:.2}", total_margin_used);
     info!("   总持仓价值: {:.2}", total_ntl_pos);
     info!("   总USD价值: {:.2}", total_raw_usd);
-    
+
     // 计算保证金率 - 使用多种方法确保准确性
     let margin_ratio = if total_margin_used > 0.0 {
         // 标准计算方法：可用资金 / 已使用保证金
@@ -6407,13 +7204,13 @@ async fn check_margin_ratio(
         info!("💡 没有持仓或保证金要求，保证金率设为安全值");
         10.0 // 设置一个安全的高值
     };
-    
+
     // 验证计算结果的合理性
     if !margin_ratio.is_finite() {
         warn!("⚠️ 保证金率计算结果无效: {}，使用默认安全值", margin_ratio);
         return Ok(10.0); // 返回安全值
     }
-    
+
     if margin_ratio < 0.0 {
         warn!("⚠️ 保证金率为负值: {:.2}，可能存在数据异常", margin_ratio);
         return Err(GridStrategyError::MarginInsufficient(format!(
@@ -6421,7 +7218,7 @@ async fn check_margin_ratio(
             margin_ratio * 100.0
         )));
     }
-    
+
     // 检查保证金安全阈值
     if margin_ratio < grid_config.margin_safety_threshold {
         warn!(
@@ -6429,7 +7226,7 @@ async fn check_margin_ratio(
             margin_ratio * 100.0,
             grid_config.margin_safety_threshold * 100.0
         );
-        
+
         // 提供详细的风险信息
         let risk_level = if margin_ratio < grid_config.margin_safety_threshold * 0.5 {
             "极高风险"
@@ -6438,16 +7235,16 @@ async fn check_margin_ratio(
         } else {
             "中等风险"
         };
-        
+
         warn!("🚨 风险等级: {} - 建议立即减仓或增加保证金", risk_level);
-        
+
         return Err(GridStrategyError::MarginInsufficient(format!(
             "保证金率过低: {:.2}% (风险等级: {})",
             margin_ratio * 100.0,
             risk_level
         )));
     }
-    
+
     // 提供保证金健康度反馈
     let health_status = if margin_ratio > grid_config.margin_safety_threshold * 3.0 {
         "优秀"
@@ -6458,9 +7255,13 @@ async fn check_margin_ratio(
     } else {
         "需要关注"
     };
-    
-    info!("💳 保证金健康度: {} (比率: {:.2}%)", health_status, margin_ratio * 100.0);
-    
+
+    info!(
+        "💳 保证金健康度: {} (比率: {:.2}%)",
+        health_status,
+        margin_ratio * 100.0
+    );
+
     Ok(margin_ratio)
 }
 
@@ -6471,84 +7272,94 @@ async fn ensure_connection(
     grid_state: &mut GridState,
 ) -> Result<bool, GridStrategyError> {
     let start_time = SystemTime::now();
-    
+
     // 使用超时控制的连接检查
     let connection_result = tokio::time::timeout(
         Duration::from_secs(15), // 连接检查超时15秒
-        get_account_info(info_client, user_address)
-    ).await;
-    
+        get_account_info(info_client, user_address),
+    )
+    .await;
+
     match connection_result {
         Ok(Ok(_account_info)) => {
             // 连接成功
             if grid_state.connection_retry_count > 0 {
-                info!("✅ 网络连接已恢复 (之前重试次数: {})", grid_state.connection_retry_count);
+                info!(
+                    "✅ 网络连接已恢复 (之前重试次数: {})",
+                    grid_state.connection_retry_count
+                );
             }
             grid_state.connection_retry_count = 0;
-            
+
             let elapsed = start_time.elapsed().unwrap_or_default();
             if elapsed.as_millis() > 5000 {
                 warn!("⚠️ 连接检查耗时较长: {}ms", elapsed.as_millis());
             }
-            
+
             Ok(true)
         }
         Ok(Err(e)) => {
             // API调用失败
             grid_state.connection_retry_count += 1;
-            
+
             // 分析错误类型
             let error_type = classify_connection_error(&e);
             warn!(
                 "⚠️ 连接检查失败 (重试次数: {}, 错误类型: {}): {:?}",
                 grid_state.connection_retry_count, error_type, e
             );
-            
+
             // 根据错误类型决定重试策略
             let max_retries = match error_type.as_str() {
-                "网络超时" => 8,      // 网络问题允许更多重试
-                "API限制" => 5,       // API限制适中重试
-                "认证失败" => 2,      // 认证问题快速失败
-                "服务器错误" => 6,    // 服务器问题适中重试
-                _ => 5,               // 默认重试次数
+                "网络超时" => 8,   // 网络问题允许更多重试
+                "API限制" => 5,    // API限制适中重试
+                "认证失败" => 2,   // 认证问题快速失败
+                "服务器错误" => 6, // 服务器问题适中重试
+                _ => 5,            // 默认重试次数
             };
-            
+
             if grid_state.connection_retry_count > max_retries {
-                error!("❌ 连接失败次数过多 ({}/{}，错误类型: {})", 
-                    grid_state.connection_retry_count, max_retries, error_type);
+                error!(
+                    "❌ 连接失败次数过多 ({}/{}，错误类型: {})",
+                    grid_state.connection_retry_count, max_retries, error_type
+                );
                 return Err(GridStrategyError::NetworkError(format!(
                     "连接失败次数过多: {} (错误类型: {})",
                     grid_state.connection_retry_count, error_type
                 )));
             }
-            
+
             // 根据错误类型和重试次数计算等待时间 - 改进的指数退避机制
             let (base_delay, max_backoff) = match error_type.as_str() {
-                "API限制" => (5, 600),      // API限制：基础5秒，最多等待10分钟
-                "网络超时" => (2, 120),     // 网络超时：基础2秒，最多等待2分钟
-                "服务器错误" => (3, 300),   // 服务器错误：基础3秒，最多等待5分钟
-                "认证失败" => (2, 60),      // 认证失败：基础2秒，最多等待1分钟
-                _ => (2, 180),              // 默认：基础2秒，最多等待3分钟
+                "API限制" => (5, 600),    // API限制：基础5秒，最多等待10分钟
+                "网络超时" => (2, 120),   // 网络超时：基础2秒，最多等待2分钟
+                "服务器错误" => (3, 300), // 服务器错误：基础3秒，最多等待5分钟
+                "认证失败" => (2, 60),    // 认证失败：基础2秒，最多等待1分钟
+                _ => (2, 180),            // 默认：基础2秒，最多等待3分钟
             };
-            
+
             let (wait_seconds, backoff_seconds, max_backoff_used) = calculate_exponential_backoff(
                 base_delay,
                 grid_state.connection_retry_count,
                 max_backoff,
                 &error_type,
             );
-            
-            info!("⏱️ 等待 {}秒 后重试连接 (错误类型: {}, 基础延迟: {}s, 指数退避: {}s, 上限: {}s)", 
-                wait_seconds, error_type, base_delay, backoff_seconds, max_backoff_used);
-            
+
+            info!(
+                "⏱️ 等待 {}秒 后重试连接 (错误类型: {}, 基础延迟: {}s, 指数退避: {}s, 上限: {}s)",
+                wait_seconds, error_type, base_delay, backoff_seconds, max_backoff_used
+            );
+
             // 如果等待时间较长，提供额外信息
             if wait_seconds >= 60 {
-                info!("💡 等待时间较长({:.1}分钟)，这是为了避免频繁重试对服务器造成压力", 
-                    wait_seconds as f64 / 60.0);
+                info!(
+                    "💡 等待时间较长({:.1}分钟)，这是为了避免频繁重试对服务器造成压力",
+                    wait_seconds as f64 / 60.0
+                );
             }
-            
+
             sleep(Duration::from_secs(wait_seconds)).await;
-            
+
             Ok(false)
         }
         Err(_timeout) => {
@@ -6558,35 +7369,43 @@ async fn ensure_connection(
                 "⚠️ 连接检查超时 (重试次数: {}, 超时时间: 15秒)",
                 grid_state.connection_retry_count
             );
-            
+
             if grid_state.connection_retry_count > 6 {
-                error!("❌ 连接超时次数过多 ({}次)", grid_state.connection_retry_count);
+                error!(
+                    "❌ 连接超时次数过多 ({}次)",
+                    grid_state.connection_retry_count
+                );
                 return Err(GridStrategyError::NetworkError(
                     "连接超时次数过多".to_string(),
                 ));
             }
-            
+
             // 超时情况下的改进指数退避机制
             let base_timeout_delay = 3;
             let max_timeout_backoff = 120; // 超时情况最多等待2分钟
-            
-            let (wait_seconds, timeout_backoff_seconds, max_backoff_used) = calculate_exponential_backoff(
-                base_timeout_delay,
-                grid_state.connection_retry_count,
-                max_timeout_backoff,
-                "连接超时",
+
+            let (wait_seconds, timeout_backoff_seconds, max_backoff_used) =
+                calculate_exponential_backoff(
+                    base_timeout_delay,
+                    grid_state.connection_retry_count,
+                    max_timeout_backoff,
+                    "连接超时",
+                );
+
+            info!(
+                "⏱️ 连接超时，等待 {}秒 后重试 (基础延迟: {}s, 指数退避: {}s, 上限: {}s)",
+                wait_seconds, base_timeout_delay, timeout_backoff_seconds, max_backoff_used
             );
-            
-            info!("⏱️ 连接超时，等待 {}秒 后重试 (基础延迟: {}s, 指数退避: {}s, 上限: {}s)", 
-                wait_seconds, base_timeout_delay, timeout_backoff_seconds, max_backoff_used);
-            
+
             if wait_seconds >= 60 {
-                info!("💡 超时重试等待时间较长({:.1}分钟)，建议检查网络连接", 
-                    wait_seconds as f64 / 60.0);
+                info!(
+                    "💡 超时重试等待时间较长({:.1}分钟)，建议检查网络连接",
+                    wait_seconds as f64 / 60.0
+                );
             }
-            
+
             sleep(Duration::from_secs(wait_seconds)).await;
-            
+
             Ok(false)
         }
     }
@@ -6601,10 +7420,10 @@ fn calculate_exponential_backoff(
 ) -> (u64, u64, u64) {
     // 指数退避计算，限制最大指数为4（避免过长等待）
     let backoff_seconds = base_delay * 2_u64.pow(retry_count.min(4));
-    
+
     // 应用上限
     let actual_wait_seconds = backoff_seconds.min(max_backoff);
-    
+
     // 返回 (实际等待时间, 指数退避计算值, 上限值)
     (actual_wait_seconds, backoff_seconds, max_backoff)
 }
@@ -6612,16 +7431,30 @@ fn calculate_exponential_backoff(
 // 分析连接错误类型，用于制定不同的重试策略
 fn classify_connection_error(error: &GridStrategyError) -> String {
     let error_msg = format!("{:?}", error).to_lowercase();
-    
+
     if error_msg.contains("timeout") || error_msg.contains("超时") {
         "网络超时".to_string()
-    } else if error_msg.contains("rate limit") || error_msg.contains("限制") || error_msg.contains("429") {
+    } else if error_msg.contains("rate limit")
+        || error_msg.contains("限制")
+        || error_msg.contains("429")
+    {
         "API限制".to_string()
-    } else if error_msg.contains("unauthorized") || error_msg.contains("认证") || error_msg.contains("401") || error_msg.contains("403") {
+    } else if error_msg.contains("unauthorized")
+        || error_msg.contains("认证")
+        || error_msg.contains("401")
+        || error_msg.contains("403")
+    {
         "认证失败".to_string()
-    } else if error_msg.contains("500") || error_msg.contains("502") || error_msg.contains("503") || error_msg.contains("服务器") {
+    } else if error_msg.contains("500")
+        || error_msg.contains("502")
+        || error_msg.contains("503")
+        || error_msg.contains("服务器")
+    {
         "服务器错误".to_string()
-    } else if error_msg.contains("network") || error_msg.contains("connection") || error_msg.contains("网络") {
+    } else if error_msg.contains("network")
+        || error_msg.contains("connection")
+        || error_msg.contains("网络")
+    {
         "网络连接".to_string()
     } else if error_msg.contains("parse") || error_msg.contains("解析") {
         "数据解析".to_string()
@@ -6636,7 +7469,7 @@ fn calculate_performance_metrics(
     _price_history: &[f64],
 ) -> PerformanceMetrics {
     let total_trades = grid_state.performance_history.len() as u32;
-    
+
     if total_trades == 0 {
         return PerformanceMetrics {
             total_trades: 0,
@@ -6653,7 +7486,7 @@ fn calculate_performance_metrics(
             largest_loss: 0.0,
         };
     }
-    
+
     let mut winning_trades = 0;
     let mut losing_trades = 0;
     let mut total_wins = 0.0;
@@ -6662,7 +7495,7 @@ fn calculate_performance_metrics(
     let mut largest_loss: f64 = 0.0;
     let mut peak_capital = grid_state.total_capital;
     let mut max_drawdown: f64 = 0.0;
-    
+
     for record in &grid_state.performance_history {
         if record.profit > 0.0 {
             winning_trades += 1;
@@ -6673,31 +7506,31 @@ fn calculate_performance_metrics(
             total_losses += record.profit.abs();
             largest_loss = largest_loss.max(record.profit.abs());
         }
-        
+
         // 计算最大回撤
         peak_capital = peak_capital.max(record.total_capital);
         let drawdown = (peak_capital - record.total_capital) / peak_capital;
         max_drawdown = max_drawdown.max(drawdown);
     }
-    
+
     let win_rate = if total_trades > 0 {
         winning_trades as f64 / total_trades as f64
     } else {
         0.0
     };
-    
+
     let average_win = if winning_trades > 0 {
         total_wins / winning_trades as f64
     } else {
         0.0
     };
-    
+
     let average_loss = if losing_trades > 0 {
         total_losses / losing_trades as f64
     } else {
         0.0
     };
-    
+
     let profit_factor = if total_losses > 0.0 {
         total_wins / total_losses
     } else if total_wins > 0.0 {
@@ -6705,19 +7538,20 @@ fn calculate_performance_metrics(
     } else {
         0.0
     };
-    
+
     // 简化的夏普比率计算
-    let returns: Vec<f64> = grid_state.performance_history
+    let returns: Vec<f64> = grid_state
+        .performance_history
         .iter()
         .map(|r| r.profit / r.total_capital)
         .collect();
-    
+
     let mean_return = if !returns.is_empty() {
         returns.iter().sum::<f64>() / returns.len() as f64
     } else {
         0.0
     };
-    
+
     let return_std = if returns.len() > 1 {
         let variance = returns
             .iter()
@@ -6728,13 +7562,13 @@ fn calculate_performance_metrics(
     } else {
         0.0
     };
-    
+
     let sharpe_ratio = if return_std > 0.0 {
         mean_return / return_std
     } else {
         0.0
     };
-    
+
     PerformanceMetrics {
         total_trades,
         winning_trades,
@@ -6789,25 +7623,30 @@ async fn create_orders_in_batches(
     orders: Vec<ClientOrderRequest>,
     grid_config: &crate::config::GridConfig,
     grid_state: &mut GridState,
+    batch_optimizer: &mut BatchTaskOptimizer,
 ) -> Result<(Vec<u64>, Vec<OrderRequestInfo>), GridStrategyError> {
     let start_time = SystemTime::now();
     let mut created_order_ids = Vec::new();
     let mut all_failed_order_infos = Vec::new();
-    
+
     if orders.is_empty() {
         return Ok((created_order_ids, all_failed_order_infos));
     }
-    
+
     // 资源限制检查
     let max_total_orders = 500; // 单次最多创建500个订单
     if orders.len() > max_total_orders {
-        warn!("⚠️ 订单数量({})超过限制({})，将只处理前{}个订单", 
-            orders.len(), max_total_orders, max_total_orders);
+        warn!(
+            "⚠️ 订单数量({})超过限制({})，将只处理前{}个订单",
+            orders.len(),
+            max_total_orders,
+            max_total_orders
+        );
     }
-    
+
     let orders_to_process: Vec<_> = orders.into_iter().take(max_total_orders).collect();
     let mut stats = OrderCreationStats::new(orders_to_process.len());
-    
+
     // 检查批次间延迟
     let now = SystemTime::now();
     if let Ok(duration) = now.duration_since(grid_state.last_order_batch_time) {
@@ -6818,76 +7657,88 @@ async fn create_orders_in_batches(
             sleep(remaining_delay).await;
         }
     }
-    
-    // 动态调整批次大小
-    let base_batch_size = grid_config.max_orders_per_batch.min(orders_to_process.len());
-    let adjusted_batch_size = if orders_to_process.len() > 100 {
-        // 大量订单时减小批次大小以提高稳定性
-        ((base_batch_size as f64) * 0.7) as usize
-    } else {
-        base_batch_size
-    }.max(1);
-    
-    info!("📦 开始增强批量创建订单 - 总数: {}, 批次大小: {}, 延迟: {}ms", 
-        orders_to_process.len(), adjusted_batch_size, grid_config.order_batch_delay_ms);
-    
+
+    // 使用批处理优化器确定最优批次大小
+    let optimal_batch_size = batch_optimizer.optimize_batch_size(orders_to_process.len());
+
+    info!(
+        "📦 开始智能批量创建订单 - 总数: {}, 优化批次大小: {}, 延迟: {}ms",
+        orders_to_process.len(),
+        optimal_batch_size,
+        grid_config.order_batch_delay_ms
+    );
+    info!(
+        "⚡ 批处理优化器状态: 目标时间={:.2}秒, 历史记录={}次",
+        batch_optimizer.target_execution_time.as_secs_f64(),
+        batch_optimizer.last_execution_times.len()
+    );
+
     // 超时控制 - 总体处理时间限制
     let max_total_time = Duration::from_secs(300); // 5分钟总超时
-    let batch_timeout = Duration::from_secs(30);   // 单批次30秒超时
-    
+    let batch_timeout = Duration::from_secs(30); // 单批次30秒超时
+
     // 分批处理订单
     let mut order_iter = orders_to_process.into_iter();
     let mut batch_count = 0;
-    
+
     loop {
         // 检查总体超时
         if start_time.elapsed().unwrap_or_default() > max_total_time {
             warn!("⚠️ 批量订单创建总体超时，停止处理剩余订单");
             break;
         }
-        
+
         let mut current_batch = Vec::new();
-        
+
         // 收集当前批次的订单
-        for _ in 0..adjusted_batch_size {
+        for _ in 0..optimal_batch_size {
             if let Some(order) = order_iter.next() {
                 current_batch.push(order);
             } else {
                 break;
             }
         }
-        
+
         if current_batch.is_empty() {
             break;
         }
-        
+
         batch_count += 1;
         let batch_start_time = SystemTime::now();
         let current_batch_len = current_batch.len(); // 在移动前保存长度
-        info!("📋 处理第{}批订单，数量: {}", batch_count, current_batch_len);
-        
+        info!(
+            "📋 处理第{}批订单，数量: {}",
+            batch_count, current_batch_len
+        );
+
         // 批次级别的超时控制
         let batch_result = tokio::time::timeout(
             batch_timeout,
-            process_order_batch(exchange_client, current_batch, grid_config)
-        ).await;
-        
+            process_order_batch(exchange_client, current_batch, grid_config),
+        )
+        .await;
+
         match batch_result {
             Ok(Ok((successful_ids, failed_order_infos))) => {
                 // 批次处理成功
                 let successful_count = successful_ids.len();
                 let failed_count = failed_order_infos.len();
-                
+
                 created_order_ids.extend(successful_ids.iter());
                 stats.successful_orders += successful_count;
                 stats.failed_orders += failed_count;
-                
+
                 // 收集失败的订单信息用于重试
                 all_failed_order_infos.extend(failed_order_infos);
-                
+
                 let batch_time = batch_start_time.elapsed().unwrap_or_default();
-                info!("✅ 第{}批处理完成 - 成功: {}, 失败: {}, 耗时: {}ms", 
-                    batch_count, successful_count, failed_count, batch_time.as_millis());
+                info!(
+                    "✅ 第{}批处理完成 - 成功: {}, 失败: {}, 耗时: {}ms",
+                    batch_count,
+                    successful_count,
+                    failed_count,
+                    batch_time.as_millis()
+                );
             }
             Ok(Err(e)) => {
                 // 批次处理失败
@@ -6900,29 +7751,30 @@ async fn create_orders_in_batches(
                 stats.failed_orders += current_batch_len;
             }
         }
-        
+
         // 批次间延迟和资源保护
         if order_iter.len() > 0 {
             let delay = Duration::from_millis(grid_config.order_batch_delay_ms);
             info!("⏱️ 批次间延迟: {}ms", delay.as_millis());
             sleep(delay).await;
-            
+
             // CPU保护 - 每5批次后稍作休息
             if batch_count % 5 == 0 {
                 sleep(Duration::from_millis(100)).await;
             }
         }
     }
-    
+
     // 重试失败的订单（最多重试一次）
     if !all_failed_order_infos.is_empty() && all_failed_order_infos.len() <= 50 {
         info!("🔄 开始重试{}个失败的订单", all_failed_order_infos.len());
-        
+
         let retry_result = tokio::time::timeout(
             Duration::from_secs(60), // 重试阶段1分钟超时
-            retry_failed_order_infos(exchange_client, all_failed_order_infos.clone(), grid_config)
-        ).await;
-        
+            retry_failed_order_infos(exchange_client, all_failed_order_infos.clone(), grid_config),
+        )
+        .await;
+
         match retry_result {
             Ok(Ok(retry_successful_ids)) => {
                 created_order_ids.extend(retry_successful_ids.iter());
@@ -6940,16 +7792,22 @@ async fn create_orders_in_batches(
             }
         }
     } else if all_failed_order_infos.len() > 50 {
-        warn!("⚠️ 失败订单数量过多({}个)，跳过重试", all_failed_order_infos.len());
+        warn!(
+            "⚠️ 失败订单数量过多({}个)，跳过重试",
+            all_failed_order_infos.len()
+        );
     }
-    
+
     // 更新统计信息
     stats.processing_time = start_time.elapsed().unwrap_or_default();
     stats.update_success_rate();
-    
+
+    // 记录批处理执行时间到优化器
+    batch_optimizer.record_execution_time(stats.processing_time);
+
     // 更新最后批次时间
     grid_state.last_order_batch_time = SystemTime::now();
-    
+
     // 输出详细统计
     info!("📊 批量订单创建统计:");
     info!("   总订单数: {}", stats.total_orders);
@@ -6958,19 +7816,31 @@ async fn create_orders_in_batches(
     info!("   重试成功: {}", stats.retried_orders);
     info!("   成功率: {:.1}%", stats.success_rate);
     info!("   总耗时: {}ms", stats.processing_time.as_millis());
-    info!("   平均每订单: {:.1}ms", 
-        stats.processing_time.as_millis() as f64 / stats.total_orders as f64);
-    
+    info!(
+        "   平均每订单: {:.1}ms",
+        stats.processing_time.as_millis() as f64 / stats.total_orders as f64
+    );
+
     // 性能警告
     if stats.success_rate < 80.0 {
-        warn!("⚠️ 订单创建成功率较低({:.1}%)，建议检查网络连接和API限制", stats.success_rate);
+        warn!(
+            "⚠️ 订单创建成功率较低({:.1}%)，建议检查网络连接和API限制",
+            stats.success_rate
+        );
     }
-    
+
     if stats.processing_time.as_secs() > 120 {
-        warn!("⚠️ 订单创建耗时较长({}秒)，建议优化批次大小", stats.processing_time.as_secs());
+        warn!(
+            "⚠️ 订单创建耗时较长({}秒)，建议优化批次大小",
+            stats.processing_time.as_secs()
+        );
     }
-    
-    info!("✅ 增强批量订单创建完成 - 成功创建: {}/{}", created_order_ids.len(), stats.total_orders);
+
+    info!(
+        "✅ 增强批量订单创建完成 - 成功创建: {}/{}",
+        created_order_ids.len(),
+        stats.total_orders
+    );
     Ok((created_order_ids, all_failed_order_infos))
 }
 
@@ -6994,7 +7864,7 @@ impl OrderRequestInfo {
             sz: order.sz,
         }
     }
-    
+
     fn to_client_order_request(&self) -> ClientOrderRequest {
         ClientOrderRequest {
             asset: self.asset.clone(),
@@ -7018,17 +7888,18 @@ async fn process_order_batch(
 ) -> Result<(Vec<u64>, Vec<OrderRequestInfo>), GridStrategyError> {
     let mut successful_ids = Vec::new();
     let mut failed_order_infos = Vec::new();
-    
+
     for order in orders {
         // 保存订单信息用于失败重试
         let order_info = OrderRequestInfo::from_client_order_request(&order);
-        
+
         // 单个订单超时控制
         let order_result = tokio::time::timeout(
             Duration::from_secs(10), // 单个订单10秒超时
-            exchange_client.order(order, None)
-        ).await;
-        
+            exchange_client.order(order, None),
+        )
+        .await;
+
         match order_result {
             Ok(Ok(ExchangeResponseStatus::Ok(response))) => {
                 if let Some(data) = response.data {
@@ -7040,7 +7911,7 @@ async fn process_order_batch(
                             order_created = true;
                         }
                     }
-                    
+
                     // 如果响应成功但没有创建订单，也算作失败
                     if !order_created {
                         warn!("⚠️ 订单响应成功但未创建订单");
@@ -7064,14 +7935,18 @@ async fn process_order_batch(
                 failed_order_infos.push(order_info);
             }
         }
-        
+
         // 订单间小延迟，避免过于频繁的请求
         if _grid_config.order_batch_delay_ms > 0 {
             sleep(Duration::from_millis(50)).await;
         }
     }
-    
-    info!("📊 批次处理完成 - 成功: {}, 失败: {}", successful_ids.len(), failed_order_infos.len());
+
+    info!(
+        "📊 批次处理完成 - 成功: {}, 失败: {}",
+        successful_ids.len(),
+        failed_order_infos.len()
+    );
     Ok((successful_ids, failed_order_infos))
 }
 
@@ -7083,18 +7958,19 @@ async fn retry_failed_orders(
     _grid_config: &crate::config::GridConfig,
 ) -> Result<Vec<u64>, GridStrategyError> {
     let mut successful_ids = Vec::new();
-    
+
     info!("🔄 开始重试{}个失败订单", failed_orders.len());
-    
+
     for (index, order) in failed_orders.into_iter().enumerate() {
         // 重试前等待更长时间
         sleep(Duration::from_millis(200)).await;
-        
+
         let retry_result = tokio::time::timeout(
             Duration::from_secs(15), // 重试时使用更长的超时时间
-            exchange_client.order(order, None)
-        ).await;
-        
+            exchange_client.order(order, None),
+        )
+        .await;
+
         match retry_result {
             Ok(Ok(ExchangeResponseStatus::Ok(response))) => {
                 if let Some(data) = response.data {
@@ -7116,13 +7992,13 @@ async fn retry_failed_orders(
                 warn!("🔄⏰ 重试订单超时");
             }
         }
-        
+
         // 每10个重试订单后稍作休息
         if (index + 1) % 10 == 0 {
             sleep(Duration::from_millis(500)).await;
         }
     }
-    
+
     info!("🔄✅ 重试完成 - 成功: {}", successful_ids.len());
     Ok(successful_ids)
 }
@@ -7134,21 +8010,22 @@ async fn retry_failed_order_infos(
     _grid_config: &crate::config::GridConfig,
 ) -> Result<Vec<u64>, GridStrategyError> {
     let mut successful_ids = Vec::new();
-    
+
     info!("🔄 开始重试{}个失败订单", failed_order_infos.len());
-    
+
     for (index, order_info) in failed_order_infos.into_iter().enumerate() {
         // 重试前等待更长时间
         sleep(Duration::from_millis(200)).await;
-        
+
         // 重建订单请求
         let order = order_info.to_client_order_request();
-        
+
         let retry_result = tokio::time::timeout(
             Duration::from_secs(15), // 重试时使用更长的超时时间
-            exchange_client.order(order, None)
-        ).await;
-        
+            exchange_client.order(order, None),
+        )
+        .await;
+
         match retry_result {
             Ok(Ok(ExchangeResponseStatus::Ok(response))) => {
                 if let Some(data) = response.data {
@@ -7170,13 +8047,13 @@ async fn retry_failed_order_infos(
                 warn!("🔄⏰ 重试订单超时");
             }
         }
-        
+
         // 每10个重试订单后稍作休息
         if (index + 1) % 10 == 0 {
             sleep(Duration::from_millis(500)).await;
         }
     }
-    
+
     info!("🔄✅ 重试完成 - 成功: {}", successful_ids.len());
     Ok(successful_ids)
 }
@@ -7191,10 +8068,13 @@ async fn create_orders_individually(
     is_buy_order: bool,
 ) -> Result<usize, GridStrategyError> {
     let mut success_count = 0;
-    
-    info!("🔄 开始单个创建模式 - 订单数: {}, 类型: {}", 
-        order_infos.len(), if is_buy_order { "买单" } else { "卖单" });
-    
+
+    info!(
+        "🔄 开始单个创建模式 - 订单数: {}, 类型: {}",
+        order_infos.len(),
+        if is_buy_order { "买单" } else { "卖单" }
+    );
+
     for (index, order_info) in order_infos.iter().enumerate() {
         // 创建订单请求
         let order_request = ClientOrderRequest {
@@ -7208,13 +8088,14 @@ async fn create_orders_individually(
                 tif: "Gtc".to_string(),
             }),
         };
-        
+
         // 单个订单超时控制
         let order_result = tokio::time::timeout(
             Duration::from_secs(15), // 单个订单15秒超时
-            exchange_client.order(order_request, None)
-        ).await;
-        
+            exchange_client.order(order_request, None),
+        )
+        .await;
+
         match order_result {
             Ok(Ok(ExchangeResponseStatus::Ok(response))) => {
                 if let Some(data) = response.data {
@@ -7223,38 +8104,54 @@ async fn create_orders_individually(
                             active_orders.push(order.oid);
                             orders_map.insert(order.oid, order_info.clone());
                             success_count += 1;
-                            
-                            info!("🔄✅ 单个{}创建成功: ID={}, 价格={:.4}, 数量={:.4}",
+
+                            info!(
+                                "🔄✅ 单个{}创建成功: ID={}, 价格={:.4}, 数量={:.4}",
                                 if is_buy_order { "买单" } else { "卖单" },
-                                order.oid, order_info.price, order_info.quantity);
+                                order.oid,
+                                order_info.price,
+                                order_info.quantity
+                            );
                         }
                     }
                 }
             }
             Ok(Ok(ExchangeResponseStatus::Err(err))) => {
-                warn!("🔄❌ 单个{}创建失败: {:?}", 
-                    if is_buy_order { "买单" } else { "卖单" }, err);
+                warn!(
+                    "🔄❌ 单个{}创建失败: {:?}",
+                    if is_buy_order { "买单" } else { "卖单" },
+                    err
+                );
             }
             Ok(Err(e)) => {
-                warn!("🔄❌ 单个{}创建失败: {:?}", 
-                    if is_buy_order { "买单" } else { "卖单" }, e);
+                warn!(
+                    "🔄❌ 单个{}创建失败: {:?}",
+                    if is_buy_order { "买单" } else { "卖单" },
+                    e
+                );
             }
             Err(_) => {
-                warn!("🔄⏰ 单个{}创建超时", 
-                    if is_buy_order { "买单" } else { "卖单" });
+                warn!(
+                    "🔄⏰ 单个{}创建超时",
+                    if is_buy_order { "买单" } else { "卖单" }
+                );
             }
         }
-        
+
         // 订单间延迟
         sleep(Duration::from_millis(200)).await;
-        
+
         // 每5个订单后稍作休息
         if (index + 1) % 5 == 0 {
             sleep(Duration::from_millis(500)).await;
         }
     }
-    
-    info!("🔄✅ 单个创建模式完成 - 成功: {}/{}", success_count, order_infos.len());
+
+    info!(
+        "🔄✅ 单个创建模式完成 - 成功: {}/{}",
+        success_count,
+        order_infos.len()
+    );
     Ok(success_count)
 }
 
@@ -7269,10 +8166,13 @@ async fn check_order_status(
     let start_time = SystemTime::now();
     let max_processing_time = Duration::from_secs(30); // 最大处理时间30秒
     let max_orders_per_batch = 100; // 每批最多处理100个订单
-    
+
     // 如果订单数量过多，进行分批处理
     if active_orders.len() > max_orders_per_batch {
-        info!("📊 订单数量较多({}个)，启用分批处理模式", active_orders.len());
+        info!(
+            "📊 订单数量较多({}个)，启用分批处理模式",
+            active_orders.len()
+        );
         return check_order_status_in_batches(
             info_client,
             user_address,
@@ -7281,40 +8181,46 @@ async fn check_order_status(
             sell_orders,
             max_orders_per_batch,
             max_processing_time,
-        ).await;
+        )
+        .await;
     }
-    
+
     // 使用超时控制的API调用
     let open_orders_result = tokio::time::timeout(
         Duration::from_secs(10), // API调用超时时间10秒
-        info_client.open_orders(user_address)
-    ).await;
-    
+        info_client.open_orders(user_address),
+    )
+    .await;
+
     let open_orders = match open_orders_result {
         Ok(Ok(orders)) => orders,
         Ok(Err(e)) => {
-            return Err(GridStrategyError::ClientError(format!("获取开放订单失败: {:?}", e)));
+            return Err(GridStrategyError::ClientError(format!(
+                "获取开放订单失败: {:?}",
+                e
+            )));
         }
         Err(_) => {
             warn!("⚠️ 获取开放订单超时，跳过本次检查");
             return Ok(()); // 超时时不返回错误，避免阻塞主流程
         }
     };
-    
+
     // 构建开放订单ID集合
-    let open_order_ids: std::collections::HashSet<u64> = open_orders
-        .iter()
-        .map(|order| order.oid)
-        .collect();
-    
-    info!("🔍 订单状态检查 - 活跃订单: {}, 开放订单: {}", 
-        active_orders.len(), open_order_ids.len());
-    
+    let open_order_ids: std::collections::HashSet<u64> =
+        open_orders.iter().map(|order| order.oid).collect();
+
+    info!(
+        "🔍 订单状态检查 - 活跃订单: {}, 开放订单: {}",
+        active_orders.len(),
+        open_order_ids.len()
+    );
+
     // 统计清理的订单
     let mut removed_buy_orders = 0;
     let mut removed_sell_orders = 0;
     let initial_count = active_orders.len();
-    
+
     // 检查活跃订单列表中的订单
     active_orders.retain(|&order_id| {
         if !open_order_ids.contains(&order_id) {
@@ -7331,15 +8237,16 @@ async fn check_order_status(
             true
         }
     });
-    
+
     let processing_time = start_time.elapsed().unwrap_or_default();
-    info!("✅ 订单状态检查完成 - 处理时间: {}ms, 移除订单: {} (买单: {}, 卖单: {})", 
+    info!(
+        "✅ 订单状态检查完成 - 处理时间: {}ms, 移除订单: {} (买单: {}, 卖单: {})",
         processing_time.as_millis(),
         initial_count - active_orders.len(),
         removed_buy_orders,
         removed_sell_orders
     );
-    
+
     Ok(())
 }
 
@@ -7356,69 +8263,78 @@ async fn check_order_status_in_batches(
     let start_time = SystemTime::now();
     let mut total_removed = 0;
     let mut batch_count = 0;
-    
-    info!("🔄 开始分批订单状态检查 - 总订单: {}, 批次大小: {}", 
-        active_orders.len(), batch_size);
-    
+
+    info!(
+        "🔄 开始分批订单状态检查 - 总订单: {}, 批次大小: {}",
+        active_orders.len(),
+        batch_size
+    );
+
     // 首先获取所有开放订单（只调用一次API）
     let open_orders_result = tokio::time::timeout(
         Duration::from_secs(15), // 增加超时时间，因为可能订单较多
-        info_client.open_orders(user_address)
-    ).await;
-    
+        info_client.open_orders(user_address),
+    )
+    .await;
+
     let open_orders = match open_orders_result {
         Ok(Ok(orders)) => orders,
         Ok(Err(e)) => {
-            return Err(GridStrategyError::ClientError(format!("获取开放订单失败: {:?}", e)));
+            return Err(GridStrategyError::ClientError(format!(
+                "获取开放订单失败: {:?}",
+                e
+            )));
         }
         Err(_) => {
             warn!("⚠️ 获取开放订单超时，跳过本次检查");
             return Ok(());
         }
     };
-    
-    let open_order_ids: std::collections::HashSet<u64> = open_orders
-        .iter()
-        .map(|order| order.oid)
-        .collect();
-    
+
+    let open_order_ids: std::collections::HashSet<u64> =
+        open_orders.iter().map(|order| order.oid).collect();
+
     info!("📊 获取到{}个开放订单，开始分批处理", open_order_ids.len());
-    
+
     // 分批处理活跃订单
     let mut orders_to_remove = Vec::new();
-    
+
     for chunk in active_orders.chunks(batch_size) {
         // 检查是否超时
         if start_time.elapsed().unwrap_or_default() > max_total_time {
             warn!("⚠️ 分批处理超时，停止处理剩余订单");
             break;
         }
-        
+
         batch_count += 1;
         let mut batch_removed = 0;
-        
+
         for &order_id in chunk {
             if !open_order_ids.contains(&order_id) {
                 orders_to_remove.push(order_id);
                 batch_removed += 1;
             }
         }
-        
-        info!("📋 第{}批处理完成 - 检查: {}, 移除: {}", 
-            batch_count, chunk.len(), batch_removed);
-        
+
+        info!(
+            "📋 第{}批处理完成 - 检查: {}, 移除: {}",
+            batch_count,
+            chunk.len(),
+            batch_removed
+        );
+
         total_removed += batch_removed;
-        
+
         // 批次间小延迟，避免过度占用CPU
         if batch_count % 5 == 0 {
             sleep(Duration::from_millis(10)).await;
         }
     }
-    
+
     // 统一移除订单
     let mut removed_buy_orders = 0;
     let mut removed_sell_orders = 0;
-    
+
     for order_id in &orders_to_remove {
         if buy_orders.remove(order_id).is_some() {
             removed_buy_orders += 1;
@@ -7428,19 +8344,20 @@ async fn check_order_status_in_batches(
         }
         info!("📋 订单{}已从活跃列表中移除（可能已成交或取消）", order_id);
     }
-    
+
     // 从活跃订单列表中移除
     active_orders.retain(|order_id| !orders_to_remove.contains(order_id));
-    
+
     let processing_time = start_time.elapsed().unwrap_or_default();
-    info!("✅ 分批订单状态检查完成 - 处理时间: {}ms, 批次数: {}, 移除订单: {} (买单: {}, 卖单: {})", 
+    info!(
+        "✅ 分批订单状态检查完成 - 处理时间: {}ms, 批次数: {}, 移除订单: {} (买单: {}, 卖单: {})",
         processing_time.as_millis(),
         batch_count,
         total_removed,
         removed_buy_orders,
         removed_sell_orders
     );
-    
+
     Ok(())
 }
 
@@ -7452,19 +8369,22 @@ fn auto_optimize_grid_parameters(
     // 保存优化前的参数状态
     let old_params = grid_state.dynamic_params.clone();
     let now = SystemTime::now();
-    
+
     // 检查是否需要优化（每24小时最多优化一次）
     let current_timestamp = now.duration_since(UNIX_EPOCH).unwrap().as_secs();
     if current_timestamp - grid_state.dynamic_params.last_optimization_time < 24 * 60 * 60 {
         return false;
     }
-    
+
     // 需要足够的历史数据
     if grid_state.performance_history.len() < 20 {
-        info!("📊 历史数据不足({})，跳过自动优化", grid_state.performance_history.len());
+        info!(
+            "📊 历史数据不足({})，跳过自动优化",
+            grid_state.performance_history.len()
+        );
         return false;
     }
-    
+
     // 分析最近的表现
     let recent_records: Vec<&PerformanceRecord> = grid_state
         .performance_history
@@ -7472,104 +8392,97 @@ fn auto_optimize_grid_parameters(
         .rev()
         .take(30) // 分析最近30笔交易
         .collect();
-    
+
     let recent_profit: f64 = recent_records.iter().map(|r| r.profit).sum();
-    let recent_win_rate = recent_records
-        .iter()
-        .filter(|r| r.profit > 0.0)
-        .count() as f64 / recent_records.len() as f64;
-    
+    let recent_win_rate = recent_records.iter().filter(|r| r.profit > 0.0).count() as f64
+        / recent_records.len() as f64;
+
     let avg_profit_per_trade = recent_profit / recent_records.len() as f64;
-    
+
     // 计算性能评分 (0-100)
     let profit_score = if recent_profit > 0.0 { 50.0 } else { 0.0 };
     let win_rate_score = recent_win_rate * 30.0;
-    let consistency_score = if avg_profit_per_trade > 0.0 { 20.0 } else { 0.0 };
+    let consistency_score = if avg_profit_per_trade > 0.0 {
+        20.0
+    } else {
+        0.0
+    };
     let performance_score = profit_score + win_rate_score + consistency_score;
-    
+
     info!("📊 性能评分分析:");
     info!("   最近30笔交易利润: {:.2}", recent_profit);
     info!("   胜率: {:.1}%", recent_win_rate * 100.0);
     info!("   平均每笔利润: {:.2}", avg_profit_per_trade);
     info!("   综合评分: {:.1}/100", performance_score);
-    
+
     // 根据性能评分决定优化策略
     let mut optimization_applied = false;
     let original_min_spacing = grid_state.dynamic_params.current_min_spacing;
     let original_max_spacing = grid_state.dynamic_params.current_max_spacing;
     let original_trade_amount = grid_state.dynamic_params.current_trade_amount;
-    
+
     if performance_score >= 70.0 {
         // 表现优秀：适度增加网格间距和交易金额以获得更大利润
         let spacing_multiplier = 1.03; // 增加3%
-        let amount_multiplier = 1.02;  // 增加2%
-        
-        grid_state.dynamic_params.current_min_spacing = 
-            (original_min_spacing * spacing_multiplier)
-            .min(grid_config.max_grid_spacing * 0.8); // 不超过最大间距的80%
-        
-        grid_state.dynamic_params.current_max_spacing = 
-            (original_max_spacing * spacing_multiplier)
-            .min(grid_config.max_grid_spacing);
-        
-        grid_state.dynamic_params.current_trade_amount = 
-            (original_trade_amount * amount_multiplier)
-            .min(grid_state.total_capital * 0.1); // 不超过总资金的10%
-        
+        let amount_multiplier = 1.02; // 增加2%
+
+        grid_state.dynamic_params.current_min_spacing =
+            (original_min_spacing * spacing_multiplier).min(grid_config.max_grid_spacing * 0.8); // 不超过最大间距的80%
+
+        grid_state.dynamic_params.current_max_spacing =
+            (original_max_spacing * spacing_multiplier).min(grid_config.max_grid_spacing);
+
+        grid_state.dynamic_params.current_trade_amount =
+            (original_trade_amount * amount_multiplier).min(grid_state.total_capital * 0.1); // 不超过总资金的10%
+
         info!("🚀 性能优秀，执行积极优化策略");
         optimization_applied = true;
-        
     } else if performance_score <= 30.0 {
         // 表现不佳：减少网格间距和交易金额以降低风险
         let spacing_multiplier = 0.97; // 减少3%
-        let amount_multiplier = 0.95;  // 减少5%
-        
-        grid_state.dynamic_params.current_min_spacing = 
-            (original_min_spacing * spacing_multiplier)
-            .max(grid_config.min_grid_spacing * 0.5); // 不低于最小间距的50%
-        
-        grid_state.dynamic_params.current_max_spacing = 
-            (original_max_spacing * spacing_multiplier)
+        let amount_multiplier = 0.95; // 减少5%
+
+        grid_state.dynamic_params.current_min_spacing =
+            (original_min_spacing * spacing_multiplier).max(grid_config.min_grid_spacing * 0.5); // 不低于最小间距的50%
+
+        grid_state.dynamic_params.current_max_spacing = (original_max_spacing * spacing_multiplier)
             .max(grid_state.dynamic_params.current_min_spacing * 1.5);
-        
-        grid_state.dynamic_params.current_trade_amount = 
-            (original_trade_amount * amount_multiplier)
-            .max(grid_config.trade_amount * 0.3); // 不低于原始金额的30%
-        
+
+        grid_state.dynamic_params.current_trade_amount =
+            (original_trade_amount * amount_multiplier).max(grid_config.trade_amount * 0.3); // 不低于原始金额的30%
+
         info!("⚠️ 性能不佳，执行保守优化策略");
         optimization_applied = true;
-        
     } else {
         // 表现中等：微调参数
         let market_volatility = grid_state.historical_volatility;
-        
-        if market_volatility > 0.02 { // 高波动市场
+
+        if market_volatility > 0.02 {
+            // 高波动市场
             // 增加网格间距以适应波动
             let spacing_multiplier = 1.01;
-            grid_state.dynamic_params.current_min_spacing = 
-                (original_min_spacing * spacing_multiplier)
-                .min(grid_config.max_grid_spacing * 0.8);
-            grid_state.dynamic_params.current_max_spacing = 
-                (original_max_spacing * spacing_multiplier)
-                .min(grid_config.max_grid_spacing);
-            
+            grid_state.dynamic_params.current_min_spacing =
+                (original_min_spacing * spacing_multiplier).min(grid_config.max_grid_spacing * 0.8);
+            grid_state.dynamic_params.current_max_spacing =
+                (original_max_spacing * spacing_multiplier).min(grid_config.max_grid_spacing);
+
             info!("📈 高波动市场，微调网格间距");
             optimization_applied = true;
-        } else if market_volatility < 0.005 { // 低波动市场
+        } else if market_volatility < 0.005 {
+            // 低波动市场
             // 减少网格间距以增加交易频率
             let spacing_multiplier = 0.99;
-            grid_state.dynamic_params.current_min_spacing = 
-                (original_min_spacing * spacing_multiplier)
-                .max(grid_config.min_grid_spacing * 0.8);
-            grid_state.dynamic_params.current_max_spacing = 
-                (original_max_spacing * spacing_multiplier)
+            grid_state.dynamic_params.current_min_spacing =
+                (original_min_spacing * spacing_multiplier).max(grid_config.min_grid_spacing * 0.8);
+            grid_state.dynamic_params.current_max_spacing = (original_max_spacing
+                * spacing_multiplier)
                 .max(grid_state.dynamic_params.current_min_spacing * 1.5);
-            
+
             info!("📉 低波动市场，微调网格间距");
             optimization_applied = true;
         }
     }
-    
+
     if optimization_applied {
         // 创建优化前的检查点
         let optimization_reason = if performance_score >= 70.0 {
@@ -7579,35 +8492,46 @@ fn auto_optimize_grid_parameters(
         } else {
             "微调优化策略".to_string()
         };
-        
-        grid_state.dynamic_params.create_checkpoint(optimization_reason, performance_score);
-        
+
+        grid_state
+            .dynamic_params
+            .create_checkpoint(optimization_reason, performance_score);
+
         grid_state.dynamic_params.last_optimization_time = current_timestamp;
         grid_state.dynamic_params.optimization_count += 1;
-        
-        info!("✅ 自动优化完成 (第{}次):", grid_state.dynamic_params.optimization_count);
-        info!("   最小网格间距: {:.4}% -> {:.4}% ({:+.2}%)", 
+
+        info!(
+            "✅ 自动优化完成 (第{}次):",
+            grid_state.dynamic_params.optimization_count
+        );
+        info!(
+            "   最小网格间距: {:.4}% -> {:.4}% ({:+.2}%)",
             original_min_spacing * 100.0,
             grid_state.dynamic_params.current_min_spacing * 100.0,
             (grid_state.dynamic_params.current_min_spacing / original_min_spacing - 1.0) * 100.0
         );
-        info!("   最大网格间距: {:.4}% -> {:.4}% ({:+.2}%)", 
+        info!(
+            "   最大网格间距: {:.4}% -> {:.4}% ({:+.2}%)",
             original_max_spacing * 100.0,
             grid_state.dynamic_params.current_max_spacing * 100.0,
             (grid_state.dynamic_params.current_max_spacing / original_max_spacing - 1.0) * 100.0
         );
-        info!("   交易金额: {:.2} -> {:.2} ({:+.2}%)", 
+        info!(
+            "   交易金额: {:.2} -> {:.2} ({:+.2}%)",
             original_trade_amount,
             grid_state.dynamic_params.current_trade_amount,
             (grid_state.dynamic_params.current_trade_amount / original_trade_amount - 1.0) * 100.0
         );
-        
+
         // 记录性能评分到滑动窗口
-        grid_state.dynamic_params.performance_window.push(performance_score);
+        grid_state
+            .dynamic_params
+            .performance_window
+            .push(performance_score);
         if grid_state.dynamic_params.performance_window.len() > 10 {
             grid_state.dynamic_params.performance_window.remove(0);
         }
-        
+
         // 验证优化后的参数
         let optimization_validation = validate_parameter_optimization(
             &old_params,
@@ -7615,9 +8539,9 @@ fn auto_optimize_grid_parameters(
             grid_config,
             performance_score,
         );
-        
+
         optimization_validation.log_results("参数优化");
-        
+
         // 如果验证失败，回滚参数
         if !optimization_validation.is_valid {
             error!("❌ 参数优化验证失败，回滚到优化前状态");
@@ -7626,26 +8550,34 @@ fn auto_optimize_grid_parameters(
         }
 
         // 保存参数到文件
-        if let Err(e) = grid_state.dynamic_params.save_to_file("dynamic_grid_params.json") {
+        if let Err(e) = grid_state
+            .dynamic_params
+            .save_to_file("dynamic_grid_params.json")
+        {
             warn!("⚠️ 保存动态参数失败: {:?}", e);
         }
-        
+
         true
     } else {
         // 即使没有优化，也检查是否需要回滚
         if let Some(checkpoint) = grid_state.dynamic_params.should_rollback(performance_score) {
             warn!("🔄 性能下降，执行参数回滚");
             let checkpoint_clone = checkpoint.clone();
-            grid_state.dynamic_params.rollback_to_checkpoint(&checkpoint_clone);
-            
+            grid_state
+                .dynamic_params
+                .rollback_to_checkpoint(&checkpoint_clone);
+
             // 保存回滚后的参数
-            if let Err(e) = grid_state.dynamic_params.save_to_file("dynamic_grid_params.json") {
+            if let Err(e) = grid_state
+                .dynamic_params
+                .save_to_file("dynamic_grid_params.json")
+            {
                 warn!("⚠️ 保存回滚参数失败: {:?}", e);
             }
-            
+
             return true; // 回滚也算是一种优化
         }
-        
+
         info!("📊 性能中等，暂不执行自动优化");
         false
     }
@@ -7664,25 +8596,26 @@ async fn safe_shutdown(
     start_time: SystemTime,
 ) -> Result<(), GridStrategyError> {
     info!("🛑 开始安全退出 - 原因: {}", reason.as_str());
-    
+
     let shutdown_start = SystemTime::now();
-    
+
     // 1. 取消所有未成交订单
     if !active_orders.is_empty() {
         info!("🗑️ 取消所有活跃订单 ({} 个)...", active_orders.len());
-        
+
         // 紧急情况下使用更短的超时时间
         let cancel_timeout = if reason.is_emergency() {
             Duration::from_secs(10)
         } else {
             Duration::from_secs(30)
         };
-        
+
         let cancel_result = tokio::time::timeout(
             cancel_timeout,
-            cancel_all_orders(exchange_client, active_orders)
-        ).await;
-        
+            cancel_all_orders(exchange_client, active_orders),
+        )
+        .await;
+
         match cancel_result {
             Ok(Ok(_)) => {
                 info!("✅ 所有订单已成功取消");
@@ -7697,22 +8630,25 @@ async fn safe_shutdown(
             }
         }
     }
-    
+
     // 2. 根据退出原因和配置决定是否清仓
     // 注意：这里假设默认在退出时清仓，可以根据需要添加配置选项
     let close_positions_on_exit = true; // 可以从配置中读取
-    let should_close_positions = reason.requires_position_close() 
+    let should_close_positions = reason.requires_position_close()
         || (close_positions_on_exit && grid_state.position_quantity > 0.0);
-    
+
     if should_close_positions && grid_state.position_quantity > 0.0 {
-        info!("📉 执行清仓操作 - 持仓数量: {:.4}", grid_state.position_quantity);
-        
+        info!(
+            "📉 执行清仓操作 - 持仓数量: {:.4}",
+            grid_state.position_quantity
+        );
+
         let close_timeout = if reason.is_emergency() {
             Duration::from_secs(15)
         } else {
             Duration::from_secs(60)
         };
-        
+
         let close_result = tokio::time::timeout(
             close_timeout,
             close_all_positions(
@@ -7720,10 +8656,11 @@ async fn safe_shutdown(
                 grid_config,
                 grid_state.position_quantity,
                 0.0, // 假设只有多头持仓
-                current_price
-            )
-        ).await;
-        
+                current_price,
+            ),
+        )
+        .await;
+
         match close_result {
             Ok(Ok(_)) => {
                 info!("✅ 清仓操作完成");
@@ -7739,28 +8676,37 @@ async fn safe_shutdown(
             }
         }
     } else if grid_state.position_quantity > 0.0 {
-        warn!("⚠️ 退出时仍有持仓 {:.4}，根据配置未执行清仓", grid_state.position_quantity);
+        warn!(
+            "⚠️ 退出时仍有持仓 {:.4}，根据配置未执行清仓",
+            grid_state.position_quantity
+        );
     }
-    
+
     // 3. 保存性能数据和状态
     info!("💾 保存性能数据和状态...");
-    
+
     if let Err(e) = save_performance_data(grid_state, start_time, reason.clone()).await {
         warn!("⚠️ 保存性能数据失败: {:?}", e);
     }
-    
+
     // 4. 保存动态参数
-    if let Err(e) = grid_state.dynamic_params.save_to_file("dynamic_grid_params.json") {
+    if let Err(e) = grid_state
+        .dynamic_params
+        .save_to_file("dynamic_grid_params.json")
+    {
         warn!("⚠️ 保存动态参数失败: {:?}", e);
     }
-    
+
     // 5. 生成最终报告
     let final_report = generate_final_report(grid_state, current_price, start_time, reason.clone());
     info!("\n{}", final_report);
-    
+
     let shutdown_duration = shutdown_start.elapsed().unwrap_or_default();
-    info!("✅ 安全退出完成 - 耗时: {:.2}秒", shutdown_duration.as_secs_f64());
-    
+    info!(
+        "✅ 安全退出完成 - 耗时: {:.2}秒",
+        shutdown_duration.as_secs_f64()
+    );
+
     Ok(())
 }
 
@@ -7772,17 +8718,17 @@ async fn save_performance_data(
 ) -> Result<(), GridStrategyError> {
     let current_time = SystemTime::now();
     let trading_duration = current_time.duration_since(start_time).unwrap_or_default();
-    
+
     // 计算最终性能指标
     let final_metrics = calculate_performance_metrics(grid_state, &[]);
-    let final_total_value = grid_state.available_funds + 
-        grid_state.position_quantity * grid_state.position_avg_price;
+    let final_total_value =
+        grid_state.available_funds + grid_state.position_quantity * grid_state.position_avg_price;
     let final_roi = if grid_state.total_capital > 0.0 {
         (final_total_value / grid_state.total_capital - 1.0) * 100.0
     } else {
         0.0
     };
-    
+
     let snapshot = PerformanceSnapshot {
         timestamp: current_time.duration_since(UNIX_EPOCH).unwrap().as_secs(),
         total_capital: grid_state.total_capital,
@@ -7799,36 +8745,38 @@ async fn save_performance_data(
         trading_duration_hours: trading_duration.as_secs_f64() / 3600.0,
         final_roi,
     };
-    
+
     // 保存到文件
     let filename = format!(
         "performance_snapshot_{}.json",
         current_time.duration_since(UNIX_EPOCH).unwrap().as_secs()
     );
-    
+
     match serde_json::to_string_pretty(&snapshot) {
         Ok(json_data) => {
             match std::fs::write(&filename, json_data) {
                 Ok(_) => {
                     info!("💾 性能快照已保存到: {}", filename);
-                    
+
                     // 同时保存详细的交易历史
                     save_trading_history(grid_state, reason).await?;
                 }
                 Err(e) => {
                     return Err(GridStrategyError::ConfigError(format!(
-                        "保存性能快照失败: {:?}", e
+                        "保存性能快照失败: {:?}",
+                        e
                     )));
                 }
             }
         }
         Err(e) => {
             return Err(GridStrategyError::ConfigError(format!(
-                "序列化性能数据失败: {:?}", e
+                "序列化性能数据失败: {:?}",
+                e
             )));
         }
     }
-    
+
     Ok(())
 }
 
@@ -7840,13 +8788,13 @@ async fn save_trading_history(
     if grid_state.performance_history.is_empty() {
         return Ok(());
     }
-    
+
     let current_time = SystemTime::now();
     let filename = format!(
         "trading_history_{}.json",
         current_time.duration_since(UNIX_EPOCH).unwrap().as_secs()
     );
-    
+
     #[derive(serde::Serialize)]
     struct TradingHistoryExport {
         shutdown_reason: String,
@@ -7854,31 +8802,32 @@ async fn save_trading_history(
         total_trades: usize,
         trades: Vec<PerformanceRecord>,
     }
-    
+
     let export_data = TradingHistoryExport {
         shutdown_reason: reason.as_str().to_string(),
         export_time: current_time.duration_since(UNIX_EPOCH).unwrap().as_secs(),
         total_trades: grid_state.performance_history.len(),
         trades: grid_state.performance_history.clone(),
     };
-    
+
     match serde_json::to_string_pretty(&export_data) {
-        Ok(json_data) => {
-            match std::fs::write(&filename, json_data) {
-                Ok(_) => {
-                    info!("📊 交易历史已保存到: {} ({} 笔交易)", 
-                        filename, grid_state.performance_history.len());
-                }
-                Err(e) => {
-                    warn!("⚠️ 保存交易历史失败: {:?}", e);
-                }
+        Ok(json_data) => match std::fs::write(&filename, json_data) {
+            Ok(_) => {
+                info!(
+                    "📊 交易历史已保存到: {} ({} 笔交易)",
+                    filename,
+                    grid_state.performance_history.len()
+                );
             }
-        }
+            Err(e) => {
+                warn!("⚠️ 保存交易历史失败: {:?}", e);
+            }
+        },
         Err(e) => {
             warn!("⚠️ 序列化交易历史失败: {:?}", e);
         }
     }
-    
+
     Ok(())
 }
 
@@ -7892,16 +8841,16 @@ fn generate_final_report(
     let current_time = SystemTime::now();
     let trading_duration = current_time.duration_since(start_time).unwrap_or_default();
     let final_metrics = calculate_performance_metrics(grid_state, &[]);
-    
-    let final_total_value = grid_state.available_funds + 
-        grid_state.position_quantity * current_price;
+
+    let final_total_value =
+        grid_state.available_funds + grid_state.position_quantity * current_price;
     let total_return = final_total_value - grid_state.total_capital;
     let roi = if grid_state.total_capital > 0.0 {
         (final_total_value / grid_state.total_capital - 1.0) * 100.0
     } else {
         0.0
     };
-    
+
     let annualized_return = if trading_duration.as_secs() > 0 {
         let years = trading_duration.as_secs_f64() / (365.25 * 24.0 * 3600.0);
         if years > 0.0 {
@@ -7912,7 +8861,7 @@ fn generate_final_report(
     } else {
         0.0
     };
-    
+
     format!(
         "===== 网格交易策略最终报告 =====\n\
         退出原因: {}\n\
@@ -7960,7 +8909,10 @@ fn generate_final_report(
         \n\
         ==============================",
         reason.as_str(),
-        format!("{:?}", current_time.duration_since(UNIX_EPOCH).unwrap().as_secs()),
+        format!(
+            "{:?}",
+            current_time.duration_since(UNIX_EPOCH).unwrap().as_secs()
+        ),
         trading_duration.as_secs_f64() / 3600.0,
         grid_state.total_capital,
         final_total_value,
@@ -7986,7 +8938,11 @@ fn generate_final_report(
         final_metrics.largest_loss,
         final_metrics.max_drawdown * 100.0,
         grid_state.historical_volatility * 100.0,
-        if final_metrics.max_drawdown > 0.0 { roi / (final_metrics.max_drawdown * 100.0) } else { 0.0 },
+        if final_metrics.max_drawdown > 0.0 {
+            roi / (final_metrics.max_drawdown * 100.0)
+        } else {
+            0.0
+        },
         grid_state.dynamic_params.current_min_spacing * 100.0,
         grid_state.dynamic_params.current_max_spacing * 100.0,
         grid_state.dynamic_params.current_trade_amount,
@@ -7998,18 +8954,20 @@ fn generate_final_report(
 fn setup_signal_handler() -> (Arc<AtomicBool>, CancellationToken) {
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let cancellation_token = CancellationToken::new();
-    
+
     let flag_clone = shutdown_flag.clone();
     let token_clone = cancellation_token.clone();
-    
+
     tokio::spawn(async move {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{signal, SignalKind};
-            
-            let mut sigint = signal(SignalKind::interrupt()).expect("Failed to setup SIGINT handler");
-            let mut sigterm = signal(SignalKind::terminate()).expect("Failed to setup SIGTERM handler");
-            
+
+            let mut sigint =
+                signal(SignalKind::interrupt()).expect("Failed to setup SIGINT handler");
+            let mut sigterm =
+                signal(SignalKind::terminate()).expect("Failed to setup SIGTERM handler");
+
             tokio::select! {
                 _ = sigint.recv() => {
                     info!("🔔 接收到 SIGINT 信号，开始安全退出...");
@@ -8019,20 +8977,20 @@ fn setup_signal_handler() -> (Arc<AtomicBool>, CancellationToken) {
                 }
             }
         }
-        
+
         #[cfg(windows)]
         {
             use tokio::signal;
-            
+
             let mut ctrl_c = signal::ctrl_c().expect("Failed to setup Ctrl+C handler");
             ctrl_c.recv().await;
             info!("🔔 接收到 Ctrl+C 信号，开始安全退出...");
         }
-        
+
         flag_clone.store(true, Ordering::SeqCst);
         token_clone.cancel();
     });
-    
+
     (shutdown_flag, cancellation_token)
 }
 
@@ -8042,10 +9000,10 @@ fn setup_signal_handler() -> (Arc<AtomicBool>, CancellationToken) {
 fn save_grid_state(grid_state: &GridState, file_path: &str) -> Result<(), GridStrategyError> {
     let serialized = serde_json::to_string_pretty(grid_state)
         .map_err(|e| GridStrategyError::ConfigError(format!("序列化状态失败: {:?}", e)))?;
-    
+
     std::fs::write(file_path, serialized)
         .map_err(|e| GridStrategyError::ConfigError(format!("写入状态文件失败: {:?}", e)))?;
-    
+
     info!("✅ 网格状态已保存到: {}", file_path);
     Ok(())
 }
@@ -8054,9 +9012,10 @@ fn save_grid_state(grid_state: &GridState, file_path: &str) -> Result<(), GridSt
 fn load_grid_state(file_path: &str) -> Result<Option<GridState>, GridStrategyError> {
     match std::fs::read_to_string(file_path) {
         Ok(contents) => {
-            let grid_state = serde_json::from_str(&contents)
-                .map_err(|e| GridStrategyError::ConfigError(format!("解析状态文件失败: {:?}", e)))?;
-            
+            let grid_state = serde_json::from_str(&contents).map_err(|e| {
+                GridStrategyError::ConfigError(format!("解析状态文件失败: {:?}", e))
+            })?;
+
             info!("✅ 成功加载网格状态");
             Ok(Some(grid_state))
         }
@@ -8064,9 +9023,10 @@ fn load_grid_state(file_path: &str) -> Result<Option<GridState>, GridStrategyErr
             info!("📄 未找到状态文件，将使用默认设置");
             Ok(None)
         }
-        Err(e) => {
-            Err(GridStrategyError::ConfigError(format!("读取状态文件失败: {:?}", e)))
-        }
+        Err(e) => Err(GridStrategyError::ConfigError(format!(
+            "读取状态文件失败: {:?}",
+            e
+        ))),
     }
 }
 
@@ -8084,29 +9044,38 @@ fn save_orders_state(
         sell_orders: HashMap<u64, OrderInfo>,
         save_time: u64,
     }
-    
+
     let orders_state = OrdersState {
         active_orders: active_orders.to_vec(),
         buy_orders: buy_orders.clone(),
         sell_orders: sell_orders.clone(),
-        save_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+        save_time: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
     };
-    
+
     let serialized = serde_json::to_string_pretty(&orders_state)
         .map_err(|e| GridStrategyError::ConfigError(format!("序列化订单状态失败: {:?}", e)))?;
-    
+
     std::fs::write(file_path, serialized)
         .map_err(|e| GridStrategyError::ConfigError(format!("写入订单状态文件失败: {:?}", e)))?;
-    
-    info!("✅ 订单状态已保存到: {} (活跃订单: {}, 买单: {}, 卖单: {})", 
-        file_path, active_orders.len(), buy_orders.len(), sell_orders.len());
+
+    info!(
+        "✅ 订单状态已保存到: {} (活跃订单: {}, 买单: {}, 卖单: {})",
+        file_path,
+        active_orders.len(),
+        buy_orders.len(),
+        sell_orders.len()
+    );
     Ok(())
 }
 
 /// 从文件加载订单状态
 fn load_orders_state(
     file_path: &str,
-) -> Result<Option<(Vec<u64>, HashMap<u64, OrderInfo>, HashMap<u64, OrderInfo>)>, GridStrategyError> {
+) -> Result<Option<(Vec<u64>, HashMap<u64, OrderInfo>, HashMap<u64, OrderInfo>)>, GridStrategyError>
+{
     #[derive(serde::Deserialize)]
     struct OrdersState {
         active_orders: Vec<u64>,
@@ -8114,35 +9083,50 @@ fn load_orders_state(
         sell_orders: HashMap<u64, OrderInfo>,
         save_time: u64,
     }
-    
+
     match std::fs::read_to_string(file_path) {
         Ok(contents) => {
-            let orders_state: OrdersState = serde_json::from_str(&contents)
-                .map_err(|e| GridStrategyError::ConfigError(format!("解析订单状态文件失败: {:?}", e)))?;
-            
+            let orders_state: OrdersState = serde_json::from_str(&contents).map_err(|e| {
+                GridStrategyError::ConfigError(format!("解析订单状态文件失败: {:?}", e))
+            })?;
+
             // 检查状态文件的时效性（超过1小时的状态文件可能已过期）
-            let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let current_time = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
             let state_age = current_time - orders_state.save_time;
-            
-            if state_age > 3600 { // 1小时
-                warn!("⚠️ 订单状态文件已过期 ({:.1} 小时前)，将忽略", state_age as f64 / 3600.0);
+
+            if state_age > 3600 {
+                // 1小时
+                warn!(
+                    "⚠️ 订单状态文件已过期 ({:.1} 小时前)，将忽略",
+                    state_age as f64 / 3600.0
+                );
                 return Ok(None);
             }
-            
-            info!("✅ 成功加载订单状态 (活跃订单: {}, 买单: {}, 卖单: {})", 
-                orders_state.active_orders.len(), 
-                orders_state.buy_orders.len(), 
-                orders_state.sell_orders.len());
-            
-            Ok(Some((orders_state.active_orders, orders_state.buy_orders, orders_state.sell_orders)))
+
+            info!(
+                "✅ 成功加载订单状态 (活跃订单: {}, 买单: {}, 卖单: {})",
+                orders_state.active_orders.len(),
+                orders_state.buy_orders.len(),
+                orders_state.sell_orders.len()
+            );
+
+            Ok(Some((
+                orders_state.active_orders,
+                orders_state.buy_orders,
+                orders_state.sell_orders,
+            )))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             info!("📄 未找到订单状态文件，将使用空状态");
             Ok(None)
         }
-        Err(e) => {
-            Err(GridStrategyError::ConfigError(format!("读取订单状态文件失败: {:?}", e)))
-        }
+        Err(e) => Err(GridStrategyError::ConfigError(format!(
+            "读取订单状态文件失败: {:?}",
+            e
+        ))),
     }
 }
 
@@ -8156,23 +9140,30 @@ fn periodic_state_save(
     save_interval_seconds: u64,
 ) -> Result<(), GridStrategyError> {
     let now = SystemTime::now();
-    
+
     // 检查是否到了保存时间
-    if now.duration_since(*last_save_time).unwrap_or_default().as_secs() >= save_interval_seconds {
+    if now
+        .duration_since(*last_save_time)
+        .unwrap_or_default()
+        .as_secs()
+        >= save_interval_seconds
+    {
         // 保存网格状态
         if let Err(e) = save_grid_state(grid_state, "grid_state.json") {
             warn!("⚠️ 保存网格状态失败: {:?}", e);
         }
-        
+
         // 保存订单状态
-        if let Err(e) = save_orders_state(active_orders, buy_orders, sell_orders, "orders_state.json") {
+        if let Err(e) =
+            save_orders_state(active_orders, buy_orders, sell_orders, "orders_state.json")
+        {
             warn!("⚠️ 保存订单状态失败: {:?}", e);
         }
-        
+
         *last_save_time = now;
         info!("💾 定期状态保存完成");
     }
-    
+
     Ok(())
 }
 
@@ -8183,7 +9174,7 @@ fn validate_loaded_state(
 ) -> Result<bool, GridStrategyError> {
     let is_valid = true;
     let mut warnings = Vec::new();
-    
+
     // 检查总资金是否匹配
     if (grid_state.total_capital - grid_config.total_capital).abs() > 0.01 {
         warnings.push(format!(
@@ -8191,10 +9182,11 @@ fn validate_loaded_state(
             grid_state.total_capital, grid_config.total_capital
         ));
     }
-    
+
     // 检查动态参数是否在合理范围内
-    if grid_state.dynamic_params.current_min_spacing < grid_config.min_grid_spacing * 0.5 
-        || grid_state.dynamic_params.current_min_spacing > grid_config.max_grid_spacing {
+    if grid_state.dynamic_params.current_min_spacing < grid_config.min_grid_spacing * 0.5
+        || grid_state.dynamic_params.current_min_spacing > grid_config.max_grid_spacing
+    {
         warnings.push(format!(
             "最小网格间距超出范围: {:.4}% (配置范围: {:.4}%-{:.4}%)",
             grid_state.dynamic_params.current_min_spacing * 100.0,
@@ -8202,7 +9194,7 @@ fn validate_loaded_state(
             grid_config.max_grid_spacing * 100.0
         ));
     }
-    
+
     // 检查交易金额是否合理
     if grid_state.dynamic_params.current_trade_amount > grid_config.total_capital * 0.5 {
         warnings.push(format!(
@@ -8211,7 +9203,7 @@ fn validate_loaded_state(
             grid_state.dynamic_params.current_trade_amount / grid_config.total_capital * 100.0
         ));
     }
-    
+
     // 输出警告信息
     if !warnings.is_empty() {
         warn!("⚠️ 加载的状态存在以下问题:");
@@ -8220,14 +9212,17 @@ fn validate_loaded_state(
         }
         warn!("建议检查状态文件或重新开始");
     }
-    
+
     Ok(is_valid)
 }
 
 /// 创建状态备份
 fn backup_state_files() -> Result<(), GridStrategyError> {
-    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
     // 备份网格状态
     if std::path::Path::new("grid_state.json").exists() {
         let backup_name = format!("grid_state_backup_{}.json", timestamp);
@@ -8235,7 +9230,7 @@ fn backup_state_files() -> Result<(), GridStrategyError> {
             .map_err(|e| GridStrategyError::ConfigError(format!("备份网格状态失败: {:?}", e)))?;
         info!("📋 网格状态已备份到: {}", backup_name);
     }
-    
+
     // 备份订单状态
     if std::path::Path::new("orders_state.json").exists() {
         let backup_name = format!("orders_state_backup_{}.json", timestamp);
@@ -8243,7 +9238,7 @@ fn backup_state_files() -> Result<(), GridStrategyError> {
             .map_err(|e| GridStrategyError::ConfigError(format!("备份订单状态失败: {:?}", e)))?;
         info!("📋 订单状态已备份到: {}", backup_name);
     }
-    
+
     // 备份动态参数
     if std::path::Path::new("dynamic_grid_params.json").exists() {
         let backup_name = format!("dynamic_grid_params_backup_{}.json", timestamp);
@@ -8251,17 +9246,24 @@ fn backup_state_files() -> Result<(), GridStrategyError> {
             .map_err(|e| GridStrategyError::ConfigError(format!("备份动态参数失败: {:?}", e)))?;
         info!("📋 动态参数已备份到: {}", backup_name);
     }
-    
+
     Ok(())
 }
 
 /// 清理过期的备份文件
 fn cleanup_old_backups(max_backup_age_days: u64) -> Result<(), GridStrategyError> {
-    let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let current_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let max_age_seconds = max_backup_age_days * 24 * 60 * 60;
-    
-    let backup_patterns = ["grid_state_backup_", "orders_state_backup_", "dynamic_grid_params_backup_"];
-    
+
+    let backup_patterns = [
+        "grid_state_backup_",
+        "orders_state_backup_",
+        "dynamic_grid_params_backup_",
+    ];
+
     for pattern in &backup_patterns {
         if let Ok(entries) = std::fs::read_dir(".") {
             for entry in entries.flatten() {
@@ -8270,7 +9272,8 @@ fn cleanup_old_backups(max_backup_age_days: u64) -> Result<(), GridStrategyError
                         // 从文件名提取时间戳
                         if let Some(timestamp_str) = filename
                             .strip_prefix(pattern)
-                            .and_then(|s| s.strip_suffix(".json")) {
+                            .and_then(|s| s.strip_suffix(".json"))
+                        {
                             if let Ok(timestamp) = timestamp_str.parse::<u64>() {
                                 if current_time - timestamp > max_age_seconds {
                                     if let Err(e) = std::fs::remove_file(entry.path()) {
@@ -8286,7 +9289,7 @@ fn cleanup_old_backups(max_backup_age_days: u64) -> Result<(), GridStrategyError
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -8298,7 +9301,7 @@ fn analyze_grid_performance_and_suggest_optimization(
     if grid_state.performance_history.len() < 10 {
         return; // 数据不足，无法分析
     }
-    
+
     // 分析最近的表现
     let recent_records: Vec<&PerformanceRecord> = grid_state
         .performance_history
@@ -8306,45 +9309,50 @@ fn analyze_grid_performance_and_suggest_optimization(
         .rev()
         .take(20)
         .collect();
-    
+
     let recent_profit: f64 = recent_records.iter().map(|r| r.profit).sum();
-    let recent_win_rate = recent_records
-        .iter()
-        .filter(|r| r.profit > 0.0)
-        .count() as f64
+    let recent_win_rate = recent_records.iter().filter(|r| r.profit > 0.0).count() as f64
         / recent_records.len() as f64;
-    
+
     let avg_profit_per_trade = recent_profit / recent_records.len() as f64;
-    
+
     info!("📊 网格性能分析:");
     info!("   最近20笔交易利润: {:.2}", recent_profit);
     info!("   胜率: {:.1}%", recent_win_rate * 100.0);
     info!("   平均每笔利润: {:.2}", avg_profit_per_trade);
-    
+
     // 提供优化建议
     if recent_profit > 0.0 && recent_win_rate > 0.6 {
         info!("💡 优化建议: 表现良好，可考虑:");
-        info!("   - 适当增加网格间距({:.3}% -> {:.3}%)以获得更大利润", 
-            grid_config.min_grid_spacing * 100.0, 
-            (grid_config.min_grid_spacing * 1.05) * 100.0);
-        info!("   - 或增加单格交易金额({:.2} -> {:.2})扩大收益", 
-            grid_config.trade_amount, 
-            grid_config.trade_amount * 1.1);
+        info!(
+            "   - 适当增加网格间距({:.3}% -> {:.3}%)以获得更大利润",
+            grid_config.min_grid_spacing * 100.0,
+            (grid_config.min_grid_spacing * 1.05) * 100.0
+        );
+        info!(
+            "   - 或增加单格交易金额({:.2} -> {:.2})扩大收益",
+            grid_config.trade_amount,
+            grid_config.trade_amount * 1.1
+        );
     } else if recent_profit < 0.0 || recent_win_rate < 0.4 {
         info!("⚠️ 优化建议: 表现不佳，建议:");
-        info!("   - 减少网格间距({:.3}% -> {:.3}%)提高成交频率", 
-            grid_config.min_grid_spacing * 100.0, 
-            (grid_config.min_grid_spacing * 0.95) * 100.0);
-        info!("   - 降低单格交易金额({:.2} -> {:.2})减少风险", 
-            grid_config.trade_amount, 
-            grid_config.trade_amount * 0.9);
+        info!(
+            "   - 减少网格间距({:.3}% -> {:.3}%)提高成交频率",
+            grid_config.min_grid_spacing * 100.0,
+            (grid_config.min_grid_spacing * 0.95) * 100.0
+        );
+        info!(
+            "   - 降低单格交易金额({:.2} -> {:.2})减少风险",
+            grid_config.trade_amount,
+            grid_config.trade_amount * 0.9
+        );
         info!("   - 考虑调整止损参数以更好控制风险");
     } else {
         info!("📈 优化建议: 表现中等，可考虑:");
         info!("   - 根据市场波动率动态调整网格间距");
         info!("   - 优化资金分配策略");
     }
-    
+
     // 分析交易频率
     if recent_records.len() < 5 {
         info!("⚠️ 交易频率建议: 成交频率较低，可考虑:");
@@ -8356,6 +9364,3 @@ fn analyze_grid_performance_and_suggest_optimization(
         info!("   - 优化手续费成本");
     }
 }
-
-
-
