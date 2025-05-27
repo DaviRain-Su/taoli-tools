@@ -183,16 +183,19 @@ impl StopLossStatus {
     }
 
     /// 判断是否为正常状态
+    #[allow(dead_code)]
     fn is_normal(&self) -> bool {
         matches!(self, StopLossStatus::Normal)
     }
 
     /// 判断是否正在监控
+    #[allow(dead_code)]
     fn is_monitoring(&self) -> bool {
         matches!(self, StopLossStatus::Monitoring)
     }
 
     /// 判断是否已执行（部分或完全）
+    #[allow(dead_code)]
     fn is_executed(&self) -> bool {
         matches!(
             self,
@@ -232,6 +235,7 @@ enum ShutdownReason {
     StopLossTriggered,    // 止损触发
     MarginInsufficient,   // 保证金不足
     NetworkError,         // 网络错误
+    #[allow(dead_code)]
     ConfigurationError,   // 配置错误
     EmergencyShutdown,    // 紧急关闭
     NormalExit,          // 正常退出
@@ -639,6 +643,7 @@ struct MarketAnalysis {
     market_state: MarketState, // 市场状态
     liquidity_score: f64,   // 流动性评分 (0-100)
     price_stability: f64,   // 价格稳定性 (0-100)
+    #[allow(dead_code)]
     volume_anomaly: f64,    // 成交量异常度 (0-100)
 }
 
@@ -735,6 +740,7 @@ impl RiskEventType {
         }
     }
 
+    #[allow(dead_code)]
     fn as_english(&self) -> &'static str {
         match self {
             RiskEventType::MarginInsufficient => "Margin Insufficient",
@@ -765,10 +771,12 @@ impl RiskEventType {
         }
     }
 
+    #[allow(dead_code)]
     fn requires_immediate_action(&self) -> bool {
         self.severity_level() >= 4
     }
 
+    #[allow(dead_code)]
     fn should_pause_trading(&self) -> bool {
         matches!(
             self,
@@ -822,6 +830,7 @@ impl RiskEvent {
         self.severity >= 4
     }
 
+    #[allow(dead_code)]
     fn age_seconds(&self) -> u64 {
         SystemTime::now()
             .duration_since(self.timestamp)
@@ -832,6 +841,7 @@ impl RiskEvent {
 
 /// 风险检查结果
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct RiskCheckResult {
     overall_risk_level: u8,        // 1-5级风险等级
     should_pause_trading: bool,    // 是否应暂停交易
@@ -892,6 +902,7 @@ impl RiskCheckResult {
 
 /// 增强风险控制模块
 #[derive(Debug)]
+#[allow(dead_code)]
 struct RiskControlModule {
     grid_state: Arc<Mutex<GridState>>,
     grid_config: Arc<crate::config::GridConfig>,
@@ -953,7 +964,7 @@ impl RiskControlModule {
         let mut result = RiskCheckResult::new();
         
         // 获取当前状态
-        let (current_capital, position_quantity, realized_profit, max_drawdown) = {
+        let (current_capital, position_quantity, _realized_profit, max_drawdown) = {
             let state = self.grid_state.lock().unwrap();
             (
                 state.available_funds + state.position_quantity * current_price,
@@ -1526,6 +1537,7 @@ impl ConnectionQuality {
 }
 
 /// WebSocket 连接管理器
+#[allow(dead_code)]
 struct ConnectionManager {
     // 客户端引用（注意：这里我们不直接持有客户端，而是通过参数传递）
     last_heartbeat: Instant,
@@ -6302,6 +6314,7 @@ async fn process_order_batch(
 }
 
 // 重试失败的订单
+#[allow(dead_code)]
 async fn retry_failed_orders(
     exchange_client: &ExchangeClient,
     failed_orders: Vec<ClientOrderRequest>,
@@ -7406,7 +7419,7 @@ fn validate_loaded_state(
     grid_state: &GridState,
     grid_config: &crate::config::GridConfig,
 ) -> Result<bool, GridStrategyError> {
-    let mut is_valid = true;
+    let is_valid = true;
     let mut warnings = Vec::new();
     
     // 检查总资金是否匹配
