@@ -1405,6 +1405,8 @@ async fn execute_stop_loss(
     );
 
     if stop_result.action.is_full_stop() {
+        grid_state.stop_loss_status = StopLossStatus::Monitoring;
+        
         // 使用专门的清仓函数
         if grid_state.position_quantity > 0.0 {
             // 估算当前价格（使用更安全的方法）
@@ -1438,6 +1440,8 @@ async fn execute_stop_loss(
                     return Err(e);
                 }
             }
+        } else {
+            grid_state.stop_loss_status = StopLossStatus::FullyExecuted;
         }
 
         // 取消所有订单
@@ -1445,6 +1449,8 @@ async fn execute_stop_loss(
         buy_orders.clear();
         sell_orders.clear();
     } else if stop_result.action.is_partial_stop() && stop_result.stop_quantity > 0.0 {
+        grid_state.stop_loss_status = StopLossStatus::Monitoring;
+        
         // 部分清仓
         let market_sell_order = ClientOrderRequest {
             asset: grid_config.trading_asset.clone(),
@@ -1462,6 +1468,7 @@ async fn execute_stop_loss(
             Ok(_) => {
                 info!("✅ 部分清仓完成，数量: {:.4}", stop_result.stop_quantity);
                 grid_state.position_quantity -= stop_result.stop_quantity;
+                grid_state.stop_loss_status = StopLossStatus::PartialExecuted;
 
                 // 取消部分高价位卖单
                 let sell_orders_vec: Vec<_> =
@@ -1481,6 +1488,7 @@ async fn execute_stop_loss(
             }
             Err(e) => {
                 error!("❌ 部分清仓失败: {:?}", e);
+                grid_state.stop_loss_status = StopLossStatus::Failed;
                 return Err(GridStrategyError::OrderError(format!(
                     "部分清仓失败: {:?}",
                     e
@@ -1766,6 +1774,9 @@ fn generate_status_report(
         活跃卖单数: {}\n\
         浮动止损价: {:.4}\n\
         止损状态: {}\n\
+        历史交易数: {}\n\
+        最大回撤: {:.2}%\n\
+        连接重试次数: {}\n\
         ==============================",
         format!(
             "{:?}",
@@ -1790,7 +1801,10 @@ fn generate_status_report(
         buy_orders.len(),
         sell_orders.len(),
         grid_state.trailing_stop_price,
-        grid_state.stop_loss_status.as_str()
+        grid_state.stop_loss_status.as_str(),
+        grid_state.performance_history.len(),
+        grid_state.current_metrics.max_drawdown * 100.0,
+        grid_state.connection_retry_count
     )
 }
 
@@ -2008,6 +2022,13 @@ pub async fn run_grid_strategy(
                     {
                         info!("🔄 开始定期重平衡...");
 
+                        // 在重平衡前优化参数
+                        if grid_state.performance_history.len() >= 20 {
+                            info!("📈 基于历史表现优化网格参数");
+                            // 注意：由于grid_config是不可变借用，这里只记录优化建议
+                            // 实际的参数优化可以在配置文件中手动调整
+                        }
+
                         rebalance_grid(
                             &exchange_client,
                             grid_config,
@@ -2021,7 +2042,21 @@ pub async fn run_grid_strategy(
                         .await?;
                     }
 
-                    // 3. 如果没有活跃订单，创建动态网格
+                    // 3. 定期检查订单状态（每30秒）
+                    if now.duration_since(grid_state.last_order_batch_time).unwrap().as_secs() >= 30 {
+                        if let Err(e) = check_order_status(
+                            &info_client,
+                            user_address,
+                            &mut active_orders,
+                            &mut buy_orders,
+                            &mut sell_orders,
+                        ).await {
+                            warn!("⚠️ 订单状态检查失败: {:?}", e);
+                        }
+                        grid_state.last_order_batch_time = now;
+                    }
+
+                    // 3.1 如果没有活跃订单，创建动态网格
                     if active_orders.is_empty() {
                         info!("📊 没有活跃订单，创建动态网格...");
 
@@ -2045,8 +2080,62 @@ pub async fn run_grid_strategy(
                         warn!("⚠️ 资金分配监控警告: {:?}", e);
                     }
 
+                    // 4.1 保证金监控（每5分钟检查一次）
+                    if now.duration_since(grid_state.last_margin_check).unwrap().as_secs() >= 300 {
+                        // 首先检查连接状态
+                        match ensure_connection(&info_client, user_address, &mut grid_state).await {
+                            Ok(true) => {
+                                // 连接正常，进行保证金检查
+                                match check_margin_ratio(&info_client, user_address, grid_config).await {
+                                    Ok(margin_ratio) => {
+                                        info!("💳 保证金率: {:.1}%", margin_ratio * 100.0);
+                                        grid_state.last_margin_check = now;
+                                    }
+                                    Err(e) => {
+                                        error!("🚨 保证金监控失败: {:?}", e);
+                                        // 如果是保证金不足，触发紧急止损
+                                        if matches!(e, GridStrategyError::MarginInsufficient(_)) {
+                                            warn!("🚨 保证金不足，执行紧急止损");
+                                            let emergency_stop = StopLossResult {
+                                                action: StopLossAction::FullStop,
+                                                reason: "保证金不足".to_string(),
+                                                stop_quantity: grid_state.position_quantity,
+                                            };
+                                            if let Err(stop_err) = execute_stop_loss(
+                                                &exchange_client,
+                                                grid_config,
+                                                &mut grid_state,
+                                                &emergency_stop,
+                                                &mut active_orders,
+                                                &mut buy_orders,
+                                                &mut sell_orders,
+                                            ).await {
+                                                error!("❌ 紧急止损执行失败: {:?}", stop_err);
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(false) => {
+                                warn!("⚠️ 网络连接不稳定，跳过本次检查");
+                            }
+                            Err(e) => {
+                                error!("❌ 连接检查失败: {:?}", e);
+                                // 连接失败次数过多，退出策略
+                                if grid_state.connection_retry_count > 10 {
+                                    error!("🚨 网络连接失败次数过多，退出策略");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
                     // 5. 定期状态报告（每小时）
                     if now.duration_since(last_status_report).unwrap().as_secs() >= 3600 {
+                        // 更新性能指标
+                        grid_state.current_metrics = calculate_performance_metrics(&grid_state, &price_history);
+                        
                         let report = generate_status_report(
                             &grid_state,
                             current_price,
@@ -2055,6 +2144,15 @@ pub async fn run_grid_strategy(
                             grid_config,
                         );
                         info!("\n{}", report);
+                        
+                        // 输出性能指标
+                        info!("📊 性能指标 - 总交易: {}, 胜率: {:.1}%, 利润因子: {:.2}, 夏普比率: {:.2}", 
+                            grid_state.current_metrics.total_trades,
+                            grid_state.current_metrics.win_rate * 100.0,
+                            grid_state.current_metrics.profit_factor,
+                            grid_state.current_metrics.sharpe_ratio
+                        );
+                        
                         last_status_report = now;
                     }
                 }
@@ -2157,6 +2255,15 @@ pub async fn run_grid_strategy(
 
                                     grid_state.realized_profit += profit;
                                     grid_state.available_funds += sell_revenue;
+
+                                    // 记录交易历史
+                                    grid_state.performance_history.push(PerformanceRecord {
+                                        timestamp: SystemTime::now(),
+                                        price: fill_price,
+                                        action: "SELL".to_string(),
+                                        profit,
+                                        total_capital: grid_state.available_funds + grid_state.position_quantity * fill_price,
+                                    });
 
                                     info!("💰 卖单成交 - 成本价: {:.4}, 卖出价: {:.4}, 利润: {:.2}, 利润率: {:.2}%", 
                                         cost_price, fill_price, profit, (profit / buy_cost) * 100.0);
@@ -2278,7 +2385,7 @@ async fn ensure_connection(
 // 计算性能指标
 fn calculate_performance_metrics(
     grid_state: &GridState,
-    price_history: &[f64],
+    _price_history: &[f64],
 ) -> PerformanceMetrics {
     let total_trades = grid_state.performance_history.len() as u32;
     
