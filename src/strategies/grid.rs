@@ -19,25 +19,25 @@ use tokio_util::sync::CancellationToken;
 pub enum GridStrategyError {
     #[error("配置错误: {0}")]
     ConfigError(String),
-
+    
     #[error("钱包初始化失败: {0}")]
     WalletError(String),
-
+    
     #[error("客户端初始化失败: {0}")]
     ClientError(String),
-
+    
     #[error("订单操作失败: {0}")]
     OrderError(String),
-
+    
     #[error("订阅失败: {0}")]
     SubscriptionError(String),
-
+    
     #[error("价格解析失败: {0}")]
     PriceParseError(String),
-
+    
     #[error("数量解析失败: {0}")]
     QuantityParseError(String),
-
+    
     #[error("风险控制触发: {0}")]
     RiskControlTriggered(String),
 
@@ -3757,7 +3757,7 @@ fn format_price(price: f64, precision: u32) -> f64 {
 fn calculate_amplitude(klines: &[f64]) -> (f64, f64) {
     let mut positive_amplitudes = Vec::new();
     let mut negative_amplitudes = Vec::new();
-
+    
     for i in 0..klines.len() - 1 {
         let change = (klines[i + 1] - klines[i]) / klines[i];
         if change > 0.0 {
@@ -3766,19 +3766,19 @@ fn calculate_amplitude(klines: &[f64]) -> (f64, f64) {
             negative_amplitudes.push(change.abs());
         }
     }
-
+    
     let avg_positive = if !positive_amplitudes.is_empty() {
         positive_amplitudes.iter().sum::<f64>() / positive_amplitudes.len() as f64
     } else {
         0.0
     };
-
+    
     let avg_negative = if !negative_amplitudes.is_empty() {
         negative_amplitudes.iter().sum::<f64>() / negative_amplitudes.len() as f64
     } else {
         0.0
     };
-
+    
     (avg_positive, avg_negative)
 }
 
@@ -5343,7 +5343,7 @@ async fn close_all_positions(
             )));
         }
     }
-
+    
     if short_position > 0.0 {
         // 空头清仓：买入时考虑向上滑点
         let buy_price = current_price * (1.0 + grid_config.slippage_tolerance);
@@ -5371,7 +5371,7 @@ async fn close_all_positions(
             )));
         }
     }
-
+    
     Ok(())
 }
 
@@ -6341,6 +6341,15 @@ async fn adaptive_order_rebalance(
     let sell_deficit = if current_sell_count < target_sell_count {
         target_sell_count - current_sell_count
     } else { 0 };
+    
+    // 检查是否有足够持仓创建卖单
+    let available_position = grid_state.position_quantity * 0.8; // 保留20%作为缓冲
+    let has_existing_sell_orders = current_sell_count > 0;
+    // 如果已经有卖单存在，说明之前有持仓，可以继续创建卖单
+    let can_create_sell_orders = available_position > 0.0 || has_existing_sell_orders;
+    
+    info!("📊 持仓检查 - 当前持仓: {:.4}, 可用持仓: {:.4}, 现有卖单: {}, 可创建卖单: {}", 
+          grid_state.position_quantity, available_position, current_sell_count, can_create_sell_orders);
 
     // 确保不超过总订单限制
     let remaining_slots = grid_config.max_active_orders as usize - current_total;
@@ -6355,12 +6364,20 @@ async fn adaptive_order_rebalance(
         warn!("⚠️ 需要补充{}个订单，但只有{}个剩余槽位，按比例分配", 
               total_needed, remaining_slots);
         
-        // 按比例分配剩余槽位
-        let buy_ratio = buy_deficit as f64 / total_needed as f64;
-        let actual_buy_add = (remaining_slots as f64 * buy_ratio).round() as usize;
-        let actual_sell_add = remaining_slots - actual_buy_add;
+        // 智能分配：如果没有持仓，优先补充买单
+        let (actual_buy_add, actual_sell_add) = if !can_create_sell_orders {
+            // 没有持仓，全部分配给买单
+            info!("💡 没有持仓，优先补充买单");
+            (remaining_slots.min(buy_deficit), 0)
+        } else {
+            // 有持仓，按比例分配
+            let buy_ratio = buy_deficit as f64 / total_needed as f64;
+            let actual_buy_add = (remaining_slots as f64 * buy_ratio).round() as usize;
+            let actual_sell_add = remaining_slots - actual_buy_add;
+            (actual_buy_add, actual_sell_add)
+        };
         
-        info!("📊 按比例分配 - 补充买单: {}, 补充卖单: {}", actual_buy_add, actual_sell_add);
+        info!("📊 智能分配 - 补充买单: {}, 补充卖单: {}", actual_buy_add, actual_sell_add);
         
         // 补充买单
         if actual_buy_add > 0 {
@@ -6376,8 +6393,8 @@ async fn adaptive_order_rebalance(
             ).await?;
         }
         
-        // 补充卖单
-        if actual_sell_add > 0 {
+        // 补充卖单（只有在有持仓时才补充）
+        if actual_sell_add > 0 && can_create_sell_orders {
             supplement_sell_orders(
                 exchange_client,
                 grid_config,
@@ -6388,13 +6405,24 @@ async fn adaptive_order_rebalance(
                 sell_orders,
                 actual_sell_add,
             ).await?;
+        } else if actual_sell_add > 0 && !can_create_sell_orders {
+            info!("⚠️ 跳过卖单补充，因为没有足够持仓");
         }
     } else {
-        // 有足够的槽位，直接补充
-        info!("📊 有足够槽位 - 补充买单: {}, 补充卖单: {}", buy_deficit, sell_deficit);
+        // 有足够的槽位，智能补充
+        let effective_sell_deficit = if can_create_sell_orders { sell_deficit } else { 0 };
+        let effective_buy_deficit = if !can_create_sell_orders && sell_deficit > 0 {
+            // 如果无法创建卖单，将卖单缺口转为买单
+            buy_deficit + sell_deficit
+        } else {
+            buy_deficit
+        };
+        
+        info!("📊 智能补充 - 补充买单: {}, 补充卖单: {} (持仓限制)", 
+              effective_buy_deficit, effective_sell_deficit);
         
         // 补充买单
-        if buy_deficit > 0 {
+        if effective_buy_deficit > 0 {
             supplement_buy_orders(
                 exchange_client,
                 grid_config,
@@ -6403,12 +6431,12 @@ async fn adaptive_order_rebalance(
                 price_history,
                 active_orders,
                 buy_orders,
-                buy_deficit,
+                effective_buy_deficit,
             ).await?;
         }
         
-        // 补充卖单
-        if sell_deficit > 0 {
+        // 补充卖单（只有在有持仓时才补充）
+        if effective_sell_deficit > 0 {
             supplement_sell_orders(
                 exchange_client,
                 grid_config,
@@ -6417,7 +6445,7 @@ async fn adaptive_order_rebalance(
                 price_history,
                 active_orders,
                 sell_orders,
-                sell_deficit,
+                effective_sell_deficit,
             ).await?;
         }
     }
@@ -6555,16 +6583,29 @@ async fn supplement_sell_orders(
         
         // 检查是否有足够的持仓进行卖出
         let available_quantity = grid_state.position_quantity * 0.8; // 保留20%作为缓冲
-        if available_quantity <= 0.0 {
-            warn!("⚠️ 没有足够持仓创建卖单");
+        let has_existing_sell_orders = sell_orders.len() > 0;
+        
+        // 如果没有持仓但有现有卖单，说明之前有持仓，可以继续创建卖单
+        if available_quantity <= 0.0 && !has_existing_sell_orders {
+            warn!("⚠️ 没有足够持仓且无现有卖单，无法创建卖单");
             break;
         }
         
+        if available_quantity <= 0.0 && has_existing_sell_orders {
+            info!("💡 虽然当前持仓为0，但有现有卖单，继续创建卖单以保持网格平衡");
+        }
+        
         let trade_amount = grid_state.dynamic_params.current_trade_amount;
-        let quantity = format_price(
-            (trade_amount / sell_price).min(available_quantity / count as f64), 
-            grid_config.quantity_precision
-        );
+        let quantity = if available_quantity > 0.0 {
+            // 有持仓时，使用持仓限制
+            format_price(
+                (trade_amount / sell_price).min(available_quantity / count as f64), 
+                grid_config.quantity_precision
+            )
+        } else {
+            // 没有持仓但有现有卖单时，使用标准交易量
+            format_price(trade_amount / sell_price, grid_config.quantity_precision)
+        };
         let formatted_price = format_price(sell_price, grid_config.price_precision);
         
         let order = ClientOrderRequest {
@@ -7010,10 +7051,10 @@ pub async fn run_grid_strategy(
 
     // 验证配置参数
     validate_grid_config(grid_config)?;
-
+    
     // 从配置文件读取私钥
     let private_key = &app_config.account.private_key;
-
+    
     // 初始化钱包
     let wallet: LocalWallet = private_key
         .parse()
@@ -7029,7 +7070,7 @@ pub async fn run_grid_strategy(
     let mut info_client = InfoClient::new(None, Some(BaseUrl::Mainnet))
         .await
         .map_err(|e| GridStrategyError::ClientError(format!("信息客户端初始化失败: {:?}", e)))?;
-
+    
     let exchange_client = ExchangeClient::new(None, wallet, Some(BaseUrl::Mainnet), None, None)
         .await
         .map_err(|e| GridStrategyError::ClientError(format!("交易客户端初始化失败: {:?}", e)))?;
@@ -7042,7 +7083,7 @@ pub async fn run_grid_strategy(
         .map_err(|e| GridStrategyError::PriceParseError(format!("解析账户总价值失败: {:?}", e)))?;
     
     let grid_config = &app_config.grid;
-    
+
     info!("=== 交易参数 ===");
     info!("交易资产: {}", grid_config.trading_asset);
     info!("账户真实资金: {:.2} USDT (从账户地址读取)", real_total_capital);
@@ -7352,7 +7393,7 @@ pub async fn run_grid_strategy(
     let mut last_connection_report = Instant::now();
 
     let mut last_price: Option<f64> = None;
-
+    
     let mut last_daily_reset = SystemTime::now();
     let mut last_status_report = SystemTime::now();
     let mut last_state_save = SystemTime::now(); // 添加状态保存时间跟踪
@@ -7368,7 +7409,7 @@ pub async fn run_grid_strategy(
         .subscribe(Subscription::AllMids, sender.clone())
         .await
         .map_err(|e| GridStrategyError::SubscriptionError(format!("订阅价格失败: {:?}", e)))?;
-
+    
     info_client
         .subscribe(
             Subscription::UserEvents { user: user_address },
@@ -7422,7 +7463,7 @@ pub async fn run_grid_strategy(
                     let current_price: f64 = current_price.parse().map_err(|e| {
                         GridStrategyError::PriceParseError(format!("价格解析失败: {:?}", e))
                     })?;
-
+                    
                     // 获取实际账户信息
                     let account_info = get_account_info(&info_client, user_address).await?;
                     let usdc_balance = account_info.withdrawable.parse().unwrap_or(0.0);
@@ -7457,7 +7498,7 @@ pub async fn run_grid_strategy(
                     if price_history.len() > grid_config.history_length {
                         price_history.remove(0);
                     }
-
+                    
                     // 打印价格变化
                     if let Some(last) = last_price {
                         let price_change = ((current_price - last) / last) * 100.0;
@@ -8149,13 +8190,49 @@ pub async fn run_grid_strategy(
                     let ideal_buy_count = ideal_total_orders / 2;
                     let ideal_sell_count = ideal_total_orders / 2;
                     
+                    // 详细的调试信息
+                    if total_orders > 0 {
+                        info!("🔍 订单平衡检查 - 买单: {}, 卖单: {}, 总计: {}, 理想总数: {}, 配置限制: {}", 
+                              buy_count, sell_count, total_orders, ideal_total_orders, grid_config.max_active_orders);
+                        
+                        let balance_diff = (buy_count as i32 - sell_count as i32).abs();
+                        let is_quantity_low = buy_count + sell_count < ideal_total_orders / 2;
+                        let is_missing_orders = total_orders < ideal_total_orders;
+                        let is_below_grid_requirement = total_orders < grid_config.grid_count as usize * 2;
+                        
+                        info!("🔍 平衡分析 - 买卖差异: {}, 数量过少: {}, 缺少订单: {}, 低于网格要求: {}", 
+                              balance_diff, is_quantity_low, is_missing_orders, is_below_grid_requirement);
+                        
+                        // 详细分析每个触发条件
+                        if buy_count == 0 && sell_count > 0 {
+                            info!("🔍 触发条件1: 只有卖单，没有买单");
+                        }
+                        if sell_count == 0 && buy_count > 0 {
+                            info!("🔍 触发条件2: 只有买单，没有卖单");
+                        }
+                        if buy_count + sell_count < ideal_total_orders / 2 {
+                            info!("🔍 触发条件3: 订单数量过少 ({} < {})", buy_count + sell_count, ideal_total_orders / 2);
+                        }
+                        if balance_diff > 3 {
+                            info!("🔍 触发条件4: 买卖单数量严重不平衡 (差异: {})", balance_diff);
+                        }
+                        if total_orders < ideal_total_orders && total_orders > 0 {
+                            info!("🔍 触发条件5: 总订单数不足但不为空 ({} < {})", total_orders, ideal_total_orders);
+                        }
+                        if total_orders > 0 && total_orders < grid_config.grid_count as usize * 2 {
+                            info!("🔍 触发条件6: 订单数少于配置要求 ({} < {})", total_orders, grid_config.grid_count as usize * 2);
+                        }
+                    }
+                    
                     // 检查是否需要补全订单
                     let should_recreate_grid = active_orders.is_empty();
                     let should_rebalance_orders = !should_recreate_grid && (
                         (buy_count == 0 && sell_count > 0) ||  // 只有卖单，没有买单
                         (sell_count == 0 && buy_count > 0) ||  // 只有买单，没有卖单
                         (buy_count + sell_count < ideal_total_orders / 2) ||  // 订单数量过少
-                        ((buy_count as i32 - sell_count as i32).abs() > 3)  // 买卖单数量严重不平衡
+                        ((buy_count as i32 - sell_count as i32).abs() > 3) ||  // 买卖单数量严重不平衡
+                        (total_orders < ideal_total_orders && total_orders > 0) ||  // 总订单数不足但不为空
+                        (total_orders > 0 && total_orders < grid_config.grid_count as usize * 2)  // 订单数少于配置要求
                     );
                     
                     if should_recreate_grid {
@@ -8701,8 +8778,8 @@ async fn check_margin_ratio(
             return Err(GridStrategyError::ClientError(format!(
                 "获取账户信息失败: {:?}",
                 e
-            )));
-        }
+                        )));
+                    }
     };
 
     // 检查margin_summary字段是否存在
@@ -8753,8 +8830,8 @@ async fn check_margin_ratio(
         return Err(GridStrategyError::MarginInsufficient(format!(
             "保证金率异常: {:.2}%，可能存在账户数据问题",
             margin_ratio * 100.0
-        )));
-    }
+                        )));
+                    }
 
     // 检查保证金安全阈值
     if margin_ratio < grid_config.margin_safety_threshold {
@@ -8882,7 +8959,7 @@ async fn ensure_connection(
                 &error_type,
             );
 
-            info!(
+                            info!(
                 "⏱️ 等待 {}秒 后重试连接 (错误类型: {}, 基础延迟: {}s, 指数退避: {}s, 上限: {}s)",
                 wait_seconds, error_type, base_delay, backoff_seconds, max_backoff_used
             );
@@ -9222,8 +9299,8 @@ async fn create_orders_in_batches(
         // 检查总体超时
         if start_time.elapsed().unwrap_or_default() > max_total_time {
             warn!("⚠️ 批量订单创建总体超时，停止处理剩余订单");
-            break;
-        }
+                                break;
+                            }
 
         let mut current_batch = Vec::new();
 
@@ -9232,8 +9309,8 @@ async fn create_orders_in_batches(
             if let Some(order) = order_iter.next() {
                 current_batch.push(order);
             } else {
-                break;
-            }
+                                break;
+                            }
         }
 
         if current_batch.is_empty() {
@@ -9409,10 +9486,10 @@ impl OrderRequestInfo {
             reduce_only: self.reduce_only,
             limit_px: self.limit_px,
             sz: self.sz,
-            cloid: None,
-            order_type: ClientOrder::Limit(ClientLimit {
-                tif: "Gtc".to_string(),
-            }),
+                                cloid: None,
+                                order_type: ClientOrder::Limit(ClientLimit {
+                                    tif: "Gtc".to_string(),
+                                }),
         }
     }
 }
@@ -9439,7 +9516,7 @@ async fn process_order_batch(
 
         match order_result {
             Ok(Ok(ExchangeResponseStatus::Ok(response))) => {
-                if let Some(data) = response.data {
+                                    if let Some(data) = response.data {
                     let mut order_created = false;
                     for status in data.statuses {
                         if let ExchangeDataStatus::Resting(order_info) = status {
@@ -9479,7 +9556,7 @@ async fn process_order_batch(
         }
     }
 
-    info!(
+                            info!(
         "📊 批次处理完成 - 成功: {}, 失败: {}",
         successful_ids.len(),
         failed_order_infos.len()
@@ -9615,16 +9692,16 @@ async fn create_orders_individually(
     for (index, order_info) in order_infos.iter().enumerate() {
         // 创建订单请求
         let order_request = ClientOrderRequest {
-            asset: grid_config.trading_asset.clone(),
+                                asset: grid_config.trading_asset.clone(),
             is_buy: is_buy_order,
             reduce_only: false,
             limit_px: order_info.price,
             sz: order_info.quantity,
-            cloid: None,
-            order_type: ClientOrder::Limit(ClientLimit {
-                tif: "Gtc".to_string(),
-            }),
-        };
+                                cloid: None,
+                                order_type: ClientOrder::Limit(ClientLimit {
+                                    tif: "Gtc".to_string(),
+                                }),
+                            };
 
         // 单个订单超时控制
         let order_result = tokio::time::timeout(
@@ -9635,10 +9712,10 @@ async fn create_orders_individually(
 
         match order_result {
             Ok(Ok(ExchangeResponseStatus::Ok(response))) => {
-                if let Some(data) = response.data {
+                                    if let Some(data) = response.data {
                     for status in data.statuses {
                         if let ExchangeDataStatus::Resting(order) = status {
-                            active_orders.push(order.oid);
+                                                active_orders.push(order.oid);
                             orders_map.insert(order.oid, order_info.clone());
                             success_count += 1;
 
@@ -9684,7 +9761,7 @@ async fn create_orders_individually(
         }
     }
 
-    info!(
+                    info!(
         "🔄✅ 单个创建模式完成 - 成功: {}/{}",
         success_count,
         order_infos.len()
@@ -9706,7 +9783,7 @@ async fn check_order_status(
 
     // 如果订单数量过多，进行分批处理
     if active_orders.len() > max_orders_per_batch {
-        info!(
+                            info!(
             "📊 订单数量较多({}个)，启用分批处理模式",
             active_orders.len()
         );
@@ -9770,7 +9847,7 @@ async fn check_order_status(
             }
             info!("📋 订单{}已从活跃列表中移除（可能已成交或取消）", order_id);
             false
-        } else {
+                            } else {
             true
         }
     });
@@ -9940,7 +10017,7 @@ fn auto_optimize_grid_parameters(
     let win_rate_score = recent_win_rate * 30.0;
     let consistency_score = if avg_profit_per_trade > 0.0 {
         20.0
-    } else {
+                            } else {
         0.0
     };
     let performance_score = profit_score + win_rate_score + consistency_score;
@@ -10025,7 +10102,7 @@ fn auto_optimize_grid_parameters(
             "积极优化策略".to_string()
         } else if performance_score <= 30.0 {
             "保守优化策略".to_string()
-        } else {
+                            } else {
             "微调优化策略".to_string()
         };
 
@@ -10094,7 +10171,7 @@ fn auto_optimize_grid_parameters(
         }
 
         true
-    } else {
+                                    } else {
         // 即使没有优化，也检查是否需要回滚
         if let Some(checkpoint) = grid_state.dynamic_params.should_rollback(performance_score) {
             warn!("🔄 性能下降，执行参数回滚");
@@ -10181,7 +10258,7 @@ async fn safe_shutdown(
 
         let close_timeout = if reason.is_emergency() {
             Duration::from_secs(15)
-        } else {
+                            } else {
             Duration::from_secs(60)
         };
 
