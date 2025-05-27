@@ -83,16 +83,28 @@
 - 更新所有函数调用以传递价格历史数据
 - 支持基于历史数据的智能决策
 
-### 9. 类型安全改进 - MarketTrend 枚举
+### 9. 类型安全改进 - 枚举类型重构
 
-**问题**: 使用字符串表示市场趋势缺乏类型安全性
+**问题**: 使用字符串表示状态缺乏类型安全性
 
 **解决方案**:
+
+#### MarketTrend 枚举
 - 定义 `MarketTrend` 枚举类型：`Upward`、`Downward`、`Sideways`
 - 实现实用方法：`as_str()`、`as_english()`、`is_bullish()`、`is_bearish()`、`is_sideways()`
 - 更新所有趋势匹配逻辑使用枚举而非字符串
-- 提供编译时类型检查，避免拼写错误
-- 支持模式匹配的完整性检查
+
+#### StopLossAction 枚举
+- 定义 `StopLossAction` 枚举类型：`Normal`、`PartialStop`、`FullStop`
+- 实现实用方法：`as_str()`、`as_english()`、`requires_action()`、`is_full_stop()`、`is_partial_stop()`
+- 更新所有止损逻辑使用枚举而非字符串比较
+- 提供更清晰的止损状态判断方法
+
+**优势**:
+- 编译时类型检查，避免拼写错误
+- 模式匹配的完整性检查
+- 更好的代码可读性和维护性
+- 性能提升（枚举比较比字符串比较更快）
 
 ## 技术实现细节
 
@@ -140,6 +152,24 @@ let amplitude_adjustment = if price_history.len() >= 10 {
 };
 ```
 
+### 类型安全的止损逻辑
+
+```rust
+// 止损检查和执行（使用类型安全的枚举）
+let stop_result = check_stop_loss(&mut grid_state, current_price, grid_config, &price_history);
+
+if stop_result.action.requires_action() {
+    warn!("🚨 触发止损: {}, 原因: {}", stop_result.action.as_str(), stop_result.reason);
+    
+    execute_stop_loss(/* ... */).await?;
+    
+    if stop_result.action.is_full_stop() {
+        error!("🛑 策略已全部止损，退出");
+        break;
+    }
+}
+```
+
 ## 性能和稳定性改进
 
 ### 1. 内存管理
@@ -172,6 +202,7 @@ let amplitude_adjustment = if price_history.len() >= 10 {
 6. ✅ 资金分配监控正常工作
 7. ✅ 函数参数传递正确
 8. ✅ MarketTrend 枚举类型安全实现
+9. ✅ StopLossAction 枚举类型安全实现
 
 ### 待测试的功能
 - 实际交易环境中的策略表现

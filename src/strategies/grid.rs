@@ -137,10 +137,52 @@ struct DynamicFundAllocation {
     position_ratio: f64,
 }
 
+// 止损动作枚举
+#[derive(Debug, Clone, PartialEq)]
+enum StopLossAction {
+    Normal,        // 正常
+    PartialStop,   // 部分止损
+    FullStop,      // 已止损
+}
+
+impl StopLossAction {
+    fn as_str(&self) -> &'static str {
+        match self {
+            StopLossAction::Normal => "正常",
+            StopLossAction::PartialStop => "部分止损",
+            StopLossAction::FullStop => "已止损",
+        }
+    }
+    
+    /// 获取英文名称
+    fn as_english(&self) -> &'static str {
+        match self {
+            StopLossAction::Normal => "Normal",
+            StopLossAction::PartialStop => "Partial Stop",
+            StopLossAction::FullStop => "Full Stop",
+        }
+    }
+    
+    /// 判断是否需要执行止损
+    fn requires_action(&self) -> bool {
+        !matches!(self, StopLossAction::Normal)
+    }
+    
+    /// 判断是否为完全止损
+    fn is_full_stop(&self) -> bool {
+        matches!(self, StopLossAction::FullStop)
+    }
+    
+    /// 判断是否为部分止损
+    fn is_partial_stop(&self) -> bool {
+        matches!(self, StopLossAction::PartialStop)
+    }
+}
+
 // 止损检查结果
 #[derive(Debug, Clone)]
 struct StopLossResult {
-    action: String, // "正常", "部分止损", "已止损"
+    action: StopLossAction,
     reason: String,
     stop_quantity: f64,
 }
@@ -346,7 +388,7 @@ fn check_stop_loss(
             current_total_value, total_stop_threshold);
         
         return StopLossResult {
-            action: "已止损".to_string(),
+            action: StopLossAction::FullStop,
             reason: "总资产亏损超过15%".to_string(),
             stop_quantity: grid_state.position_quantity,
         };
@@ -378,7 +420,7 @@ fn check_stop_loss(
             grid_state.trailing_stop_price = current_price * 0.9;
             
             return StopLossResult {
-                action: "部分止损".to_string(),
+                action: StopLossAction::PartialStop,
                 reason: "触发浮动止损".to_string(),
                 stop_quantity,
             };
@@ -396,7 +438,7 @@ fn check_stop_loss(
             let stop_quantity = grid_state.position_quantity * 0.3; // 止损30%持仓
             
             return StopLossResult {
-                action: "部分止损".to_string(),
+                action: StopLossAction::PartialStop,
                 reason: "单笔持仓亏损超过10%".to_string(),
                 stop_quantity,
             };
@@ -416,7 +458,7 @@ fn check_stop_loss(
             let stop_quantity = grid_state.position_quantity * stop_ratio;
             
             return StopLossResult {
-                action: "部分止损".to_string(),
+                action: StopLossAction::PartialStop,
                 reason: format!("加速下跌{}%", short_term_change.abs() * 100.0),
                 stop_quantity,
             };
@@ -424,7 +466,7 @@ fn check_stop_loss(
     }
     
     StopLossResult {
-        action: "正常".to_string(),
+        action: StopLossAction::Normal,
         reason: "".to_string(),
         stop_quantity: 0.0,
     }
@@ -1040,9 +1082,9 @@ async fn execute_stop_loss(
     sell_orders: &mut HashMap<u64, OrderInfo>,
 ) -> Result<(), GridStrategyError> {
     info!("🚨 执行止损操作: {}, 原因: {}, 止损数量: {:.4}", 
-        stop_result.action, stop_result.reason, stop_result.stop_quantity);
+        stop_result.action.as_str(), stop_result.reason, stop_result.stop_quantity);
     
-    if stop_result.action == "已止损" {
+    if stop_result.action.is_full_stop() {
         // 使用专门的清仓函数
         if grid_state.position_quantity > 0.0 {
             // 估算当前价格（使用更安全的方法）
@@ -1080,7 +1122,7 @@ async fn execute_stop_loss(
         buy_orders.clear();
         sell_orders.clear();
         
-    } else if stop_result.action == "部分止损" && stop_result.stop_quantity > 0.0 {
+    } else if stop_result.action.is_partial_stop() && stop_result.stop_quantity > 0.0 {
         // 部分清仓
         let market_sell_order = ClientOrderRequest {
             asset: grid_config.trading_asset.clone(),
@@ -1532,8 +1574,8 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                     // 1. 止损检查
                     let stop_result = check_stop_loss(&mut grid_state, current_price, grid_config, &price_history);
                     
-                    if stop_result.action != "正常" {
-                        warn!("🚨 触发止损: {}, 原因: {}", stop_result.action, stop_result.reason);
+                    if stop_result.action.requires_action() {
+                        warn!("🚨 触发止损: {}, 原因: {}", stop_result.action.as_str(), stop_result.reason);
                         
                         execute_stop_loss(
                             &exchange_client,
@@ -1545,7 +1587,7 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                             &mut sell_orders,
                         ).await?;
                         
-                        if stop_result.action == "已止损" {
+                        if stop_result.action.is_full_stop() {
                             error!("🛑 策略已全部止损，退出");
                             break;
                         }
