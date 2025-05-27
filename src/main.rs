@@ -42,28 +42,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Spot => {
             let config = app_config.unwrap();
-            println!("执行现货套利: 交易所1={}, 交易所2={}, 交易对={}", 
-                config.spot.exchange1, 
-                config.spot.exchange2, 
-                config.spot.symbol
+            println!(
+                "执行现货套利: 交易所1={}, 交易所2={}, 交易对={}",
+                config.spot.exchange1, config.spot.exchange2, config.spot.symbol
             );
             // TODO: 实现现货套利逻辑
         }
         Commands::Futures => {
             let config = app_config.unwrap();
-            println!("执行期现套利: 现货交易所={}, 期货交易所={}, 交易对={}", 
-                config.futures.spot_exchange, 
-                config.futures.futures_exchange, 
+            println!(
+                "执行期现套利: 现货交易所={}, 期货交易所={}, 交易对={}",
+                config.futures.spot_exchange,
+                config.futures.futures_exchange,
                 config.futures.symbol
             );
             // TODO: 实现期现套利逻辑
         }
         Commands::Triangle => {
             let config = app_config.unwrap();
-            println!("执行三角套利: 交易所={}, 交易对1={}, 交易对2={}, 交易对3={}", 
-                config.triangle.exchange, 
-                config.triangle.pair1, 
-                config.triangle.pair2, 
+            println!(
+                "执行三角套利: 交易所={}, 交易对1={}, 交易对2={}, 交易对3={}",
+                config.triangle.exchange,
+                config.triangle.pair1,
+                config.triangle.pair2,
                 config.triangle.pair3
             );
             // TODO: 实现三角套利逻辑
