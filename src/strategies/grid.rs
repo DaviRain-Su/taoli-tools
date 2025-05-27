@@ -7,7 +7,7 @@ use log::{error, info, warn};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::time::sleep;
@@ -1243,6 +1243,829 @@ impl RiskControlModule {
             self.last_margin_ratio * 100.0,
             self.risk_metrics_history.len()
         )
+    }
+}
+
+// ============================================================================
+// WebSocket 连接管理模块
+// ============================================================================
+
+/// 连接状态枚举
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+enum ConnectionStatus {
+    Connected,       // 已连接
+    Disconnected,    // 已断开
+    Connecting,      // 连接中
+    Reconnecting,    // 重连中
+    Failed,          // 连接失败
+    Unstable,        // 连接不稳定
+}
+
+impl ConnectionStatus {
+    /// 获取中文描述
+    fn as_str(&self) -> &'static str {
+        match self {
+            ConnectionStatus::Connected => "已连接",
+            ConnectionStatus::Disconnected => "已断开",
+            ConnectionStatus::Connecting => "连接中",
+            ConnectionStatus::Reconnecting => "重连中",
+            ConnectionStatus::Failed => "连接失败",
+            ConnectionStatus::Unstable => "连接不稳定",
+        }
+    }
+
+    /// 获取英文描述
+    fn as_english(&self) -> &'static str {
+        match self {
+            ConnectionStatus::Connected => "Connected",
+            ConnectionStatus::Disconnected => "Disconnected",
+            ConnectionStatus::Connecting => "Connecting",
+            ConnectionStatus::Reconnecting => "Reconnecting",
+            ConnectionStatus::Failed => "Failed",
+            ConnectionStatus::Unstable => "Unstable",
+        }
+    }
+
+    /// 判断是否为健康状态
+    fn is_healthy(&self) -> bool {
+        matches!(self, ConnectionStatus::Connected)
+    }
+
+    /// 判断是否需要重连
+    fn needs_reconnect(&self) -> bool {
+        matches!(
+            self,
+            ConnectionStatus::Disconnected | ConnectionStatus::Failed | ConnectionStatus::Unstable
+        )
+    }
+
+    /// 判断是否正在连接
+    fn is_connecting(&self) -> bool {
+        matches!(
+            self,
+            ConnectionStatus::Connecting | ConnectionStatus::Reconnecting
+        )
+    }
+}
+
+/// 连接事件类型
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+enum ConnectionEventType {
+    Connected,           // 连接成功
+    Disconnected,        // 连接断开
+    ReconnectAttempt,    // 重连尝试
+    ReconnectSuccess,    // 重连成功
+    ReconnectFailed,     // 重连失败
+    HeartbeatTimeout,    // 心跳超时
+    DataReceived,        // 数据接收
+    ErrorOccurred,       // 错误发生
+    QualityDegraded,     // 连接质量下降
+    QualityImproved,     // 连接质量改善
+}
+
+impl ConnectionEventType {
+    /// 获取中文描述
+    fn as_str(&self) -> &'static str {
+        match self {
+            ConnectionEventType::Connected => "连接成功",
+            ConnectionEventType::Disconnected => "连接断开",
+            ConnectionEventType::ReconnectAttempt => "重连尝试",
+            ConnectionEventType::ReconnectSuccess => "重连成功",
+            ConnectionEventType::ReconnectFailed => "重连失败",
+            ConnectionEventType::HeartbeatTimeout => "心跳超时",
+            ConnectionEventType::DataReceived => "数据接收",
+            ConnectionEventType::ErrorOccurred => "错误发生",
+            ConnectionEventType::QualityDegraded => "连接质量下降",
+            ConnectionEventType::QualityImproved => "连接质量改善",
+        }
+    }
+
+    /// 获取英文描述
+    fn as_english(&self) -> &'static str {
+        match self {
+            ConnectionEventType::Connected => "Connected",
+            ConnectionEventType::Disconnected => "Disconnected",
+            ConnectionEventType::ReconnectAttempt => "Reconnect Attempt",
+            ConnectionEventType::ReconnectSuccess => "Reconnect Success",
+            ConnectionEventType::ReconnectFailed => "Reconnect Failed",
+            ConnectionEventType::HeartbeatTimeout => "Heartbeat Timeout",
+            ConnectionEventType::DataReceived => "Data Received",
+            ConnectionEventType::ErrorOccurred => "Error Occurred",
+            ConnectionEventType::QualityDegraded => "Quality Degraded",
+            ConnectionEventType::QualityImproved => "Quality Improved",
+        }
+    }
+
+    /// 获取严重程度 (1-5)
+    fn severity_level(&self) -> u8 {
+        match self {
+            ConnectionEventType::Connected => 1,
+            ConnectionEventType::ReconnectSuccess => 1,
+            ConnectionEventType::QualityImproved => 1,
+            ConnectionEventType::DataReceived => 1,
+            ConnectionEventType::ReconnectAttempt => 2,
+            ConnectionEventType::QualityDegraded => 3,
+            ConnectionEventType::HeartbeatTimeout => 4,
+            ConnectionEventType::Disconnected => 4,
+            ConnectionEventType::ReconnectFailed => 4,
+            ConnectionEventType::ErrorOccurred => 5,
+        }
+    }
+
+    /// 判断是否为错误事件
+    fn is_error(&self) -> bool {
+        matches!(
+            self,
+            ConnectionEventType::Disconnected
+                | ConnectionEventType::ReconnectFailed
+                | ConnectionEventType::HeartbeatTimeout
+                | ConnectionEventType::ErrorOccurred
+        )
+    }
+}
+
+/// 连接事件记录
+#[derive(Debug, Clone)]
+struct ConnectionEvent {
+    event_type: ConnectionEventType,
+    timestamp: Instant,
+    description: String,
+    error_message: Option<String>,
+    latency_ms: Option<u64>,
+    retry_count: u32,
+}
+
+impl ConnectionEvent {
+    /// 创建新的连接事件
+    fn new(event_type: ConnectionEventType, description: String) -> Self {
+        Self {
+            event_type,
+            timestamp: Instant::now(),
+            description,
+            error_message: None,
+            latency_ms: None,
+            retry_count: 0,
+        }
+    }
+
+    /// 创建带错误信息的事件
+    fn with_error(event_type: ConnectionEventType, description: String, error: String) -> Self {
+        Self {
+            event_type,
+            timestamp: Instant::now(),
+            description,
+            error_message: Some(error),
+            latency_ms: None,
+            retry_count: 0,
+        }
+    }
+
+    /// 创建带延迟信息的事件
+    fn with_latency(event_type: ConnectionEventType, description: String, latency_ms: u64) -> Self {
+        Self {
+            event_type,
+            timestamp: Instant::now(),
+            description,
+            error_message: None,
+            latency_ms: Some(latency_ms),
+            retry_count: 0,
+        }
+    }
+
+    /// 设置重试次数
+    fn with_retry_count(mut self, retry_count: u32) -> Self {
+        self.retry_count = retry_count;
+        self
+    }
+
+    /// 获取事件年龄（秒）
+    fn age_seconds(&self) -> u64 {
+        self.timestamp.elapsed().as_secs()
+    }
+
+    /// 判断是否为最近事件（5分钟内）
+    fn is_recent(&self) -> bool {
+        self.age_seconds() < 300
+    }
+}
+
+/// 连接质量指标
+#[derive(Debug, Clone)]
+struct ConnectionQuality {
+    average_latency_ms: f64,      // 平均延迟
+    packet_loss_rate: f64,        // 丢包率 (0-1)
+    connection_stability: f64,    // 连接稳定性 (0-100)
+    data_throughput: f64,         // 数据吞吐量
+    error_rate: f64,              // 错误率 (0-1)
+    uptime_percentage: f64,       // 在线时间百分比 (0-100)
+}
+
+impl ConnectionQuality {
+    /// 创建默认连接质量
+    fn new() -> Self {
+        Self {
+            average_latency_ms: 0.0,
+            packet_loss_rate: 0.0,
+            connection_stability: 100.0,
+            data_throughput: 0.0,
+            error_rate: 0.0,
+            uptime_percentage: 100.0,
+        }
+    }
+
+    /// 更新延迟指标
+    fn update_latency(&mut self, latency_ms: u64) {
+        // 使用指数移动平均
+        let alpha = 0.1;
+        self.average_latency_ms = alpha * latency_ms as f64 + (1.0 - alpha) * self.average_latency_ms;
+    }
+
+    /// 记录错误
+    fn record_error(&mut self) {
+        let alpha = 0.1;
+        self.error_rate = alpha * 1.0 + (1.0 - alpha) * self.error_rate;
+        self.connection_stability = (self.connection_stability * 0.95).max(0.0);
+    }
+
+    /// 记录成功
+    fn record_success(&mut self) {
+        let alpha = 0.05;
+        self.error_rate = (1.0 - alpha) * self.error_rate;
+        self.connection_stability = (self.connection_stability * 1.01).min(100.0);
+    }
+
+    /// 获取总体质量评分 (0-100)
+    fn overall_score(&self) -> f64 {
+        let latency_score = if self.average_latency_ms < 50.0 {
+            100.0
+        } else if self.average_latency_ms < 100.0 {
+            80.0
+        } else if self.average_latency_ms < 200.0 {
+            60.0
+        } else if self.average_latency_ms < 500.0 {
+            40.0
+        } else {
+            20.0
+        };
+
+        let error_score = (1.0 - self.error_rate) * 100.0;
+        let stability_score = self.connection_stability;
+
+        (latency_score * 0.3 + error_score * 0.4 + stability_score * 0.3).min(100.0).max(0.0)
+    }
+
+    /// 判断连接质量是否良好
+    fn is_good(&self) -> bool {
+        self.overall_score() >= 70.0
+    }
+
+    /// 判断连接质量是否较差
+    fn is_poor(&self) -> bool {
+        self.overall_score() < 40.0
+    }
+}
+
+/// WebSocket 连接管理器
+struct ConnectionManager {
+    // 客户端引用（注意：这里我们不直接持有客户端，而是通过参数传递）
+    last_heartbeat: Instant,
+    last_data_received: Instant,
+    reconnect_count: u32,
+    status: ConnectionStatus,
+    
+    // 连接配置
+    heartbeat_interval: Duration,
+    heartbeat_timeout: Duration,
+    max_reconnect_attempts: u32,
+    reconnect_base_delay: Duration,
+    max_reconnect_delay: Duration,
+    
+    // 连接质量监控
+    quality: ConnectionQuality,
+    events: Vec<ConnectionEvent>,
+    max_events: usize,
+    
+    // 统计信息
+    total_connections: u32,
+    total_disconnections: u32,
+    total_reconnect_attempts: u32,
+    successful_reconnects: u32,
+    connection_start_time: Instant,
+    total_downtime: Duration,
+    last_disconnect_time: Option<Instant>,
+    
+    // 自适应参数
+    adaptive_heartbeat: bool,
+    dynamic_timeout: bool,
+    connection_degraded: bool,
+}
+
+impl ConnectionManager {
+    /// 创建新的连接管理器
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            last_heartbeat: now,
+            last_data_received: now,
+            reconnect_count: 0,
+            status: ConnectionStatus::Disconnected,
+            
+            // 默认配置
+            heartbeat_interval: Duration::from_secs(30),
+            heartbeat_timeout: Duration::from_secs(60),
+            max_reconnect_attempts: 10,
+            reconnect_base_delay: Duration::from_secs(1),
+            max_reconnect_delay: Duration::from_secs(60),
+            
+            quality: ConnectionQuality::new(),
+            events: Vec::new(),
+            max_events: 100,
+            
+            total_connections: 0,
+            total_disconnections: 0,
+            total_reconnect_attempts: 0,
+            successful_reconnects: 0,
+            connection_start_time: now,
+            total_downtime: Duration::ZERO,
+            last_disconnect_time: None,
+            
+            adaptive_heartbeat: true,
+            dynamic_timeout: true,
+            connection_degraded: false,
+        }
+    }
+
+    /// 检查连接状态
+    async fn check_connection(
+        &mut self,
+        info_client: &InfoClient,
+        user_address: ethers::types::Address,
+    ) -> Result<bool, GridStrategyError> {
+        let check_start = Instant::now();
+        
+        // 1. 检查心跳超时
+        if self.last_heartbeat.elapsed() > self.heartbeat_timeout {
+            self.record_event(ConnectionEvent::new(
+                ConnectionEventType::HeartbeatTimeout,
+                format!("心跳超时: {}秒", self.last_heartbeat.elapsed().as_secs()),
+            ));
+            
+            self.status = ConnectionStatus::Unstable;
+            self.quality.record_error();
+            
+            // 尝试重连
+            return self.attempt_reconnect(info_client, user_address).await;
+        }
+        
+        // 2. 检查数据接收超时
+        if self.last_data_received.elapsed() > self.heartbeat_timeout * 2 {
+            self.record_event(ConnectionEvent::new(
+                ConnectionEventType::QualityDegraded,
+                format!("数据接收超时: {}秒", self.last_data_received.elapsed().as_secs()),
+            ));
+            
+            self.connection_degraded = true;
+            self.quality.record_error();
+        }
+        
+        // 3. 执行实际连接测试
+        match self.test_connection(info_client, user_address).await {
+            Ok(latency_ms) => {
+                let check_duration = check_start.elapsed();
+                
+                // 更新连接状态
+                if self.status != ConnectionStatus::Connected {
+                    self.on_connection_established();
+                }
+                
+                // 更新质量指标
+                self.quality.update_latency(latency_ms);
+                self.quality.record_success();
+                
+                // 记录数据接收
+                self.last_data_received = Instant::now();
+                self.last_heartbeat = Instant::now();
+                
+                // 记录事件
+                self.record_event(ConnectionEvent::with_latency(
+                    ConnectionEventType::DataReceived,
+                    format!("连接检查成功，延迟: {}ms", latency_ms),
+                    latency_ms,
+                ));
+                
+                // 自适应调整
+                if self.adaptive_heartbeat {
+                    self.adjust_heartbeat_interval(latency_ms);
+                }
+                
+                // 重置连接降级标志
+                if self.connection_degraded && self.quality.is_good() {
+                    self.connection_degraded = false;
+                    self.record_event(ConnectionEvent::new(
+                        ConnectionEventType::QualityImproved,
+                        "连接质量已恢复".to_string(),
+                    ));
+                }
+                
+                info!(
+                    "连接检查成功 - 状态: {}, 延迟: {}ms, 质量评分: {:.1}, 检查耗时: {}ms",
+                    self.status.as_str(),
+                    latency_ms,
+                    self.quality.overall_score(),
+                    check_duration.as_millis()
+                );
+                
+                Ok(true)
+            }
+            Err(e) => {
+                // 连接失败
+                self.on_connection_lost(&e);
+                
+                // 尝试重连
+                self.attempt_reconnect(info_client, user_address).await
+            }
+        }
+    }
+
+    /// 尝试重连
+    async fn attempt_reconnect(
+        &mut self,
+        info_client: &InfoClient,
+        user_address: ethers::types::Address,
+    ) -> Result<bool, GridStrategyError> {
+        while self.reconnect_count < self.max_reconnect_attempts {
+            self.reconnect_count += 1;
+            self.total_reconnect_attempts += 1;
+            self.status = ConnectionStatus::Reconnecting;
+            
+            // 计算重连延迟（指数退避）
+            let delay = self.calculate_reconnect_delay();
+            
+            self.record_event(
+                ConnectionEvent::new(
+                    ConnectionEventType::ReconnectAttempt,
+                    format!("开始第{}次重连尝试，延迟{}秒", self.reconnect_count, delay.as_secs()),
+                ).with_retry_count(self.reconnect_count)
+            );
+            
+            info!(
+                "开始重连尝试 - 第{}/{}次，延迟: {}秒",
+                self.reconnect_count,
+                self.max_reconnect_attempts,
+                delay.as_secs()
+            );
+            
+            // 等待重连延迟
+            sleep(delay).await;
+            
+            // 执行重连
+            match self.reconnect(info_client, user_address).await {
+                Ok(()) => {
+                    self.on_reconnect_success();
+                    return Ok(true);
+                }
+                Err(e) => {
+                    self.record_event(ConnectionEvent::with_error(
+                        ConnectionEventType::ReconnectFailed,
+                        format!("第{}次重连失败", self.reconnect_count),
+                        e.to_string(),
+                    ));
+                    
+                    warn!(
+                        "重连失败 - 第{}/{}次: {}",
+                        self.reconnect_count, self.max_reconnect_attempts, e
+                    );
+                    
+                    // 继续下一次重连尝试
+                }
+            }
+        }
+        
+        // 达到最大重试次数
+        self.status = ConnectionStatus::Failed;
+        self.record_event(
+            ConnectionEvent::new(
+                ConnectionEventType::ReconnectFailed,
+                format!("重连失败，已达到最大重试次数: {}", self.max_reconnect_attempts),
+            ).with_retry_count(self.reconnect_count)
+        );
+        
+        error!(
+            "连接重连失败 - 已达到最大重试次数: {}, 总重连尝试: {}",
+            self.max_reconnect_attempts, self.total_reconnect_attempts
+        );
+        
+        Err(GridStrategyError::NetworkError(
+            format!("连接重连失败，已达到最大重试次数: {}", self.max_reconnect_attempts)
+        ))
+    }
+
+    /// 执行重连
+    async fn reconnect(
+        &mut self,
+        info_client: &InfoClient,
+        user_address: ethers::types::Address,
+    ) -> Result<(), GridStrategyError> {
+        // 注意：这里我们不能重新创建客户端，因为客户端是在外部创建的
+        // 我们只能测试现有连接是否恢复
+        
+        match self.test_connection(info_client, user_address).await {
+            Ok(latency_ms) => {
+                self.quality.update_latency(latency_ms);
+                self.quality.record_success();
+                Ok(())
+            }
+            Err(e) => {
+                self.quality.record_error();
+                Err(e)
+            }
+        }
+    }
+
+    /// 测试连接
+    async fn test_connection(
+        &self,
+        info_client: &InfoClient,
+        user_address: ethers::types::Address,
+    ) -> Result<u64, GridStrategyError> {
+        let start_time = Instant::now();
+        
+        // 使用账户信息查询作为连接测试
+        match get_account_info(info_client, user_address).await {
+            Ok(_) => {
+                let latency_ms = start_time.elapsed().as_millis() as u64;
+                Ok(latency_ms)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// 连接建立时的处理
+    fn on_connection_established(&mut self) {
+        let was_disconnected = matches!(
+            self.status,
+            ConnectionStatus::Disconnected | ConnectionStatus::Failed
+        );
+        
+        self.status = ConnectionStatus::Connected;
+        self.last_heartbeat = Instant::now();
+        self.last_data_received = Instant::now();
+        
+        if was_disconnected {
+            self.total_connections += 1;
+            
+            // 计算停机时间
+            if let Some(disconnect_time) = self.last_disconnect_time {
+                self.total_downtime += disconnect_time.elapsed();
+                self.last_disconnect_time = None;
+            }
+        }
+        
+        self.record_event(ConnectionEvent::new(
+            ConnectionEventType::Connected,
+            "连接已建立".to_string(),
+        ));
+        
+        info!(
+            "连接已建立 - 总连接次数: {}, 质量评分: {:.1}",
+            self.total_connections,
+            self.quality.overall_score()
+        );
+    }
+
+    /// 连接丢失时的处理
+    fn on_connection_lost(&mut self, error: &GridStrategyError) {
+        if self.status == ConnectionStatus::Connected {
+            self.total_disconnections += 1;
+            self.last_disconnect_time = Some(Instant::now());
+        }
+        
+        self.status = ConnectionStatus::Disconnected;
+        self.quality.record_error();
+        
+        self.record_event(ConnectionEvent::with_error(
+            ConnectionEventType::Disconnected,
+            "连接已断开".to_string(),
+            error.to_string(),
+        ));
+        
+        warn!(
+            "连接已断开 - 总断开次数: {}, 错误: {}",
+            self.total_disconnections, error
+        );
+    }
+
+    /// 重连成功时的处理
+    fn on_reconnect_success(&mut self) {
+        self.successful_reconnects += 1;
+        self.reconnect_count = 0; // 重置重连计数
+        self.status = ConnectionStatus::Connected;
+        self.last_heartbeat = Instant::now();
+        self.last_data_received = Instant::now();
+        
+        // 计算停机时间
+        if let Some(disconnect_time) = self.last_disconnect_time {
+            self.total_downtime += disconnect_time.elapsed();
+            self.last_disconnect_time = None;
+        }
+        
+        self.record_event(
+            ConnectionEvent::new(
+                ConnectionEventType::ReconnectSuccess,
+                format!("重连成功，尝试次数: {}", self.total_reconnect_attempts),
+            ).with_retry_count(self.total_reconnect_attempts)
+        );
+        
+        info!(
+            "重连成功 - 成功重连次数: {}/{}, 质量评分: {:.1}",
+            self.successful_reconnects,
+            self.total_reconnect_attempts,
+            self.quality.overall_score()
+        );
+    }
+
+    /// 计算重连延迟（指数退避）
+    fn calculate_reconnect_delay(&self) -> Duration {
+        let base_delay_ms = self.reconnect_base_delay.as_millis() as u64;
+        let max_delay_ms = self.max_reconnect_delay.as_millis() as u64;
+        
+        // 指数退避：delay = base * 2^(retry_count - 1)
+        let delay_ms = base_delay_ms * 2_u64.pow((self.reconnect_count - 1).min(10));
+        let final_delay_ms = delay_ms.min(max_delay_ms);
+        
+        Duration::from_millis(final_delay_ms)
+    }
+
+    /// 自适应调整心跳间隔
+    fn adjust_heartbeat_interval(&mut self, latency_ms: u64) {
+        if !self.adaptive_heartbeat {
+            return;
+        }
+        
+        let new_interval = if latency_ms < 50 {
+            Duration::from_secs(45) // 延迟低，可以延长心跳间隔
+        } else if latency_ms < 100 {
+            Duration::from_secs(30) // 正常延迟
+        } else if latency_ms < 200 {
+            Duration::from_secs(20) // 延迟较高，缩短心跳间隔
+        } else {
+            Duration::from_secs(15) // 延迟很高，频繁检查
+        };
+        
+        if new_interval != self.heartbeat_interval {
+            self.heartbeat_interval = new_interval;
+            info!(
+                "自适应调整心跳间隔: {}秒 (基于延迟: {}ms)",
+                new_interval.as_secs(),
+                latency_ms
+            );
+        }
+    }
+
+    /// 记录连接事件
+    fn record_event(&mut self, event: ConnectionEvent) {
+        self.events.push(event);
+        
+        // 限制事件数量
+        if self.events.len() > self.max_events {
+            self.events.remove(0);
+        }
+    }
+
+    /// 获取连接状态
+    fn get_status(&self) -> &ConnectionStatus {
+        &self.status
+    }
+
+    /// 获取连接质量
+    fn get_quality(&self) -> &ConnectionQuality {
+        &self.quality
+    }
+
+    /// 判断是否需要检查连接
+    fn should_check_connection(&self) -> bool {
+        self.last_heartbeat.elapsed() >= self.heartbeat_interval
+    }
+
+    /// 判断连接是否健康
+    fn is_healthy(&self) -> bool {
+        self.status.is_healthy() && self.quality.is_good() && !self.connection_degraded
+    }
+
+    /// 获取最近的错误事件
+    fn get_recent_errors(&self, minutes: u64) -> Vec<&ConnectionEvent> {
+        let cutoff_time = Instant::now() - Duration::from_secs(minutes * 60);
+        self.events
+            .iter()
+            .filter(|event| event.timestamp > cutoff_time && event.event_type.is_error())
+            .collect()
+    }
+
+    /// 获取连接统计报告
+    fn get_connection_report(&self) -> String {
+        let uptime_percentage = if self.connection_start_time.elapsed().as_secs() > 0 {
+            let total_time = self.connection_start_time.elapsed();
+            let uptime = total_time - self.total_downtime;
+            (uptime.as_secs_f64() / total_time.as_secs_f64()) * 100.0
+        } else {
+            100.0
+        };
+
+        let recent_errors = self.get_recent_errors(60); // 最近1小时的错误
+
+        format!(
+            "=== 连接管理报告 ===\n\
+            当前状态: {} ({})\n\
+            连接质量评分: {:.1}/100\n\
+            平均延迟: {:.1}ms\n\
+            错误率: {:.2}%\n\
+            连接稳定性: {:.1}%\n\
+            在线时间: {:.1}%\n\
+            \n\
+            === 统计信息 ===\n\
+            总连接次数: {}\n\
+            总断开次数: {}\n\
+            重连尝试次数: {}\n\
+            成功重连次数: {}\n\
+            重连成功率: {:.1}%\n\
+            总运行时间: {}小时\n\
+            总停机时间: {}分钟\n\
+            \n\
+            === 最近状态 ===\n\
+            最后心跳: {}秒前\n\
+            最后数据接收: {}秒前\n\
+            连接是否降级: {}\n\
+            最近1小时错误次数: {}\n\
+            当前重连次数: {}/{}",
+            self.status.as_str(),
+            self.status.as_english(),
+            self.quality.overall_score(),
+            self.quality.average_latency_ms,
+            self.quality.error_rate * 100.0,
+            self.quality.connection_stability,
+            uptime_percentage,
+            self.total_connections,
+            self.total_disconnections,
+            self.total_reconnect_attempts,
+            self.successful_reconnects,
+            if self.total_reconnect_attempts > 0 {
+                (self.successful_reconnects as f64 / self.total_reconnect_attempts as f64) * 100.0
+            } else {
+                100.0
+            },
+            self.connection_start_time.elapsed().as_secs() / 3600,
+            self.total_downtime.as_secs() / 60,
+            self.last_heartbeat.elapsed().as_secs(),
+            self.last_data_received.elapsed().as_secs(),
+            if self.connection_degraded { "是" } else { "否" },
+            recent_errors.len(),
+            self.reconnect_count,
+            self.max_reconnect_attempts
+        )
+    }
+
+    /// 重置统计信息
+    fn reset_stats(&mut self) {
+        self.total_connections = 0;
+        self.total_disconnections = 0;
+        self.total_reconnect_attempts = 0;
+        self.successful_reconnects = 0;
+        self.connection_start_time = Instant::now();
+        self.total_downtime = Duration::ZERO;
+        self.events.clear();
+        self.quality = ConnectionQuality::new();
+        
+        info!("连接管理器统计信息已重置");
+    }
+
+    /// 强制重连
+    async fn force_reconnect(
+        &mut self,
+        info_client: &InfoClient,
+        user_address: ethers::types::Address,
+    ) -> Result<(), GridStrategyError> {
+        info!("强制重连开始");
+        
+        self.status = ConnectionStatus::Reconnecting;
+        self.reconnect_count = 0; // 重置重连计数
+        
+        self.record_event(ConnectionEvent::new(
+            ConnectionEventType::ReconnectAttempt,
+            "强制重连".to_string(),
+        ));
+        
+        match self.reconnect(info_client, user_address).await {
+            Ok(()) => {
+                self.on_reconnect_success();
+                info!("强制重连成功");
+                Ok(())
+            }
+            Err(e) => {
+                self.on_connection_lost(&e);
+                error!("强制重连失败: {}", e);
+                Err(e)
+            }
+        }
     }
 }
 
@@ -3770,6 +4593,34 @@ pub async fn run_grid_strategy(
     let mut consecutive_failures = 0u32;
     let mut last_margin_ratio = 100.0f64;
 
+    // ===== 初始化连接管理器 =====
+    
+    let mut connection_manager = ConnectionManager::new();
+    
+    info!("🔗 连接管理器已初始化");
+    info!("   - 心跳间隔: {}秒", connection_manager.heartbeat_interval.as_secs());
+    info!("   - 心跳超时: {}秒", connection_manager.heartbeat_timeout.as_secs());
+    info!("   - 最大重连次数: {}", connection_manager.max_reconnect_attempts);
+    info!("   - 重连基础延迟: {}秒", connection_manager.reconnect_base_delay.as_secs());
+    info!("   - 最大重连延迟: {}秒", connection_manager.max_reconnect_delay.as_secs());
+    info!("   - 自适应心跳: {}", if connection_manager.adaptive_heartbeat { "启用" } else { "禁用" });
+    
+    // 初始连接检查
+    match connection_manager.check_connection(&info_client, user_address).await {
+        Ok(true) => {
+            info!("✅ 初始连接检查成功");
+        }
+        Ok(false) => {
+            warn!("⚠️ 初始连接检查失败，但系统将继续运行");
+        }
+        Err(e) => {
+            warn!("⚠️ 初始连接检查出错: {}, 系统将继续运行", e);
+        }
+    }
+    
+    let mut last_connection_check = Instant::now();
+    let mut last_connection_report = Instant::now();
+
     let mut last_price: Option<f64> = None;
 
     let mut last_daily_reset = SystemTime::now();
@@ -4155,6 +5006,61 @@ pub async fn run_grid_strategy(
                         warn!("⚠️ 风险控制已激活，跳过交易操作");
                         sleep(Duration::from_secs(grid_config.check_interval)).await;
                         continue;
+                    }
+
+                    // 1.6. 连接管理器检查
+                    let connection_check_interval = Duration::from_secs(60); // 每分钟检查一次连接
+                    if last_connection_check.elapsed() >= connection_check_interval {
+                        last_connection_check = Instant::now();
+                        
+                        match connection_manager.check_connection(&info_client, user_address).await {
+                            Ok(is_healthy) => {
+                                if !is_healthy {
+                                    warn!("⚠️ 连接质量下降，尝试重连");
+                                    
+                                    match connection_manager.attempt_reconnect(&info_client, user_address).await {
+                                        Ok(true) => {
+                                            info!("✅ 连接重连成功");
+                                        }
+                                        Ok(false) => {
+                                            warn!("⚠️ 连接重连失败，但系统继续运行");
+                                        }
+                                        Err(e) => {
+                                            error!("❌ 连接重连过程出错: {}", e);
+                                            
+                                            // 如果连接完全失败，考虑暂停交易
+                                            if connection_manager.get_status() == &ConnectionStatus::Failed {
+                                                warn!("🚨 连接完全失败，暂停交易操作");
+                                                stop_trading_flag.store(true, Ordering::SeqCst);
+                                                
+                                                // 记录网络风险事件
+                                                let network_event = RiskEvent::new(
+                                                    RiskEventType::NetworkIssue,
+                                                    format!("网络连接失败: {}", e),
+                                                    0.0,
+                                                    1.0,
+                                                );
+                                                risk_events.push(network_event);
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // 连接健康，记录数据接收事件
+                                    connection_manager.last_data_received = Instant::now();
+                                }
+                            }
+                            Err(e) => {
+                                warn!("⚠️ 连接检查失败: {}", e);
+                                connection_manager.on_connection_lost(&e);
+                            }
+                        }
+                        
+                        // 定期显示连接报告（每10分钟一次）
+                        if last_connection_report.elapsed() >= Duration::from_secs(600) {
+                            last_connection_report = Instant::now();
+                            let report = connection_manager.get_connection_report();
+                            info!("📡 连接状态报告:\n{}", report);
+                        }
                     }
 
                     // 2. 检查是否需要重平衡（每24小时）
