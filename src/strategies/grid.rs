@@ -1691,6 +1691,12 @@ struct GridState {
     #[serde(with = "system_time_serde")]
     last_order_batch_time: SystemTime, // 上次批量下单时间
     dynamic_params: DynamicGridParams,           // 动态网格参数
+    // 智能订单更新相关字段
+    #[serde(with = "system_time_serde")]
+    last_price_update: SystemTime,              // 上次价格更新时间
+    last_grid_price: f64,                       // 上次网格创建时的价格
+    order_update_threshold: f64,                // 订单更新阈值（价格变化百分比）
+    max_order_age_minutes: u64,                 // 订单最大存活时间（分钟）
 }
 
 // 市场趋势枚举
@@ -5398,6 +5404,139 @@ async fn execute_stop_loss(
 }
 
 // 重平衡网格
+// 智能订单更新函数
+async fn smart_update_orders(
+    exchange_client: &ExchangeClient,
+    grid_config: &crate::config::GridConfig,
+    grid_state: &mut GridState,
+    current_price: f64,
+    price_history: &[f64],
+    active_orders: &mut Vec<u64>,
+    buy_orders: &mut HashMap<u64, OrderInfo>,
+    sell_orders: &mut HashMap<u64, OrderInfo>,
+    batch_optimizer: &mut BatchTaskOptimizer,
+) -> Result<bool, GridStrategyError> {
+    let now = SystemTime::now();
+    
+    // 检查是否需要更新订单
+    let price_change_ratio = (current_price - grid_state.last_grid_price).abs() / grid_state.last_grid_price;
+    let time_since_last_update = now.duration_since(grid_state.last_price_update)
+        .unwrap_or(Duration::from_secs(0));
+    
+    // 检查订单年龄
+    let order_age_minutes = time_since_last_update.as_secs() / 60;
+    let orders_too_old = order_age_minutes >= grid_state.max_order_age_minutes;
+    
+    // 检查买单是否远离当前价格
+    let mut orders_too_far = false;
+    if !buy_orders.is_empty() {
+        let highest_buy_price = buy_orders.values()
+            .map(|order| order.price)
+            .fold(0.0, f64::max);
+        
+        // 如果最高买单价格低于当前价格的95%，认为订单太远
+        if highest_buy_price < current_price * 0.95 {
+            orders_too_far = true;
+            info!(
+                "🔄 买单价格过远 - 最高买单: {:.4}, 当前价格: {:.4}, 差距: {:.2}%",
+                highest_buy_price,
+                current_price,
+                (current_price - highest_buy_price) / current_price * 100.0
+            );
+        }
+    }
+    
+    let should_update = price_change_ratio >= grid_state.order_update_threshold 
+        || orders_too_old 
+        || orders_too_far;
+    
+    if should_update {
+        info!(
+            "🔄 触发智能订单更新 - 价格变化: {:.2}%, 订单年龄: {}分钟, 订单过远: {}, 阈值: {:.2}%",
+            price_change_ratio * 100.0,
+            order_age_minutes,
+            orders_too_far,
+            grid_state.order_update_threshold * 100.0
+        );
+        
+        // 取消现有订单
+        if !active_orders.is_empty() {
+            info!("🗑️ 取消 {} 个现有订单...", active_orders.len());
+            cancel_all_orders(exchange_client, active_orders, &grid_config.trading_asset).await?;
+            buy_orders.clear();
+            sell_orders.clear();
+            
+            // 等待订单取消完成
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        
+        // 重新创建网格
+        let mut temp_order_manager = OrderManager::new(100);
+        create_dynamic_grid(
+            exchange_client,
+            grid_config,
+            grid_state,
+            current_price,
+            price_history,
+            active_orders,
+            buy_orders,
+            sell_orders,
+            &mut temp_order_manager,
+        ).await?;
+        
+                                // 更新状态
+                        grid_state.last_price_update = now;
+                        grid_state.last_grid_price = current_price;
+                        grid_state.last_order_batch_time = now;
+        
+        info!("✅ 智能订单更新完成");
+        return Ok(true);
+    }
+    
+    Ok(false)
+}
+
+// 检查并清理过期订单
+async fn cleanup_expired_orders(
+    exchange_client: &ExchangeClient,
+    grid_config: &crate::config::GridConfig,
+    grid_state: &GridState,
+    active_orders: &mut Vec<u64>,
+    buy_orders: &mut HashMap<u64, OrderInfo>,
+    sell_orders: &mut HashMap<u64, OrderInfo>,
+) -> Result<(), GridStrategyError> {
+    let now = SystemTime::now();
+    let max_age = Duration::from_secs(grid_state.max_order_age_minutes * 60);
+    
+    let time_since_creation = now.duration_since(grid_state.last_order_batch_time)
+        .unwrap_or(Duration::from_secs(0));
+    
+    if time_since_creation >= max_age {
+        let expired_count = active_orders.len();
+        if expired_count > 0 {
+            info!("⏰ 发现 {} 个过期订单，开始清理...", expired_count);
+            
+            // 取消过期订单
+            for &order_id in active_orders.iter() {
+                match cancel_order_with_asset(exchange_client, order_id, &grid_config.trading_asset).await {
+                    Ok(_) => info!("✅ 过期订单 {} 已取消", order_id),
+                    Err(e) => warn!("❌ 取消过期订单 {} 失败: {:?}", order_id, e),
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            
+            // 清理本地记录
+            active_orders.clear();
+            buy_orders.clear();
+            sell_orders.clear();
+            
+            info!("🧹 过期订单清理完成");
+        }
+    }
+    
+    Ok(())
+}
+
 async fn rebalance_grid(
     exchange_client: &ExchangeClient,
     grid_config: &crate::config::GridConfig,
@@ -5896,6 +6035,11 @@ pub async fn run_grid_strategy(
                         "dynamic_grid_params.json",
                         grid_config,
                     ),
+                    // 智能订单更新相关字段
+                    last_price_update: SystemTime::now(),
+                    last_grid_price: 0.0,
+                    order_update_threshold: 0.02, // 2%价格变化触发更新
+                    max_order_age_minutes: 30,     // 订单最大存活30分钟
                 }
             } else {
                 info!("✅ 网格状态验证通过，继续使用已保存状态");
@@ -5954,6 +6098,11 @@ pub async fn run_grid_strategy(
                     "dynamic_grid_params.json",
                     grid_config,
                 ),
+                // 智能订单更新相关字段
+                last_price_update: SystemTime::now(),
+                last_grid_price: 0.0,
+                order_update_threshold: 0.02, // 2%价格变化触发更新
+                max_order_age_minutes: 30,     // 订单最大存活30分钟
             }
         }
     };
@@ -6586,7 +6735,34 @@ pub async fn run_grid_strategy(
                         continue;
                     }
 
-                    // 1.6. 连接管理器检查
+                    // 1.6. 智能订单更新检查
+                    if let Err(e) = smart_update_orders(
+                        &exchange_client,
+                        grid_config,
+                        &mut grid_state,
+                        current_price,
+                        &price_history,
+                        &mut active_orders,
+                        &mut buy_orders,
+                        &mut sell_orders,
+                        &mut batch_optimizer,
+                    ).await {
+                        warn!("⚠️ 智能订单更新失败: {:?}", e);
+                    }
+
+                    // 1.7. 过期订单清理
+                    if let Err(e) = cleanup_expired_orders(
+                        &exchange_client,
+                        grid_config,
+                        &grid_state,
+                        &mut active_orders,
+                        &mut buy_orders,
+                        &mut sell_orders,
+                    ).await {
+                        warn!("⚠️ 过期订单清理失败: {:?}", e);
+                    }
+
+                    // 1.8. 连接管理器检查
                     let connection_check_interval = Duration::from_secs(60); // 每分钟检查一次连接
                     if last_connection_check.elapsed() >= connection_check_interval {
                         last_connection_check = Instant::now();
