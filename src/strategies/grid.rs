@@ -2768,16 +2768,31 @@ async fn ensure_connection(
                 )));
             }
             
-            // 根据错误类型和重试次数计算等待时间
-            let base_delay = match error_type.as_str() {
-                "API限制" => 5,       // API限制等待更长时间
-                "网络超时" => 2,      // 网络超时等待较短时间
-                "服务器错误" => 3,    // 服务器错误中等等待时间
-                _ => 2,               // 默认等待时间
+            // 根据错误类型和重试次数计算等待时间 - 改进的指数退避机制
+            let (base_delay, max_backoff) = match error_type.as_str() {
+                "API限制" => (5, 600),      // API限制：基础5秒，最多等待10分钟
+                "网络超时" => (2, 120),     // 网络超时：基础2秒，最多等待2分钟
+                "服务器错误" => (3, 300),   // 服务器错误：基础3秒，最多等待5分钟
+                "认证失败" => (2, 60),      // 认证失败：基础2秒，最多等待1分钟
+                _ => (2, 180),              // 默认：基础2秒，最多等待3分钟
             };
             
-            let wait_seconds = base_delay * 2_u64.pow(grid_state.connection_retry_count.min(4));
-            info!("⏱️ 等待 {}秒 后重试连接 (错误类型: {})", wait_seconds, error_type);
+            let (wait_seconds, backoff_seconds, max_backoff_used) = calculate_exponential_backoff(
+                base_delay,
+                grid_state.connection_retry_count,
+                max_backoff,
+                &error_type,
+            );
+            
+            info!("⏱️ 等待 {}秒 后重试连接 (错误类型: {}, 基础延迟: {}s, 指数退避: {}s, 上限: {}s)", 
+                wait_seconds, error_type, base_delay, backoff_seconds, max_backoff_used);
+            
+            // 如果等待时间较长，提供额外信息
+            if wait_seconds >= 60 {
+                info!("💡 等待时间较长({:.1}分钟)，这是为了避免频繁重试对服务器造成压力", 
+                    wait_seconds as f64 / 60.0);
+            }
+            
             sleep(Duration::from_secs(wait_seconds)).await;
             
             Ok(false)
@@ -2797,14 +2812,47 @@ async fn ensure_connection(
                 ));
             }
             
-            // 超时情况下使用较短的等待时间
-            let wait_seconds = 3 * grid_state.connection_retry_count.min(5);
-            info!("⏱️ 连接超时，等待 {}秒 后重试", wait_seconds);
-            sleep(Duration::from_secs(wait_seconds as u64)).await;
+            // 超时情况下的改进指数退避机制
+            let base_timeout_delay = 3;
+            let max_timeout_backoff = 120; // 超时情况最多等待2分钟
+            
+            let (wait_seconds, timeout_backoff_seconds, max_backoff_used) = calculate_exponential_backoff(
+                base_timeout_delay,
+                grid_state.connection_retry_count,
+                max_timeout_backoff,
+                "连接超时",
+            );
+            
+            info!("⏱️ 连接超时，等待 {}秒 后重试 (基础延迟: {}s, 指数退避: {}s, 上限: {}s)", 
+                wait_seconds, base_timeout_delay, timeout_backoff_seconds, max_backoff_used);
+            
+            if wait_seconds >= 60 {
+                info!("💡 超时重试等待时间较长({:.1}分钟)，建议检查网络连接", 
+                    wait_seconds as f64 / 60.0);
+            }
+            
+            sleep(Duration::from_secs(wait_seconds)).await;
             
             Ok(false)
         }
     }
+}
+
+// 计算指数退避延迟时间，包含上限控制
+fn calculate_exponential_backoff(
+    base_delay: u64,
+    retry_count: u32,
+    max_backoff: u64,
+    _error_type: &str,
+) -> (u64, u64, u64) {
+    // 指数退避计算，限制最大指数为4（避免过长等待）
+    let backoff_seconds = base_delay * 2_u64.pow(retry_count.min(4));
+    
+    // 应用上限
+    let actual_wait_seconds = backoff_seconds.min(max_backoff);
+    
+    // 返回 (实际等待时间, 指数退避计算值, 上限值)
+    (actual_wait_seconds, backoff_seconds, max_backoff)
 }
 
 // 分析连接错误类型，用于制定不同的重试策略
