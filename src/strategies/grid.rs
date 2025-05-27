@@ -147,6 +147,714 @@ struct OrderInfo {
     allocated_funds: f64,              // 分配的资金
 }
 
+// ============================================================================
+// 订单优先级和过期管理模块
+// ============================================================================
+
+/// 订单优先级枚举
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+enum OrderPriority {
+    High,   // 高优先级，如止损单、紧急平仓单
+    Normal, // 普通网格单
+    Low,    // 低优先级，如远离当前价格的网格单
+}
+
+impl OrderPriority {
+    /// 获取中文描述
+    fn as_str(&self) -> &'static str {
+        match self {
+            OrderPriority::High => "高优先级",
+            OrderPriority::Normal => "普通优先级",
+            OrderPriority::Low => "低优先级",
+        }
+    }
+
+    /// 获取英文描述
+    fn as_english(&self) -> &'static str {
+        match self {
+            OrderPriority::High => "High",
+            OrderPriority::Normal => "Normal",
+            OrderPriority::Low => "Low",
+        }
+    }
+
+    /// 获取优先级数值（数值越大优先级越高）
+    fn priority_value(&self) -> u8 {
+        match self {
+            OrderPriority::High => 3,
+            OrderPriority::Normal => 2,
+            OrderPriority::Low => 1,
+        }
+    }
+
+    /// 判断是否为高优先级
+    fn is_high(&self) -> bool {
+        matches!(self, OrderPriority::High)
+    }
+
+    /// 判断是否为低优先级
+    fn is_low(&self) -> bool {
+        matches!(self, OrderPriority::Low)
+    }
+
+    /// 获取建议的超时时间（秒）
+    fn suggested_timeout_seconds(&self) -> u64 {
+        match self {
+            OrderPriority::High => 30,    // 高优先级订单30秒超时
+            OrderPriority::Normal => 300, // 普通订单5分钟超时
+            OrderPriority::Low => 1800,   // 低优先级订单30分钟超时
+        }
+    }
+}
+
+/// 订单过期策略
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+enum ExpiryStrategy {
+    Cancel,           // 过期后取消订单
+    Reprice,          // 过期后重新定价
+    Extend,           // 延长过期时间
+    ConvertToMarket,  // 转换为市价单（仅限高优先级）
+}
+
+impl ExpiryStrategy {
+    /// 获取中文描述
+    fn as_str(&self) -> &'static str {
+        match self {
+            ExpiryStrategy::Cancel => "取消订单",
+            ExpiryStrategy::Reprice => "重新定价",
+            ExpiryStrategy::Extend => "延长时间",
+            ExpiryStrategy::ConvertToMarket => "转市价单",
+        }
+    }
+
+    /// 获取英文描述
+    fn as_english(&self) -> &'static str {
+        match self {
+            ExpiryStrategy::Cancel => "Cancel",
+            ExpiryStrategy::Reprice => "Reprice",
+            ExpiryStrategy::Extend => "Extend",
+            ExpiryStrategy::ConvertToMarket => "Convert to Market",
+        }
+    }
+
+    /// 判断是否需要立即处理
+    fn requires_immediate_action(&self) -> bool {
+        matches!(self, ExpiryStrategy::ConvertToMarket)
+    }
+}
+
+/// 带优先级的订单信息
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PrioritizedOrderInfo {
+    // 基础订单信息
+    base_info: OrderInfo,
+    
+    // 优先级管理
+    priority: OrderPriority,
+    
+    // 过期管理
+    #[serde(with = "system_time_serde")]
+    created_time: SystemTime,
+    expiry_time: Option<SystemTime>,
+    expiry_strategy: ExpiryStrategy,
+    
+    // 订单状态
+    order_id: Option<u64>,
+    retry_count: u32,
+    last_retry_time: Option<SystemTime>,
+    
+    // 市场条件
+    distance_from_current_price: f64,  // 与当前价格的距离（百分比）
+    market_urgency: f64,               // 市场紧急度评分 (0-100)
+    
+    // 执行统计
+    execution_attempts: u32,
+    total_wait_time: Duration,
+    average_fill_time: Option<Duration>,
+}
+
+impl PrioritizedOrderInfo {
+    /// 创建新的优先级订单
+    fn new(
+        base_info: OrderInfo,
+        priority: OrderPriority,
+        expiry_strategy: ExpiryStrategy,
+        current_price: f64,
+    ) -> Self {
+        let created_time = SystemTime::now();
+        let expiry_time = Some(created_time + Duration::from_secs(priority.suggested_timeout_seconds()));
+        
+        // 计算与当前价格的距离
+        let distance_from_current_price = ((base_info.price - current_price) / current_price * 100.0).abs();
+        
+        Self {
+            base_info,
+            priority,
+            created_time,
+            expiry_time,
+            expiry_strategy,
+            order_id: None,
+            retry_count: 0,
+            last_retry_time: None,
+            distance_from_current_price,
+            market_urgency: 50.0, // 默认中等紧急度
+            execution_attempts: 0,
+            total_wait_time: Duration::new(0, 0),
+            average_fill_time: None,
+        }
+    }
+
+    /// 创建高优先级订单（止损单等）
+    fn new_high_priority(
+        base_info: OrderInfo,
+        current_price: f64,
+        timeout_seconds: Option<u64>,
+    ) -> Self {
+        let mut order = Self::new(base_info, OrderPriority::High, ExpiryStrategy::ConvertToMarket, current_price);
+        
+        if let Some(timeout) = timeout_seconds {
+            order.expiry_time = Some(order.created_time + Duration::from_secs(timeout));
+        }
+        
+        order.market_urgency = 90.0; // 高紧急度
+        order
+    }
+
+    /// 创建低优先级订单（远离价格的网格单）
+    fn new_low_priority(
+        base_info: OrderInfo,
+        current_price: f64,
+    ) -> Self {
+        let mut order = Self::new(base_info, OrderPriority::Low, ExpiryStrategy::Cancel, current_price);
+        order.market_urgency = 20.0; // 低紧急度
+        order
+    }
+
+    /// 检查订单是否过期
+    fn is_expired(&self) -> bool {
+        if let Some(expiry_time) = self.expiry_time {
+            SystemTime::now() > expiry_time
+        } else {
+            false
+        }
+    }
+
+    /// 获取剩余时间（秒）
+    fn remaining_seconds(&self) -> Option<u64> {
+        if let Some(expiry_time) = self.expiry_time {
+            expiry_time.duration_since(SystemTime::now())
+                .ok()
+                .map(|d| d.as_secs())
+        } else {
+            None
+        }
+    }
+
+    /// 延长过期时间
+    fn extend_expiry(&mut self, additional_seconds: u64) {
+        if let Some(expiry_time) = self.expiry_time {
+            self.expiry_time = Some(expiry_time + Duration::from_secs(additional_seconds));
+        } else {
+            self.expiry_time = Some(SystemTime::now() + Duration::from_secs(additional_seconds));
+        }
+    }
+
+    /// 更新市场紧急度
+    fn update_market_urgency(&mut self, volatility: f64, price_change: f64) {
+        // 基于市场波动率和价格变化计算紧急度
+        let volatility_factor = (volatility * 100.0).min(50.0);
+        let price_change_factor = (price_change.abs() * 100.0).min(30.0);
+        let distance_factor = (100.0 - self.distance_from_current_price).max(0.0) * 0.2;
+        
+        self.market_urgency = (volatility_factor + price_change_factor + distance_factor).min(100.0);
+    }
+
+    /// 记录执行尝试
+    fn record_execution_attempt(&mut self) {
+        self.execution_attempts += 1;
+        self.total_wait_time += self.created_time.elapsed().unwrap_or_default();
+    }
+
+    /// 设置订单ID
+    fn set_order_id(&mut self, order_id: u64) {
+        self.order_id = Some(order_id);
+    }
+
+    /// 记录重试
+    fn record_retry(&mut self) {
+        self.retry_count += 1;
+        self.last_retry_time = Some(SystemTime::now());
+    }
+
+    /// 获取综合优先级评分
+    fn get_priority_score(&self) -> f64 {
+        let base_priority = self.priority.priority_value() as f64 * 30.0;
+        let urgency_score = self.market_urgency * 0.4;
+        let distance_penalty = self.distance_from_current_price * 0.1;
+        let time_bonus = if self.is_expired() { 20.0 } else { 0.0 };
+        
+        (base_priority + urgency_score - distance_penalty + time_bonus).max(0.0)
+    }
+
+    /// 判断是否需要立即处理
+    fn needs_immediate_attention(&self) -> bool {
+        self.priority.is_high() || 
+        self.is_expired() || 
+        self.market_urgency > 80.0 ||
+        self.retry_count > 3
+    }
+
+    /// 获取建议的处理策略
+    fn get_suggested_action(&self, _current_price: f64) -> String {
+        if self.is_expired() {
+            format!("订单已过期，建议{}", self.expiry_strategy.as_str())
+        } else if self.distance_from_current_price > 5.0 {
+            "订单距离当前价格较远，建议降低优先级".to_string()
+        } else if self.market_urgency > 80.0 {
+            "市场紧急度高，建议提高优先级".to_string()
+        } else {
+            "正常处理".to_string()
+        }
+    }
+}
+
+/// 订单管理器
+#[derive(Debug)]
+struct OrderManager {
+    prioritized_orders: Vec<PrioritizedOrderInfo>,
+    max_orders: usize,
+    last_cleanup_time: SystemTime,
+    cleanup_interval: Duration,
+    
+    // 统计信息
+    total_orders_created: u64,
+    total_orders_expired: u64,
+    total_orders_repriced: u64,
+    total_high_priority_orders: u64,
+    
+    // 性能指标
+    average_execution_time: Duration,
+    success_rate: f64,
+    priority_distribution: HashMap<OrderPriority, u32>,
+}
+
+impl OrderManager {
+    /// 创建新的订单管理器
+    fn new(max_orders: usize) -> Self {
+        Self {
+            prioritized_orders: Vec::new(),
+            max_orders,
+            last_cleanup_time: SystemTime::now(),
+            cleanup_interval: Duration::from_secs(60), // 每分钟清理一次
+            total_orders_created: 0,
+            total_orders_expired: 0,
+            total_orders_repriced: 0,
+            total_high_priority_orders: 0,
+            average_execution_time: Duration::new(0, 0),
+            success_rate: 100.0,
+            priority_distribution: HashMap::new(),
+        }
+    }
+
+    /// 添加订单
+    fn add_order(&mut self, order: PrioritizedOrderInfo) -> Result<(), GridStrategyError> {
+        // 检查是否超过最大订单数
+        if self.prioritized_orders.len() >= self.max_orders {
+            // 尝试清理过期订单
+            self.cleanup_expired_orders();
+            
+            // 如果仍然超过限制，移除最低优先级的订单
+            if self.prioritized_orders.len() >= self.max_orders {
+                self.remove_lowest_priority_order();
+            }
+        }
+
+        // 更新统计信息
+        self.total_orders_created += 1;
+        if order.priority.is_high() {
+            self.total_high_priority_orders += 1;
+        }
+        
+        // 更新优先级分布
+        *self.priority_distribution.entry(order.priority.clone()).or_insert(0) += 1;
+
+        // 插入订单（按优先级排序）
+        let insert_pos = self.prioritized_orders
+            .binary_search_by(|a| order.get_priority_score().partial_cmp(&a.get_priority_score()).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or_else(|pos| pos);
+        
+        self.prioritized_orders.insert(insert_pos, order);
+        
+        info!("📋 添加订单到管理器 - 当前订单数: {}, 总创建数: {}", 
+            self.prioritized_orders.len(), self.total_orders_created);
+        
+        Ok(())
+    }
+
+    /// 获取下一个要处理的订单
+    fn get_next_order(&mut self) -> Option<&mut PrioritizedOrderInfo> {
+        // 按优先级评分排序，返回最高优先级的订单
+        self.prioritized_orders.sort_by(|a, b| 
+            b.get_priority_score().partial_cmp(&a.get_priority_score()).unwrap_or(std::cmp::Ordering::Equal)
+        );
+        
+        self.prioritized_orders.first_mut()
+    }
+
+    /// 获取所有需要立即处理的订单
+    fn get_urgent_orders(&mut self) -> Vec<&mut PrioritizedOrderInfo> {
+        self.prioritized_orders
+            .iter_mut()
+            .filter(|order| order.needs_immediate_attention())
+            .collect()
+    }
+
+    /// 获取过期订单
+    fn get_expired_orders(&self) -> Vec<&PrioritizedOrderInfo> {
+        self.prioritized_orders
+            .iter()
+            .filter(|order| order.is_expired())
+            .collect()
+    }
+
+    /// 清理过期订单
+    fn cleanup_expired_orders(&mut self) -> Vec<PrioritizedOrderInfo> {
+        let now = SystemTime::now();
+        
+        // 如果还没到清理时间，跳过
+        if now.duration_since(self.last_cleanup_time).unwrap_or_default() < self.cleanup_interval {
+            return Vec::new();
+        }
+
+        let (expired, remaining): (Vec<_>, Vec<_>) = self.prioritized_orders
+            .drain(..)
+            .partition(|order| order.is_expired());
+
+        self.prioritized_orders = remaining;
+        self.total_orders_expired += expired.len() as u64;
+        self.last_cleanup_time = now;
+
+        if !expired.is_empty() {
+            info!("🧹 清理过期订单 - 清理数量: {}, 剩余订单: {}", 
+                expired.len(), self.prioritized_orders.len());
+        }
+
+        expired
+    }
+
+    /// 移除最低优先级的订单
+    fn remove_lowest_priority_order(&mut self) -> Option<PrioritizedOrderInfo> {
+        if self.prioritized_orders.is_empty() {
+            return None;
+        }
+
+        // 找到优先级最低的订单
+        let min_pos = self.prioritized_orders
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| 
+                a.get_priority_score().partial_cmp(&b.get_priority_score()).unwrap_or(std::cmp::Ordering::Equal)
+            )
+            .map(|(pos, _)| pos)?;
+
+        let removed = self.prioritized_orders.remove(min_pos);
+        
+        warn!("⚠️ 移除最低优先级订单 - 优先级: {}, 剩余订单: {}", 
+            removed.priority.as_str(), self.prioritized_orders.len());
+        
+        Some(removed)
+    }
+
+    /// 更新所有订单的市场紧急度
+    fn update_market_conditions(&mut self, current_price: f64, volatility: f64, price_change: f64) {
+        for order in &mut self.prioritized_orders {
+            // 更新与当前价格的距离
+            order.distance_from_current_price = 
+                ((order.base_info.price - current_price) / current_price * 100.0).abs();
+            
+            // 更新市场紧急度
+            order.update_market_urgency(volatility, price_change);
+        }
+    }
+
+    /// 根据订单ID查找订单
+    fn find_order_by_id(&mut self, order_id: u64) -> Option<&mut PrioritizedOrderInfo> {
+        self.prioritized_orders
+            .iter_mut()
+            .find(|order| order.order_id == Some(order_id))
+    }
+
+    /// 移除订单
+    fn remove_order(&mut self, order_id: u64) -> Option<PrioritizedOrderInfo> {
+        if let Some(pos) = self.prioritized_orders
+            .iter()
+            .position(|order| order.order_id == Some(order_id)) {
+            Some(self.prioritized_orders.remove(pos))
+        } else {
+            None
+        }
+    }
+
+    /// 获取订单统计报告
+    fn get_statistics_report(&self) -> String {
+        let high_priority_count = self.prioritized_orders.iter()
+            .filter(|o| o.priority.is_high()).count();
+        let normal_priority_count = self.prioritized_orders.iter()
+            .filter(|o| o.priority == OrderPriority::Normal).count();
+        let low_priority_count = self.prioritized_orders.iter()
+            .filter(|o| o.priority.is_low()).count();
+        let expired_count = self.prioritized_orders.iter()
+            .filter(|o| o.is_expired()).count();
+        let urgent_count = self.prioritized_orders.iter()
+            .filter(|o| o.needs_immediate_attention()).count();
+
+        format!(
+            "📊 订单管理器统计报告\n\
+            ├─ 当前订单数: {}\n\
+            ├─ 高优先级: {} | 普通: {} | 低优先级: {}\n\
+            ├─ 过期订单: {} | 紧急订单: {}\n\
+            ├─ 总创建数: {} | 总过期数: {} | 重定价数: {}\n\
+            ├─ 成功率: {:.1}% | 平均执行时间: {:.2}秒\n\
+            └─ 最大容量: {} | 使用率: {:.1}%",
+            self.prioritized_orders.len(),
+            high_priority_count, normal_priority_count, low_priority_count,
+            expired_count, urgent_count,
+            self.total_orders_created, self.total_orders_expired, self.total_orders_repriced,
+            self.success_rate, self.average_execution_time.as_secs_f64(),
+            self.max_orders, 
+            (self.prioritized_orders.len() as f64 / self.max_orders as f64) * 100.0
+        )
+    }
+
+    /// 获取优先级分布
+    fn get_priority_distribution(&self) -> &HashMap<OrderPriority, u32> {
+        &self.priority_distribution
+    }
+
+    /// 重置统计信息
+    fn reset_statistics(&mut self) {
+        self.total_orders_created = 0;
+        self.total_orders_expired = 0;
+        self.total_orders_repriced = 0;
+        self.total_high_priority_orders = 0;
+        self.priority_distribution.clear();
+        self.success_rate = 100.0;
+        self.average_execution_time = Duration::new(0, 0);
+    }
+}
+
+/// 创建带优先级的订单
+async fn create_order_with_priority(
+    exchange_client: &ExchangeClient,
+    order_info: PrioritizedOrderInfo,
+    grid_config: &crate::config::GridConfig,
+) -> Result<u64, GridStrategyError> {
+    let start_time = SystemTime::now();
+    
+    // 记录订单创建尝试
+    info!("🎯 创建{}订单 - 价格: {:.4}, 数量: {:.4}, 优先级: {}", 
+        if order_info.base_info.price > 0.0 { "买入" } else { "卖出" },
+        order_info.base_info.price,
+        order_info.base_info.quantity,
+        order_info.priority.as_str()
+    );
+
+    // 根据优先级调整订单参数
+    let (timeout, retry_count) = match order_info.priority {
+        OrderPriority::High => (Duration::from_secs(10), 5),   // 高优先级：10秒超时，5次重试
+        OrderPriority::Normal => (Duration::from_secs(30), 3), // 普通：30秒超时，3次重试
+        OrderPriority::Low => (Duration::from_secs(60), 1),    // 低优先级：60秒超时，1次重试
+    };
+
+    // 创建订单请求
+    let order_request = ClientOrderRequest {
+        asset: grid_config.trading_asset.clone(),
+        is_buy: order_info.base_info.quantity > 0.0,
+        reduce_only: false,
+        limit_px: order_info.base_info.price,
+        sz: order_info.base_info.quantity.abs(),
+        order_type: ClientOrder::Limit(ClientLimit {
+            tif: "Gtc".to_string(),
+        }),
+        cloid: None,
+    };
+
+    // 执行订单创建（带重试机制）
+    let mut last_error = None;
+    for attempt in 1..=retry_count {
+        // 重新创建订单请求（因为ClientOrderRequest不支持clone）
+        let order_request = ClientOrderRequest {
+            asset: grid_config.trading_asset.clone(),
+            is_buy: order_info.base_info.quantity > 0.0,
+            reduce_only: false,
+            limit_px: order_info.base_info.price,
+            sz: order_info.base_info.quantity.abs(),
+            order_type: ClientOrder::Limit(ClientLimit {
+                tif: "Gtc".to_string(),
+            }),
+            cloid: None,
+        };
+        
+        match tokio::time::timeout(timeout, exchange_client.order(order_request, None)).await {
+            Ok(Ok(ExchangeResponseStatus::Ok(response))) => {
+                if let Some(data) = response.data {
+                    if !data.statuses.is_empty() {
+                        if let ExchangeDataStatus::Resting(order) = &data.statuses[0] {
+                            let execution_time = start_time.elapsed().unwrap_or_default();
+                            info!("✅ {}订单创建成功 - ID: {}, 执行时间: {:.2}秒, 尝试次数: {}", 
+                                order_info.priority.as_str(), order.oid, execution_time.as_secs_f64(), attempt);
+                            
+                            return Ok(order.oid);
+                        } else {
+                            let error_msg = format!("订单响应中未找到订单ID");
+                            warn!("⚠️ {}订单创建失败 - 尝试 {}/{}: {}", 
+                                order_info.priority.as_str(), attempt, retry_count, error_msg);
+                            last_error = Some(GridStrategyError::OrderError(error_msg));
+                        }
+                    } else {
+                        let error_msg = format!("订单响应中未找到数据");
+                        warn!("⚠️ {}订单创建失败 - 尝试 {}/{}: {}", 
+                            order_info.priority.as_str(), attempt, retry_count, error_msg);
+                        last_error = Some(GridStrategyError::OrderError(error_msg));
+                    }
+                } else {
+                    let error_msg = format!("订单响应中未找到订单ID");
+                    warn!("⚠️ {}订单创建失败 - 尝试 {}/{}: {}", 
+                        order_info.priority.as_str(), attempt, retry_count, error_msg);
+                    last_error = Some(GridStrategyError::OrderError(error_msg));
+                }
+            }
+            Ok(Ok(ExchangeResponseStatus::Err(err_response))) => {
+                let error_msg = format!("订单被交易所拒绝: {:?}", err_response);
+                warn!("⚠️ {}订单创建失败 - 尝试 {}/{}: {}", 
+                    order_info.priority.as_str(), attempt, retry_count, error_msg);
+                last_error = Some(GridStrategyError::OrderError(error_msg));
+            }
+            Ok(Err(e)) => {
+                let error_msg = format!("订单创建失败: {}", e);
+                warn!("⚠️ {}订单创建失败 - 尝试 {}/{}: {}", 
+                    order_info.priority.as_str(), attempt, retry_count, error_msg);
+                last_error = Some(GridStrategyError::OrderError(error_msg));
+            }
+            Err(_) => {
+                let error_msg = format!("订单创建超时 ({:.1}秒)", timeout.as_secs_f64());
+                warn!("⚠️ {}订单创建超时 - 尝试 {}/{}: {}", 
+                    order_info.priority.as_str(), attempt, retry_count, error_msg);
+                last_error = Some(GridStrategyError::OrderError(error_msg));
+            }
+        }
+
+        // 如果不是最后一次尝试，等待一段时间再重试
+        if attempt < retry_count {
+            let delay = Duration::from_millis(500 * attempt as u64); // 递增延迟
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    // 所有尝试都失败了
+    let final_error = last_error.unwrap_or_else(|| 
+        GridStrategyError::OrderError("未知订单创建错误".to_string())
+    );
+    
+    error!("❌ {}订单创建最终失败 - 已尝试{}次: {}", 
+        order_info.priority.as_str(), retry_count, final_error);
+    
+    Err(final_error)
+}
+
+/// 检查过期订单并处理
+async fn check_expired_orders(
+    exchange_client: &ExchangeClient,
+    order_manager: &mut OrderManager,
+    grid_config: &crate::config::GridConfig,
+    current_price: f64,
+) -> Result<(), GridStrategyError> {
+    let expired_orders = order_manager.cleanup_expired_orders();
+    
+    if expired_orders.is_empty() {
+        return Ok(());
+    }
+
+    info!("⏰ 检查到{}个过期订单，开始处理", expired_orders.len());
+
+    for mut expired_order in expired_orders {
+        match expired_order.expiry_strategy {
+            ExpiryStrategy::Cancel => {
+                // 取消订单
+                if let Some(order_id) = expired_order.order_id {
+                    match cancel_order(exchange_client, order_id).await {
+                        Ok(_) => {
+                            info!("✅ 成功取消过期订单 - ID: {}", order_id);
+                        }
+                        Err(e) => {
+                            warn!("⚠️ 取消过期订单失败 - ID: {}, 错误: {}", order_id, e);
+                        }
+                    }
+                }
+            }
+            
+            ExpiryStrategy::Reprice => {
+                // 重新定价订单
+                if let Some(order_id) = expired_order.order_id {
+                    // 先取消原订单
+                    if let Err(e) = cancel_order(exchange_client, order_id).await {
+                        warn!("⚠️ 取消待重定价订单失败 - ID: {}, 错误: {}", order_id, e);
+                        continue;
+                    }
+
+                    // 根据当前市场价格重新定价
+                    let price_adjustment = if expired_order.base_info.quantity > 0.0 {
+                        // 买单：降低价格以提高成交概率
+                        -0.001 * current_price
+                    } else {
+                        // 卖单：提高价格以提高成交概率
+                        0.001 * current_price
+                    };
+
+                    expired_order.base_info.price += price_adjustment;
+                    let new_price = expired_order.base_info.price; // 保存价格用于日志
+                    expired_order.expiry_time = Some(SystemTime::now() + Duration::from_secs(300)); // 延长5分钟
+                    expired_order.record_retry();
+
+                    // 重新创建订单
+                    match create_order_with_priority(exchange_client, expired_order.clone(), grid_config).await {
+                        Ok(new_order_id) => {
+                            expired_order.set_order_id(new_order_id);
+                            order_manager.add_order(expired_order)?;
+                            order_manager.total_orders_repriced += 1;
+                            info!("✅ 成功重定价订单 - 新ID: {}, 新价格: {:.4}", 
+                                new_order_id, new_price);
+                        }
+                        Err(e) => {
+                            warn!("⚠️ 重定价订单失败: {}", e);
+                        }
+                    }
+                }
+            }
+            
+            ExpiryStrategy::Extend => {
+                // 延长过期时间
+                let order_id = expired_order.order_id; // 保存订单ID用于日志
+                expired_order.extend_expiry(expired_order.priority.suggested_timeout_seconds());
+                order_manager.add_order(expired_order)?;
+                info!("⏰ 延长订单过期时间 - ID: {:?}", order_id);
+            }
+            
+            ExpiryStrategy::ConvertToMarket => {
+                // 转换为市价单（仅限高优先级）
+                if expired_order.priority.is_high() {
+                    warn!("🚨 高优先级订单过期，转换为市价单处理");
+                    // 这里可以实现市价单逻辑
+                    // 由于hyperliquid的限制，我们暂时记录警告
+                    error!("⚠️ 市价单转换功能需要根据交易所API实现");
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // 止损状态枚举
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 enum StopLossStatus {
@@ -2187,33 +2895,27 @@ fn detect_market_state(
     rsi: f64,
 ) -> (MarketState, f64, f64, f64) {
     let mut liquidity_score = 100.0;
-    let mut price_stability = 100.0;
     let mut volume_anomaly = 0.0;
     
     // 1. 基于波动率判断
-    let volatility_state = if volatility > 0.08 {
+    let (volatility_state, mut price_stability) = if volatility > 0.08 {
         // 极端波动 (日波动率 > 8%)
-        price_stability = 10.0;
         volume_anomaly = 80.0;
-        MarketState::Extreme
+        (MarketState::Extreme, 10.0)
     } else if volatility > 0.05 {
         // 高波动 (日波动率 > 5%)
-        price_stability = 30.0;
         volume_anomaly = 60.0;
-        MarketState::HighVolatility
+        (MarketState::HighVolatility, 30.0)
     } else if volatility > 0.03 {
         // 中等波动 (日波动率 > 3%)
-        price_stability = 60.0;
         volume_anomaly = 30.0;
-        MarketState::HighVolatility
+        (MarketState::HighVolatility, 60.0)
     } else if volatility < 0.005 {
         // 极低波动，可能是盘整
-        price_stability = 95.0;
-        MarketState::Consolidation
+        (MarketState::Consolidation, 95.0)
     } else {
         // 正常波动
-        price_stability = 80.0;
-        MarketState::Normal
+        (MarketState::Normal, 80.0)
     };
     
     // 2. 基于短期价格变化判断闪崩/闪涨
