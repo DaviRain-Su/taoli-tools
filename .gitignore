@@ -2,3 +2,5 @@
 config.toml
 dynamic_*
 performance_snapshot_*
+dynamic_grid_params*
+performance_snapshot_*
