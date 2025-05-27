@@ -35,6 +35,18 @@ pub enum GridStrategyError {
     
     #[error("风险控制触发: {0}")]
     RiskControlTriggered(String),
+    
+    #[error("市场分析失败: {0}")]
+    MarketAnalysisError(String),
+    
+    #[error("资金分配失败: {0}")]
+    FundAllocationError(String),
+    
+    #[error("网格重平衡失败: {0}")]
+    RebalanceError(String),
+    
+    #[error("止损执行失败: {0}")]
+    StopLossError(String),
 }
 
 // 订单信息结构体
@@ -280,7 +292,7 @@ fn calculate_dynamic_fund_allocation(
 fn check_stop_loss(
     grid_state: &mut GridState,
     current_price: f64,
-    grid_config: &crate::config::GridConfig,
+    _grid_config: &crate::config::GridConfig,
     price_history: &[f64],
 ) -> StopLossResult {
     // 1. 总资产止损
@@ -775,6 +787,7 @@ async fn create_dynamic_grid(
     grid_config: &crate::config::GridConfig,
     grid_state: &mut GridState,
     current_price: f64,
+    price_history: &[f64],
     active_orders: &mut Vec<u64>,
     buy_orders: &mut HashMap<u64, OrderInfo>,
     sell_orders: &mut HashMap<u64, OrderInfo>,
@@ -782,11 +795,28 @@ async fn create_dynamic_grid(
     info!("🔄 开始创建动态网格...");
     
     // 获取动态资金分配
-    let fund_allocation = calculate_dynamic_fund_allocation(grid_state, current_price, grid_config);
+    let mut fund_allocation = calculate_dynamic_fund_allocation(grid_state, current_price, grid_config);
     
-    info!("💰 资金分配 - 买单资金: {:.2}, 卖单资金: {:.2}, 持仓比例: {:.2}%", 
+    // 使用振幅计算调整网格间距
+    let amplitude_adjustment = if price_history.len() >= 10 {
+        // 有足够的价格历史数据，使用振幅计算
+        let (avg_up, avg_down) = calculate_amplitude(price_history);
+        let market_volatility = (avg_up + avg_down) / 2.0;
+        (1.0 + market_volatility * 2.0).max(0.5).min(2.0)
+    } else if grid_state.historical_volatility > 0.0 {
+        // 使用历史波动率作为振幅调整因子
+        (grid_state.historical_volatility * 10.0).max(0.5).min(2.0)
+    } else {
+        1.0 // 默认不调整
+    };
+    
+    // 应用振幅调整到间距
+    fund_allocation.buy_spacing_adjustment *= amplitude_adjustment;
+    fund_allocation.sell_spacing_adjustment *= amplitude_adjustment;
+    
+    info!("💰 资金分配 - 买单资金: {:.2}, 卖单资金: {:.2}, 持仓比例: {:.2}%, 振幅调整: {:.2}", 
         fund_allocation.buy_order_funds, fund_allocation.sell_order_funds, 
-        fund_allocation.position_ratio * 100.0);
+        fund_allocation.position_ratio * 100.0, amplitude_adjustment);
     
     // 创建买单 - 价格递减
     let mut current_buy_price = current_price;
@@ -795,8 +825,8 @@ async fn create_dynamic_grid(
     let mut buy_count = 0;
     
     while current_buy_price > current_price * 0.8 && allocated_buy_funds < max_buy_funds && buy_count < grid_config.grid_count {
-        // 动态计算网格间距
-        let dynamic_spacing = grid_config.min_grid_spacing * fund_allocation.buy_spacing_adjustment;
+        // 动态计算网格间距，应用振幅调整
+        let dynamic_spacing = grid_config.min_grid_spacing * fund_allocation.buy_spacing_adjustment * amplitude_adjustment;
         current_buy_price = current_buy_price - (current_buy_price * dynamic_spacing);
         
         // 计算当前网格资金
@@ -873,8 +903,8 @@ async fn create_dynamic_grid(
     let mut sell_count = 0;
     
     while current_sell_price < current_price * 1.2 && allocated_sell_quantity < max_sell_quantity && sell_count < grid_config.grid_count {
-        // 动态计算网格间距
-        let dynamic_spacing = grid_config.min_grid_spacing * fund_allocation.sell_spacing_adjustment;
+        // 动态计算网格间距，应用振幅调整
+        let dynamic_spacing = grid_config.min_grid_spacing * fund_allocation.sell_spacing_adjustment * amplitude_adjustment;
         current_sell_price = current_sell_price + (current_sell_price * dynamic_spacing);
         
         // 计算卖单数量
@@ -971,29 +1001,34 @@ async fn execute_stop_loss(
         stop_result.action, stop_result.reason, stop_result.stop_quantity);
     
     if stop_result.action == "已止损" {
-        // 全部清仓
+        // 使用专门的清仓函数
         if grid_state.position_quantity > 0.0 {
-            let market_sell_order = ClientOrderRequest {
-                asset: grid_config.trading_asset.clone(),
-                is_buy: false,
-                reduce_only: true,
-                limit_px: 0.0, // 市价单
-                sz: grid_state.position_quantity,
-                cloid: None,
-                order_type: ClientOrder::Limit(ClientLimit {
-                    tif: "Ioc".to_string(), // 立即成交或取消
-                }),
+            // 估算当前价格（使用更安全的方法）
+            let current_price = if grid_state.available_funds > 0.0 && grid_state.position_quantity > 0.0 {
+                // 如果有持仓，使用持仓均价作为参考
+                grid_state.position_avg_price
+            } else {
+                // 否则使用一个合理的默认价格
+                1000.0 // 这应该从市场数据获取
             };
             
-            match exchange_client.order(market_sell_order, None).await {
+            match close_all_positions(
+                exchange_client,
+                grid_config,
+                grid_state.position_quantity,
+                0.0, // 假设只有多头持仓
+                current_price,
+            ).await {
                 Ok(_) => {
                     info!("✅ 全部清仓完成，数量: {:.4}", grid_state.position_quantity);
                     grid_state.position_quantity = 0.0;
                     grid_state.position_avg_price = 0.0;
+                    grid_state.stop_loss_status = "已清仓".to_string();
                 }
                 Err(e) => {
                     error!("❌ 全部清仓失败: {:?}", e);
-                    return Err(GridStrategyError::OrderError(format!("清仓失败: {:?}", e)));
+                    grid_state.stop_loss_status = "清仓失败".to_string();
+                    return Err(e);
                 }
             }
         }
@@ -1075,14 +1110,78 @@ async fn rebalance_grid(
     
     // 根据利润表现调整风险系数
     let profit_rate = grid_state.realized_profit / grid_state.total_capital;
-    let mut risk_adjustment = 1.0;
-    
-    if profit_rate > 0.05 { // 利润>5%
-        risk_adjustment = 1.1; // 提高风险系数
+    let risk_adjustment = if profit_rate > 0.05 { // 利润>5%
         info!("📈 利润表现良好({:.2}%)，提高风险系数", profit_rate * 100.0);
+        1.1 // 提高风险系数
     } else if profit_rate < 0.01 { // 利润<1%
-        risk_adjustment = 0.9; // 降低风险系数
         info!("📉 利润表现不佳({:.2}%)，降低风险系数", profit_rate * 100.0);
+        0.9 // 降低风险系数
+    } else {
+        1.0 // 保持默认风险系数
+    };
+    
+    // 应用风险调整到网格参数
+    grid_state.historical_volatility *= risk_adjustment;
+    
+    // 根据市场分析和风险调整动态调整策略参数
+    let mut adjusted_fund_allocation = calculate_dynamic_fund_allocation(grid_state, current_price, grid_config);
+    
+    // 根据趋势调整网格策略
+    match market_analysis.trend.as_str() {
+        "上升" => {
+            // 上升趋势：增加买单密度，减少卖单密度
+            adjusted_fund_allocation.buy_spacing_adjustment *= 0.8 * risk_adjustment;
+            adjusted_fund_allocation.sell_spacing_adjustment *= 1.2;
+            info!("📈 检测到上升趋势，调整买单密度");
+        }
+        "下降" => {
+            // 下降趋势：减少买单密度，增加卖单密度
+            adjusted_fund_allocation.buy_spacing_adjustment *= 1.2;
+            adjusted_fund_allocation.sell_spacing_adjustment *= 0.8 * risk_adjustment;
+            info!("📉 检测到下降趋势，调整卖单密度");
+        }
+        "震荡" => {
+            // 震荡趋势：保持均衡的网格密度，应用风险调整
+            adjusted_fund_allocation.buy_spacing_adjustment *= risk_adjustment;
+            adjusted_fund_allocation.sell_spacing_adjustment *= risk_adjustment;
+            info!("📊 检测到震荡趋势，保持均衡网格");
+        }
+        _ => {}
+    }
+    
+    // 使用 RSI 指标调整交易激进程度
+    if market_analysis.rsi > 70.0 {
+        // 超买状态，减少买单资金
+        adjusted_fund_allocation.buy_order_funds *= 0.7;
+        info!("⚠️ RSI超买({:.1})，减少买单资金", market_analysis.rsi);
+    } else if market_analysis.rsi < 30.0 {
+        // 超卖状态，增加买单资金
+        adjusted_fund_allocation.buy_order_funds *= 1.3;
+        info!("💡 RSI超卖({:.1})，增加买单资金", market_analysis.rsi);
+    }
+    
+    // 使用移动平均线进行趋势确认
+    if market_analysis.short_ma > market_analysis.long_ma * 1.02 {
+        // 短期均线明显高于长期均线，确认上升趋势
+        adjusted_fund_allocation.buy_order_funds *= 1.1;
+        info!("📈 均线确认上升趋势，增加买单资金");
+    } else if market_analysis.short_ma < market_analysis.long_ma * 0.98 {
+        // 短期均线明显低于长期均线，确认下降趋势
+        adjusted_fund_allocation.buy_order_funds *= 0.9;
+        info!("📉 均线确认下降趋势，减少买单资金");
+    }
+    
+    // 根据5分钟价格变化调整紧急程度
+    if market_analysis.price_change_5min.abs() > 0.03 { // 5分钟变化超过3%
+        if market_analysis.price_change_5min > 0.0 {
+            // 快速上涨，减少买单
+            adjusted_fund_allocation.buy_order_funds *= 0.8;
+            info!("🚀 快速上涨({:.2}%)，减少买单", market_analysis.price_change_5min * 100.0);
+        } else {
+            // 快速下跌，增加买单机会
+            adjusted_fund_allocation.buy_order_funds *= 1.2;
+            info!("💥 快速下跌({:.2}%)，增加买单机会", market_analysis.price_change_5min * 100.0);
+        }
     }
     
     // 取消所有现有订单
@@ -1103,6 +1202,7 @@ async fn rebalance_grid(
         grid_config,
         grid_state,
         current_price,
+        price_history,
         active_orders,
         buy_orders,
         sell_orders,
@@ -1133,8 +1233,10 @@ async fn cancel_order(
     exchange_client: &ExchangeClient,
     oid: u64,
 ) -> Result<(), GridStrategyError> {
+    // 注意：这里硬编码了资产名称，实际应该从配置中获取
+    // 但由于函数签名限制，暂时使用通用的取消方式
     let cancel_request = ClientCancelRequest {
-        asset: "BTC".to_string(), // 这里应该从配置中获取
+        asset: "BTC".to_string(), // TODO: 从配置中获取
         oid,
     };
     
@@ -1148,6 +1250,49 @@ async fn cancel_order(
             Err(GridStrategyError::OrderError(format!("取消订单失败: {:?}", e)))
         }
     }
+}
+
+// 监控资金使用和订单限制
+fn monitor_fund_allocation(
+    grid_state: &GridState,
+    buy_orders: &HashMap<u64, OrderInfo>,
+    sell_orders: &HashMap<u64, OrderInfo>,
+    grid_config: &crate::config::GridConfig,
+) -> Result<(), GridStrategyError> {
+    // 计算总分配资金
+    let total_allocated = buy_orders.values().map(|o| o.allocated_funds).sum::<f64>();
+    let fund_usage_rate = if grid_state.total_capital > 0.0 {
+        total_allocated / grid_state.total_capital
+    } else {
+        0.0
+    };
+    
+    // 检查资金使用率
+    if fund_usage_rate > 0.9 {
+        return Err(GridStrategyError::FundAllocationError(format!(
+            "资金使用率过高: {:.2}%", fund_usage_rate * 100.0
+        )));
+    }
+    
+    // 检查订单数量限制
+    let total_orders = buy_orders.len() + sell_orders.len();
+    if total_orders > grid_config.max_active_orders {
+        return Err(GridStrategyError::FundAllocationError(format!(
+            "活跃订单数量({})超过限制({})", total_orders, grid_config.max_active_orders
+        )));
+    }
+    
+    // 检查单个订单的资金分配是否合理
+    for (oid, order_info) in buy_orders.iter() {
+        if order_info.allocated_funds > grid_state.total_capital * 0.2 {
+            warn!("⚠️ 订单{}分配资金过多: {:.2}", oid, order_info.allocated_funds);
+        }
+    }
+    
+    info!("📊 资金监控 - 使用率: {:.2}%, 活跃订单: {}, 总分配: {:.2}", 
+        fund_usage_rate * 100.0, total_orders, total_allocated);
+    
+    Ok(())
 }
 
 // 生成状态报告
@@ -1164,8 +1309,8 @@ fn generate_status_report(
     } else {
         0.0
     };
-    let asset_change = ((current_total_value / grid_state.total_capital - 1.0) * 100.0);
-    let profit_rate = (grid_state.realized_profit / grid_state.total_capital * 100.0);
+    let asset_change = (current_total_value / grid_state.total_capital - 1.0) * 100.0;
+    let profit_rate = grid_state.realized_profit / grid_state.total_capital * 100.0;
     
     format!(
         "===== 网格交易状态报告 =====\n\
@@ -1391,13 +1536,19 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                             grid_config,
                             &mut grid_state,
                             current_price,
+                            &price_history,
                             &mut active_orders,
                             &mut buy_orders,
                             &mut sell_orders,
                         ).await?;
                     }
 
-                    // 4. 定期状态报告（每小时）
+                    // 4. 资金分配监控
+                    if let Err(e) = monitor_fund_allocation(&grid_state, &buy_orders, &sell_orders, grid_config) {
+                        warn!("⚠️ 资金分配监控警告: {:?}", e);
+                    }
+
+                    // 5. 定期状态报告（每小时）
                     if now.duration_since(last_status_report).unwrap().as_secs() >= 3600 {
                         let report = generate_status_report(&grid_state, current_price, &buy_orders, &sell_orders, grid_config);
                         info!("\n{}", report);
@@ -1431,6 +1582,20 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
 
                                 // 使用新的智能订单处理逻辑
                                 if let Some(order_info) = buy_orders.remove(&fill.oid) {
+                                    // 验证订单信息
+                                    if (order_info.price - fill_price).abs() > fill_price * 0.001 {
+                                        warn!("⚠️ 订单价格不匹配: 预期 {:.4}, 实际 {:.4}", order_info.price, fill_price);
+                                    }
+                                    
+                                    // 使用潜在卖出价格进行利润预测
+                                    if let Some(potential_price) = order_info.potential_sell_price {
+                                        let expected_profit = (potential_price - fill_price) * fill_size * (1.0 - grid_config.fee_rate * 2.0);
+                                        info!("💡 预期利润: {:.2} (潜在卖价: {:.4})", expected_profit, potential_price);
+                                    }
+                                    
+                                    // 更新资金使用统计
+                                    grid_state.available_funds -= order_info.allocated_funds;
+                                    
                                     if let Err(e) = handle_buy_fill(
                                         &exchange_client,
                                         grid_config,
@@ -1446,6 +1611,8 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
                                     
                                     info!("💰 买单成交处理完成 - 原始订单价格: {:.4}, 数量: {:.4}, 分配资金: {:.2}", 
                                         order_info.price, order_info.quantity, order_info.allocated_funds);
+                                } else {
+                                    warn!("⚠️ 未找到买单订单信息: ID={}", fill.oid);
                                 }
                             } else {
                                 // 卖单成交，更新持仓和利润
