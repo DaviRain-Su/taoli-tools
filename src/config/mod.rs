@@ -62,6 +62,7 @@ pub struct GridConfig {
     pub fee_rate: f64,               // 手续费率
     pub min_profit: f64,             // 最小盈利阈值
     pub margin_usage_threshold: f64, // 保证金使用率阈值，默认0.8（80%）
+    pub order_update_threshold: f64, // 订单更新阈值（价格变化百分比），默认0.02（2%）
 }
 
 #[derive(Debug, Deserialize)]

@@ -6757,12 +6757,12 @@ pub async fn run_grid_strategy(
                         "dynamic_grid_params.json",
                         grid_config,
                     ),
-                    // 智能订单更新相关字段
-                    last_price_update: SystemTime::now(),
-                    last_grid_price: 0.0,
-                    order_update_threshold: 0.02, // 2%价格变化触发更新 TODO(需要修改进配置文件)
-                    // 修改为存活1分钟
-                    max_order_age_minutes: 0.1,     // 订单最大存活10s  TODO(需要修改进配置文件)
+                                    // 智能订单更新相关字段
+                last_price_update: SystemTime::now(),
+                last_grid_price: 0.0,
+                order_update_threshold: grid_config.order_update_threshold, // 从配置文件读取价格变化触发更新阈值
+                // 修改为存活10s
+                max_order_age_minutes: 0.1,     // 订单最大存活10s  TODO(需要修改进配置文件)
                     // 自适应订单管理
                     adaptive_order_config: AdaptiveOrderConfig::new(),
                 }
@@ -6826,7 +6826,7 @@ pub async fn run_grid_strategy(
                 // 智能订单更新相关字段
                 last_price_update: SystemTime::now(),
                 last_grid_price: 0.0,
-                order_update_threshold: 0.02, // 2%价格变化触发更新 TODO(需要修改进配置文件)
+                order_update_threshold: grid_config.order_update_threshold, // 从配置文件读取价格变化触发更新阈值
                 max_order_age_minutes: 0.1,     // 订单最大存活10s TODO(需要修改进配置文件)
                 // 自适应订单管理
                 adaptive_order_config: AdaptiveOrderConfig::new(),
