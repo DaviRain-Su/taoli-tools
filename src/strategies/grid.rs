@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use ethers::signers::{LocalWallet, Signer};
 use hyperliquid_rust_sdk::{
     BaseUrl, ClientCancelRequest, ClientLimit, ClientOrder, ClientOrderRequest, ExchangeClient,
@@ -266,7 +268,7 @@ impl BatchTaskOptimizer {
     }
 
     /// 更新性能趋势
-    fn update_performance_trend(&mut self, current_avg: Duration) {
+    fn update_performance_trend(&mut self, _current_avg: Duration) {
         if self.last_execution_times.len() < 5 {
             return;
         }
@@ -1046,19 +1048,6 @@ async fn create_order_with_priority(
         OrderPriority::High => (Duration::from_secs(10), 5), // 高优先级：10秒超时，5次重试
         OrderPriority::Normal => (Duration::from_secs(30), 3), // 普通：30秒超时，3次重试
         OrderPriority::Low => (Duration::from_secs(60), 1),  // 低优先级：60秒超时，1次重试
-    };
-
-    // 创建订单请求
-    let order_request = ClientOrderRequest {
-        asset: grid_config.trading_asset.clone(),
-        is_buy: order_info.base_info.quantity > 0.0,
-        reduce_only: false,
-        limit_px: order_info.base_info.price,
-        sz: order_info.base_info.quantity.abs(),
-        order_type: ClientOrder::Limit(ClientLimit {
-            tif: "Gtc".to_string(),
-        }),
-        cloid: None,
     };
 
     // 执行订单创建（带重试机制）
@@ -4737,7 +4726,7 @@ async fn create_dynamic_grid(
     active_orders: &mut Vec<u64>,
     buy_orders: &mut HashMap<u64, OrderInfo>,
     sell_orders: &mut HashMap<u64, OrderInfo>,
-    order_manager: &mut OrderManager,
+    _order_manager: &mut OrderManager,
 ) -> Result<(), GridStrategyError> {
     info!("🔄 开始创建动态网格...");
 
