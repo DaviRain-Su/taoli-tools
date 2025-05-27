@@ -437,90 +437,105 @@ fn calculate_dynamic_fund_allocation(
 fn check_stop_loss(
     grid_state: &mut GridState,
     current_price: f64,
-    _grid_config: &crate::config::GridConfig,
+    grid_config: &crate::config::GridConfig,
     price_history: &[f64],
 ) -> StopLossResult {
-    // 1. 总资产止损
+    // 1. 总资产止损 - 使用配置的最大回撤参数
     let current_total_value = grid_state.available_funds + grid_state.position_quantity * current_price;
-    let total_stop_threshold = grid_state.total_capital * 0.85; // 亏损15%触发止损
+    let total_stop_threshold = grid_state.total_capital * (1.0 - grid_config.max_drawdown);
     
     if current_total_value < total_stop_threshold {
-        warn!("🚨 触发总资产止损 - 当前总资产: {:.2}, 止损阈值: {:.2}", 
-            current_total_value, total_stop_threshold);
+        warn!("🚨 触发总资产止损 - 当前总资产: {:.2}, 止损阈值: {:.2}, 最大回撤: {:.1}%", 
+            current_total_value, total_stop_threshold, grid_config.max_drawdown * 100.0);
         
         return StopLossResult {
             action: StopLossAction::FullStop,
-            reason: "总资产亏损超过15%".to_string(),
+            reason: format!("总资产亏损超过{:.1}%", grid_config.max_drawdown * 100.0),
             stop_quantity: grid_state.position_quantity,
         };
     }
     
-    // 2. 浮动止损 (Trailing Stop)
+    // 2. 浮动止损 (Trailing Stop) - 使用配置的浮动止损比例
     if grid_state.position_quantity > 0.0 {
+        let trailing_stop_multiplier = 1.0 - grid_config.trailing_stop_ratio;
+        
         // 初始化最高价和止损价
         if grid_state.highest_price_after_position < grid_state.position_avg_price {
             grid_state.highest_price_after_position = grid_state.position_avg_price;
-            grid_state.trailing_stop_price = grid_state.position_avg_price * 0.9;
+            grid_state.trailing_stop_price = grid_state.position_avg_price * trailing_stop_multiplier;
         }
         
         // 更新最高价和浮动止损价
         if current_price > grid_state.highest_price_after_position {
             grid_state.highest_price_after_position = current_price;
-            grid_state.trailing_stop_price = current_price * 0.9;
-            info!("📈 更新浮动止损 - 新最高价: {:.4}, 新止损价: {:.4}", 
-                grid_state.highest_price_after_position, grid_state.trailing_stop_price);
+            grid_state.trailing_stop_price = current_price * trailing_stop_multiplier;
+            info!("📈 更新浮动止损 - 新最高价: {:.4}, 新止损价: {:.4}, 止损比例: {:.1}%", 
+                grid_state.highest_price_after_position, grid_state.trailing_stop_price, 
+                grid_config.trailing_stop_ratio * 100.0);
         }
         
         // 检查是否触发浮动止损
         if current_price < grid_state.trailing_stop_price {
-            warn!("🚨 触发浮动止损 - 当前价格: {:.4}, 止损价: {:.4}", 
-                current_price, grid_state.trailing_stop_price);
+            warn!("🚨 触发浮动止损 - 当前价格: {:.4}, 止损价: {:.4}, 配置止损比例: {:.1}%", 
+                current_price, grid_state.trailing_stop_price, grid_config.trailing_stop_ratio * 100.0);
             
-            let stop_quantity = grid_state.position_quantity * 0.5; // 止损一半持仓
+            // 根据配置的浮动止损比例动态调整止损数量
+            let stop_ratio = (grid_config.trailing_stop_ratio * 5.0).min(0.8).max(0.3); // 30%-80%之间
+            let stop_quantity = grid_state.position_quantity * stop_ratio;
             grid_state.highest_price_after_position = current_price;
-            grid_state.trailing_stop_price = current_price * 0.9;
+            grid_state.trailing_stop_price = current_price * trailing_stop_multiplier;
             
             return StopLossResult {
                 action: StopLossAction::PartialStop,
-                reason: "触发浮动止损".to_string(),
+                reason: format!("触发浮动止损，回撤{:.1}%", grid_config.trailing_stop_ratio * 100.0),
                 stop_quantity,
             };
         }
     }
     
-    // 3. 单笔持仓止损
+    // 3. 单笔持仓止损 - 使用配置的最大单笔亏损参数
     if grid_state.position_quantity > 0.0 && grid_state.position_avg_price > 0.0 {
         let position_loss_rate = (current_price - grid_state.position_avg_price) / grid_state.position_avg_price;
         
-        if position_loss_rate < -0.1 { // 亏损超过10%
-            warn!("🚨 触发单笔持仓止损 - 持仓均价: {:.4}, 当前价格: {:.4}, 亏损率: {:.2}%", 
-                grid_state.position_avg_price, current_price, position_loss_rate * 100.0);
+        if position_loss_rate < -grid_config.max_single_loss {
+            warn!("🚨 触发单笔持仓止损 - 持仓均价: {:.4}, 当前价格: {:.4}, 亏损率: {:.2}%, 配置阈值: {:.1}%", 
+                grid_state.position_avg_price, current_price, position_loss_rate * 100.0, grid_config.max_single_loss * 100.0);
             
-            let stop_quantity = grid_state.position_quantity * 0.3; // 止损30%持仓
+            // 根据亏损程度动态调整止损比例
+            let loss_severity = position_loss_rate.abs() / grid_config.max_single_loss;
+            let stop_ratio = (0.3 * loss_severity).min(0.8); // 最少30%，最多80%
+            let stop_quantity = grid_state.position_quantity * stop_ratio;
             
             return StopLossResult {
                 action: StopLossAction::PartialStop,
-                reason: "单笔持仓亏损超过10%".to_string(),
+                reason: format!("单笔持仓亏损超过{:.1}%", grid_config.max_single_loss * 100.0),
                 stop_quantity,
             };
         }
     }
     
-    // 4. 加速下跌止损
+    // 4. 加速下跌止损 - 基于每日最大亏损参数的动态阈值
     if price_history.len() >= 5 {
         let recent_price = price_history[price_history.len() - 1];
         let old_price = price_history[price_history.len() - 5];
         let short_term_change = (recent_price - old_price) / old_price;
         
-        if short_term_change < -0.05 && grid_state.position_quantity > 0.0 { // 5分钟内下跌超过5%
-            warn!("🚨 触发加速下跌止损 - 5分钟价格变化率: {:.2}%", short_term_change * 100.0);
+        // 使用每日最大亏损的一半作为短期下跌阈值
+        let rapid_decline_threshold = -(grid_config.max_daily_loss * 0.5);
+        
+        if short_term_change < rapid_decline_threshold && grid_state.position_quantity > 0.0 {
+            warn!("🚨 触发加速下跌止损 - 5分钟价格变化率: {:.2}%, 阈值: {:.2}%", 
+                short_term_change * 100.0, rapid_decline_threshold * 100.0);
             
-            let stop_ratio = (short_term_change.abs() * 5.0).min(0.5); // 最大止损50%
+            // 根据下跌幅度和配置的每日最大亏损动态计算止损比例
+            let decline_severity = short_term_change.abs() / grid_config.max_daily_loss;
+            let stop_ratio = (0.2 + decline_severity * 0.3).min(0.6); // 20%-60%之间
             let stop_quantity = grid_state.position_quantity * stop_ratio;
             
             return StopLossResult {
                 action: StopLossAction::PartialStop,
-                reason: format!("加速下跌{}%", short_term_change.abs() * 100.0),
+                reason: format!("加速下跌{:.1}%，超过阈值{:.1}%", 
+                    short_term_change.abs() * 100.0, rapid_decline_threshold.abs() * 100.0),
                 stop_quantity,
             };
         }
@@ -604,6 +619,10 @@ fn validate_grid_config(grid_config: &crate::config::GridConfig) -> Result<(), G
     
     if grid_config.max_daily_loss <= 0.0 || grid_config.max_daily_loss > 1.0 {
         return Err(GridStrategyError::ConfigError("每日最大亏损必须在0-100%之间".to_string()));
+    }
+    
+    if grid_config.trailing_stop_ratio <= 0.0 || grid_config.trailing_stop_ratio > 0.5 {
+        return Err(GridStrategyError::ConfigError("浮动止损比例必须在0-50%之间".to_string()));
     }
     
     // 检查杠杆倍数

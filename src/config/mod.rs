@@ -51,6 +51,7 @@ pub struct GridConfig {
     // 风险控制参数 (Risk control parameters)
     pub max_single_loss: f64,
     pub max_daily_loss: f64,
+    pub trailing_stop_ratio: f64,  // 浮动止损比例，默认0.1（10%）
     pub max_holding_time: u64,
     pub history_length: usize,
     pub max_active_orders: usize, // 每次最多挂单数量（买/卖各自）
