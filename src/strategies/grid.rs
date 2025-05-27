@@ -5,7 +5,7 @@ use hyperliquid_rust_sdk::{
     BaseUrl, ClientCancelRequest, ClientLimit, ClientOrder, ClientOrderRequest, ExchangeClient,
     ExchangeDataStatus, ExchangeResponseStatus, InfoClient, Message, Subscription, UserData,
 };
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -108,6 +108,48 @@ mod system_time_serde {
         let secs = u64::deserialize(deserializer)?;
         Ok(UNIX_EPOCH + std::time::Duration::from_secs(secs))
     }
+}
+
+/// 安全的时间差计算，处理时间倒退的情况
+fn safe_duration_since(now: SystemTime, earlier: SystemTime) -> Duration {
+    match now.duration_since(earlier) {
+        Ok(duration) => duration,
+        Err(e) => {
+            // 时间倒退了，记录警告并返回一个合理的默认值
+            warn!("⚠️ 检测到系统时间倒退: {:?}", e);
+            // 返回一个较大的值，确保时间检查会触发
+            Duration::from_secs(3600) // 1小时，确保定期检查会执行
+        }
+    }
+}
+
+/// 安全的Unix时间戳获取
+fn safe_unix_timestamp() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs(),
+        Err(_) => {
+            warn!("⚠️ 系统时间早于Unix纪元，使用备用时间戳");
+            // 使用一个合理的默认时间戳（2024年1月1日）
+            1704067200 // 2024-01-01 00:00:00 UTC
+        }
+    }
+}
+
+/// 安全的时间间隔检查
+fn should_execute_periodic_task(
+    last_execution: SystemTime,
+    interval_seconds: u64,
+    task_name: &str,
+) -> bool {
+    let now = SystemTime::now();
+    let duration = safe_duration_since(now, last_execution);
+    let should_execute = duration.as_secs() >= interval_seconds;
+    
+    if should_execute {
+        debug!("⏰ 执行定期任务: {} (间隔: {}秒)", task_name, duration.as_secs());
+    }
+    
+    should_execute
 }
 
 // 批处理任务优化器
@@ -6302,7 +6344,7 @@ pub async fn run_grid_strategy(
         }
 
         // 检查是否需要重置每日统计
-        if now.duration_since(last_daily_reset).unwrap().as_secs() >= 24 * 60 * 60 {
+        if should_execute_periodic_task(last_daily_reset, 24 * 60 * 60, "每日统计重置") {
             last_daily_reset = now;
             info!("🔄 重置每日统计");
         }
@@ -6922,12 +6964,11 @@ pub async fn run_grid_strategy(
                     }
 
                     // 3. 定期检查订单状态（每30秒）
-                    if now
-                        .duration_since(grid_state.last_order_batch_time)
-                        .unwrap()
-                        .as_secs()
-                        >= 30
-                    {
+                    if should_execute_periodic_task(
+                        grid_state.last_order_batch_time,
+                        30,
+                        "订单状态检查"
+                    ) {
                         if let Err(e) = check_order_status(
                             &info_client,
                             user_address,
@@ -6978,12 +7019,11 @@ pub async fn run_grid_strategy(
                     }
 
                     // 4.1 保证金监控（每5分钟检查一次）
-                    if now
-                        .duration_since(grid_state.last_margin_check)
-                        .unwrap()
-                        .as_secs()
-                        >= 300
-                    {
+                    if should_execute_periodic_task(
+                        grid_state.last_margin_check,
+                        300,
+                        "保证金监控"
+                    ) {
                         // 首先检查连接状态
                         match ensure_connection(&info_client, user_address, &mut grid_state).await {
                             Ok(true) => {
@@ -7075,7 +7115,7 @@ pub async fn run_grid_strategy(
                     }
 
                     // 5. 定期状态报告和参数管理（每小时）
-                    if now.duration_since(last_status_report).unwrap().as_secs() >= 3600 {
+                    if should_execute_periodic_task(last_status_report, 3600, "状态报告") {
                         // 更新性能指标
                         grid_state.current_metrics =
                             calculate_performance_metrics(&grid_state, &price_history);
@@ -8669,10 +8709,9 @@ fn auto_optimize_grid_parameters(
 ) -> bool {
     // 保存优化前的参数状态
     let old_params = grid_state.dynamic_params.clone();
-    let now = SystemTime::now();
-
+    
     // 检查是否需要优化（每24小时最多优化一次）
-    let current_timestamp = now.duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let current_timestamp = safe_unix_timestamp();
     if current_timestamp - grid_state.dynamic_params.last_optimization_time < 24 * 60 * 60 {
         return false;
     }
@@ -9031,7 +9070,7 @@ async fn save_performance_data(
     };
 
     let snapshot = PerformanceSnapshot {
-        timestamp: current_time.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+        timestamp: safe_unix_timestamp(),
         total_capital: grid_state.total_capital,
         available_funds: grid_state.available_funds,
         position_quantity: grid_state.position_quantity,
@@ -9050,7 +9089,7 @@ async fn save_performance_data(
     // 保存到文件
     let filename = format!(
         "performance_snapshot_{}.json",
-        current_time.duration_since(UNIX_EPOCH).unwrap().as_secs()
+        safe_unix_timestamp()
     );
 
     match serde_json::to_string_pretty(&snapshot) {
@@ -9090,10 +9129,9 @@ async fn save_trading_history(
         return Ok(());
     }
 
-    let current_time = SystemTime::now();
     let filename = format!(
         "trading_history_{}.json",
-        current_time.duration_since(UNIX_EPOCH).unwrap().as_secs()
+        safe_unix_timestamp()
     );
 
     #[derive(serde::Serialize)]
@@ -9106,7 +9144,7 @@ async fn save_trading_history(
 
     let export_data = TradingHistoryExport {
         shutdown_reason: reason.as_str().to_string(),
-        export_time: current_time.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+        export_time: safe_unix_timestamp(),
         total_trades: grid_state.performance_history.len(),
         trades: grid_state.performance_history.clone(),
     };
@@ -9210,10 +9248,7 @@ fn generate_final_report(
         \n\
         ==============================",
         reason.as_str(),
-        format!(
-            "{:?}",
-            current_time.duration_since(UNIX_EPOCH).unwrap().as_secs()
-        ),
+        format!("{:?}", safe_unix_timestamp()),
         trading_duration.as_secs_f64() / 3600.0,
         grid_state.total_capital,
         final_total_value,
@@ -9519,10 +9554,7 @@ fn validate_loaded_state(
 
 /// 创建状态备份
 fn backup_state_files() -> Result<(), GridStrategyError> {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let timestamp = safe_unix_timestamp();
 
     // 备份网格状态
     if std::path::Path::new("grid_state.json").exists() {
@@ -9553,10 +9585,7 @@ fn backup_state_files() -> Result<(), GridStrategyError> {
 
 /// 清理过期的备份文件
 fn cleanup_old_backups(max_backup_age_days: u64) -> Result<(), GridStrategyError> {
-    let current_time = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let current_time = safe_unix_timestamp();
     let max_age_seconds = max_backup_age_days * 24 * 60 * 60;
 
     let backup_patterns = [
