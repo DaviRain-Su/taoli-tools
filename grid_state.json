@@ -1,0 +1,41 @@
+{
+  "total_capital": 1000.0,
+  "available_funds": 7610.196767,
+  "position_quantity": 0.0,
+  "position_avg_price": 0.0,
+  "realized_profit": 0.0,
+  "highest_price_after_position": 0.0,
+  "trailing_stop_price": 0.0,
+  "stop_loss_status": "Normal",
+  "last_rebalance_time": 1748337557,
+  "historical_volatility": 0.0,
+  "performance_history": [],
+  "current_metrics": {
+    "total_trades": 0,
+    "winning_trades": 0,
+    "losing_trades": 0,
+    "win_rate": 0.0,
+    "total_profit": 0.0,
+    "max_drawdown": 0.0,
+    "sharpe_ratio": 0.0,
+    "profit_factor": 0.0,
+    "average_win": 0.0,
+    "average_loss": 0.0,
+    "largest_win": 0.0,
+    "largest_loss": 0.0
+  },
+  "last_margin_check": 1748337557,
+  "connection_retry_count": 0,
+  "last_order_batch_time": 1748337843,
+  "dynamic_params": {
+    "current_min_spacing": 0.0018,
+    "current_max_spacing": 0.002,
+    "current_trade_amount": 100.0,
+    "last_optimization_time": 1748332996,
+    "optimization_count": 0,
+    "performance_window": [],
+    "checkpoints": [],
+    "last_checkpoint_time": 1748332996,
+    "rollback_threshold": 15.0
+  }
+}

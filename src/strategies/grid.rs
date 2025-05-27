@@ -4800,6 +4800,30 @@ async fn create_dynamic_grid(
         amplitude_adjustment
     );
 
+    // 添加详细的调试信息
+    info!(
+        "🔍 网格创建调试信息 - 当前价格: {:.4}, 总资金: {:.2}, 可用资金: {:.2}, 网格数量: {}",
+        current_price,
+        grid_state.total_capital,
+        grid_state.available_funds,
+        grid_config.grid_count
+    );
+
+    info!(
+        "🔍 动态参数 - 最小间距: {:.6}, 最大间距: {:.6}, 交易金额: {:.2}",
+        grid_state.dynamic_params.current_min_spacing,
+        grid_state.dynamic_params.current_max_spacing,
+        grid_state.dynamic_params.current_trade_amount
+    );
+
+    info!(
+        "🔍 配置参数 - 最小利润: {:.4}, 手续费率: {:.6}, 价格精度: {}, 数量精度: {}",
+        grid_config.min_profit,
+        grid_config.fee_rate,
+        grid_config.price_precision,
+        grid_config.quantity_precision
+    );
+
     // 创建买单 - 价格递减
     let mut current_buy_price = current_price;
     let max_buy_funds = grid_state.available_funds * 0.7; // 最多使用70%资金做买单
@@ -4809,6 +4833,14 @@ async fn create_dynamic_grid(
     // 收集要批量创建的买单
     let mut pending_buy_orders: Vec<ClientOrderRequest> = Vec::new();
     let mut pending_buy_order_info: Vec<OrderInfo> = Vec::new();
+
+    info!(
+        "🔄 开始买单循环 - 初始买入价: {:.4}, 价格下限: {:.4}, 最大资金: {:.2}, 最大网格数: {}",
+        current_buy_price,
+        current_price * 0.8,
+        max_buy_funds,
+        adjusted_grid_count
+    );
 
     while current_buy_price > current_price * 0.8
         && allocated_buy_funds < max_buy_funds
@@ -4833,6 +4865,11 @@ async fn create_dynamic_grid(
         }
 
         if current_grid_funds < fund_allocation.buy_order_funds * 0.1 {
+            info!(
+                "🚫 买单资金不足 - 当前网格资金: {:.2}, 最小要求: {:.2}, 停止创建买单",
+                current_grid_funds,
+                fund_allocation.buy_order_funds * 0.1
+            );
             break; // 资金太少，停止创建买单
         }
 
@@ -4847,6 +4884,14 @@ async fn create_dynamic_grid(
             current_buy_price,
             potential_sell_price,
             grid_config.fee_rate,
+        );
+
+        info!(
+            "🔍 买单利润检查 - 买入价: {:.4}, 潜在卖出价: {:.4}, 预期利润率: {:.4}%, 最小要求: {:.4}%",
+            current_buy_price,
+            potential_sell_price,
+            expected_profit_rate * 100.0,
+            (grid_config.min_profit / current_buy_price) * 100.0
         );
 
         if expected_profit_rate >= grid_config.min_profit / current_buy_price {
@@ -4876,6 +4921,20 @@ async fn create_dynamic_grid(
 
             allocated_buy_funds += current_grid_funds;
             buy_count += 1;
+
+            info!(
+                "✅ 买单准备就绪 - 价格: {:.4}, 数量: {:.4}, 资金: {:.2}, 累计资金: {:.2}",
+                formatted_price,
+                buy_quantity,
+                current_grid_funds,
+                allocated_buy_funds
+            );
+        } else {
+            info!(
+                "❌ 买单利润不足 - 预期利润率: {:.4}% < 最小要求: {:.4}%, 跳过此价格",
+                expected_profit_rate * 100.0,
+                (grid_config.min_profit / current_buy_price) * 100.0
+            );
         }
     }
 
