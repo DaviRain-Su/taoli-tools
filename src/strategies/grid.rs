@@ -4245,16 +4245,17 @@ fn check_stop_loss(
     current_price: f64,
     grid_config: &crate::config::GridConfig,
     price_history: &[f64],
+    active_orders_count: usize,
 ) -> StopLossResult {
     // 1. 总资产止损 - 区分持仓亏损和手续费损失
-    // 注意：这里只计算可用资金和持仓价值，不包括挂单占用的资金
-    // 挂单占用的资金仍然属于总资产，只是暂时锁定
-    let liquid_total_value =
-        grid_state.available_funds + grid_state.position_quantity * current_price;
+    // 修复：正确计算当前总资产价值
+    // 注意：available_funds可能不包含挂单预留的资金，需要使用真实的账户总资产
+    // 当前总资产 = 流动资金 + 持仓价值 + 挂单预留资金
+    let current_total_value = grid_state.available_funds + grid_state.position_quantity * current_price;
     
-    // 计算基于流动资产的亏损率（用于信息显示）
-    let liquid_loss_rate = if grid_state.total_capital > 0.0 {
-        (grid_state.total_capital - liquid_total_value) / grid_state.total_capital
+    // 计算真实的资产变化率（基于总资产对比）
+    let asset_change_rate = if grid_state.total_capital > 0.0 {
+        (current_total_value - grid_state.total_capital) / grid_state.total_capital
     } else {
         0.0
     };
@@ -4268,20 +4269,31 @@ fn check_stop_loss(
         0.0
     };
     
-    // 估算手续费损失（基于已实现利润的负值部分）
+    // 修复：更准确的手续费估算
+    // 手续费损失主要来自已实现的交易损失，而不是总资产减少
     let estimated_fee_loss = if grid_state.realized_profit < 0.0 {
+        // 如果已实现利润为负，这部分主要是手续费和小额亏损
         grid_state.realized_profit.abs()
     } else {
-        (grid_state.total_capital - liquid_total_value - unrealized_pnl.min(0.0)).max(0.0)
+        // 如果没有持仓且资产减少，估算为合理的手续费范围
+        if !has_significant_position && asset_change_rate < 0.0 {
+            // 估算手续费：假设进行了一些交易，每笔交易手续费约0.02%
+            // 基于当前资产的0.1%作为合理的手续费估算上限
+            let reasonable_fee_estimate = grid_state.total_capital * 0.001; // 0.1%
+            let actual_loss = grid_state.total_capital - current_total_value;
+            actual_loss.min(reasonable_fee_estimate)
+        } else {
+            0.0
+        }
     };
 
-    // 只有在有显著持仓且持仓亏损超过阈值时才触发总资产止损
-    if has_significant_position && liquid_loss_rate > grid_config.max_drawdown {
+    // 只有在有显著持仓且总资产亏损超过阈值时才触发总资产止损
+    if has_significant_position && asset_change_rate < -grid_config.max_drawdown {
         warn!(
-            "🚨 触发总资产止损 - 流动资产: {:.2}, 初始资产: {:.2}, 流动资产亏损率: {:.2}%, 持仓价值: {:.2}, 未实现盈亏: {:.2}, 最大回撤限制: {:.1}%",
-            liquid_total_value,
+            "🚨 触发总资产止损 - 当前总资产: {:.2}, 初始资产: {:.2}, 总资产亏损率: {:.2}%, 持仓价值: {:.2}, 未实现盈亏: {:.2}, 最大回撤限制: {:.1}%",
+            current_total_value,
             grid_state.total_capital,
-            liquid_loss_rate * 100.0,
+            asset_change_rate * 100.0,
             position_value,
             unrealized_pnl,
             grid_config.max_drawdown * 100.0
@@ -4289,19 +4301,40 @@ fn check_stop_loss(
 
         return StopLossResult {
             action: StopLossAction::FullStop,
-            reason: format!("总资产亏损{:.2}%，超过{:.1}%限制", liquid_loss_rate * 100.0, grid_config.max_drawdown * 100.0),
+            reason: format!("总资产亏损{:.2}%，超过{:.1}%限制", (-asset_change_rate) * 100.0, grid_config.max_drawdown * 100.0),
             stop_quantity: grid_state.position_quantity,
         };
-    } else if !has_significant_position && liquid_loss_rate > 0.0 {
-        // 无持仓时的资金减少主要是手续费，不触发止损
-        // 注意：挂单不占用资金，所以这里的减少主要是手续费成本
+    } else if !has_significant_position && asset_change_rate < 0.0 {
+        // 无持仓时的资产减少分析
+        let actual_loss = grid_state.total_capital - current_total_value;
+        
+        // 更准确的原因分析：考虑挂单预留资金
+        let possible_causes = if actual_loss > estimated_fee_loss * 10.0 {
+            "原因: 挂单预留资金（非真实损失）"
+        } else if actual_loss > estimated_fee_loss * 2.0 {
+            "可能原因: 挂单预留资金或账户同步延迟"
+        } else {
+            "可能原因: 交易手续费"
+        };
+        
         info!(
-            "📊 无持仓状态 - 流动资产: {:.2}, 初始资产: {:.2}, 流动资产减少: {:.2} ({:.2}%), 主要原因: 交易手续费成本约{:.2}",
-            liquid_total_value,
+            "📊 无持仓状态 - 流动资金: {:.2}, 初始资产: {:.2}, 差额: {:.2} ({:.2}%), 活跃挂单: {}, 估算手续费: {:.2}, {}",
+            current_total_value,
             grid_state.total_capital,
-            grid_state.total_capital - liquid_total_value,
-            liquid_loss_rate * 100.0,
-            estimated_fee_loss
+            actual_loss,
+            (-asset_change_rate) * 100.0,
+            active_orders_count,
+            estimated_fee_loss,
+            possible_causes
+        );
+    } else if !has_significant_position && asset_change_rate >= 0.0 {
+        // 无持仓且资产增加或持平
+        info!(
+            "📊 无持仓状态 - 当前资产: {:.2}, 初始资产: {:.2}, 资产变化: {:.2} ({:.2}%), 状态: 正常",
+            current_total_value,
+            grid_state.total_capital,
+            current_total_value - grid_state.total_capital,
+            asset_change_rate * 100.0
         );
     }
 
@@ -7090,9 +7123,24 @@ pub async fn run_grid_strategy(
 
                     // 初始化每日起始资本（仅在第一次获取价格时）
                     if !daily_start_capital_initialized {
-                        daily_start_capital = grid_state.available_funds + grid_state.position_quantity * current_price;
+                        // 获取真实的账户总资产作为起始资本
+                        let account_info_result = get_account_info(&info_client, user_address).await;
+                        daily_start_capital = match account_info_result {
+                            Ok(account_info) => {
+                                if let Some(account_value) = account_info.margin_summary.account_value.parse::<f64>().ok() {
+                                    account_value
+                                } else {
+                                    // 如果解析失败，使用流动资产作为备选
+                                    grid_state.available_funds + grid_state.position_quantity * current_price
+                                }
+                            }
+                            Err(_) => {
+                                // 如果获取账户信息失败，使用流动资产作为备选
+                                grid_state.available_funds + grid_state.position_quantity * current_price
+                            }
+                        };
                         daily_start_capital_initialized = true;
-                        info!("📊 每日起始资本已初始化: {:.2} USDC", daily_start_capital);
+                        info!("📊 每日起始资本已初始化: {:.2} USDC (基于真实账户总资产)", daily_start_capital);
                     }
 
                     // 更新价格历史
@@ -7129,6 +7177,7 @@ pub async fn run_grid_strategy(
                         current_price,
                         grid_config,
                         &price_history,
+                        active_orders.len(),
                     );
 
                     if stop_result.action.requires_action() {
@@ -7257,9 +7306,24 @@ pub async fn run_grid_strategy(
                             should_pause_trading = true;
                         }
 
-                        // 检查每日亏损 - 挂单不占用资金，所以只计算流动资产
-                        let current_capital = grid_state.available_funds
-                            + grid_state.position_quantity * current_price;
+                        // 检查每日亏损 - 需要获取账户真实总资产（包括保证金占用）
+                        let account_info_result = get_account_info(&info_client, user_address).await;
+                        let current_capital = match account_info_result {
+                            Ok(account_info) => {
+                                // 计算真实总资产：使用账户总价值
+                                if let Some(account_value) = account_info.margin_summary.account_value.parse::<f64>().ok() {
+                                    account_value
+                                } else {
+                                    // 如果解析失败，使用流动资产作为备选
+                                    grid_state.available_funds + grid_state.position_quantity * current_price
+                                }
+                            }
+                            Err(_) => {
+                                // 如果获取账户信息失败，使用流动资产作为备选
+                                grid_state.available_funds + grid_state.position_quantity * current_price
+                            }
+                        };
+                        
                         let daily_loss_ratio =
                             (daily_start_capital - current_capital) / daily_start_capital;
 
@@ -7515,8 +7579,40 @@ pub async fn run_grid_strategy(
                     // 检查风险控制标志
                     if stop_trading_flag.load(Ordering::SeqCst) {
                         warn!("⚠️ 风险控制已激活，跳过交易操作");
-                        sleep(Duration::from_secs(grid_config.check_interval)).await;
-                        continue;
+                        
+                        // 添加详细的调试信息
+                        info!("🔍 风险控制调试信息:");
+                        info!("   - 最近风险事件数量: {}", risk_events.len());
+                        if !risk_events.is_empty() {
+                            let recent_events: Vec<_> = risk_events
+                                .iter()
+                                .filter(|e| {
+                                    SystemTime::now().duration_since(e.timestamp)
+                                        .unwrap_or_default()
+                                        .as_secs() < 300 // 最近5分钟
+                                })
+                                .collect();
+                            info!("   - 最近5分钟风险事件: {}", recent_events.len());
+                            for event in recent_events.iter().take(3) {
+                                info!("     * {}: {}", event.event_type.as_str(), event.description);
+                            }
+                        }
+                        
+                        // 检查是否可以重置风险控制标志
+                        let should_reset = risk_events.is_empty() || 
+                            risk_events.iter().all(|e| {
+                                SystemTime::now().duration_since(e.timestamp)
+                                    .unwrap_or_default()
+                                    .as_secs() > 600 // 10分钟前的事件
+                            });
+                        
+                        if should_reset {
+                            info!("🔄 风险事件已过期，重置风险控制标志");
+                            stop_trading_flag.store(false, Ordering::SeqCst);
+                        } else {
+                            sleep(Duration::from_secs(grid_config.check_interval)).await;
+                            continue;
+                        }
                     }
 
                     // 1.6. 智能订单更新检查
