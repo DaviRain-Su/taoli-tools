@@ -74,11 +74,53 @@ struct GridState {
     historical_volatility: f64,
 }
 
+// 市场趋势枚举
+#[derive(Debug, Clone, PartialEq)]
+enum MarketTrend {
+    Upward,    // 上升
+    Downward,  // 下降
+    Sideways,  // 震荡
+}
+
+impl MarketTrend {
+    fn as_str(&self) -> &'static str {
+        match self {
+            MarketTrend::Upward => "上升",
+            MarketTrend::Downward => "下降",
+            MarketTrend::Sideways => "震荡",
+        }
+    }
+    
+    /// 获取趋势的英文名称
+    fn as_english(&self) -> &'static str {
+        match self {
+            MarketTrend::Upward => "Upward",
+            MarketTrend::Downward => "Downward", 
+            MarketTrend::Sideways => "Sideways",
+        }
+    }
+    
+    /// 判断是否为上升趋势
+    fn is_bullish(&self) -> bool {
+        matches!(self, MarketTrend::Upward)
+    }
+    
+    /// 判断是否为下降趋势
+    fn is_bearish(&self) -> bool {
+        matches!(self, MarketTrend::Downward)
+    }
+    
+    /// 判断是否为震荡趋势
+    fn is_sideways(&self) -> bool {
+        matches!(self, MarketTrend::Sideways)
+    }
+}
+
 // 市场分析结果
 #[derive(Debug, Clone)]
 struct MarketAnalysis {
     volatility: f64,
-    trend: String, // "上升", "下降", "震荡"
+    trend: MarketTrend,
     rsi: f64,
     short_ma: f64,
     long_ma: f64,
@@ -200,7 +242,7 @@ fn analyze_market_trend(price_history: &[f64]) -> MarketAnalysis {
     if price_history.len() < 25 {
         return MarketAnalysis {
             volatility: 0.0,
-            trend: "震荡".to_string(),
+            trend: MarketTrend::Sideways,
             rsi: 50.0,
             short_ma: price_history.last().copied().unwrap_or(0.0),
             long_ma: price_history.last().copied().unwrap_or(0.0),
@@ -224,11 +266,11 @@ fn analyze_market_trend(price_history: &[f64]) -> MarketAnalysis {
     
     // 判断趋势
     let trend = if short_ma > long_ma * 1.05 && rsi > 55.0 {
-        "上升".to_string()
+        MarketTrend::Upward
     } else if short_ma < long_ma * 0.95 && rsi < 45.0 {
-        "下降".to_string()
+        MarketTrend::Downward
     } else {
-        "震荡".to_string()
+        MarketTrend::Sideways
     };
     
     MarketAnalysis {
@@ -1099,7 +1141,7 @@ async fn rebalance_grid(
     let market_analysis = analyze_market_trend(price_history);
     
     info!("📊 市场分析 - 波动率: {:.4}, 趋势: {}, RSI: {:.2}", 
-        market_analysis.volatility, market_analysis.trend, market_analysis.rsi);
+        market_analysis.volatility, market_analysis.trend.as_str(), market_analysis.rsi);
     
     // 更新历史波动率（使用移动平均方式平滑更新）
     if grid_state.historical_volatility == 0.0 {
@@ -1127,26 +1169,25 @@ async fn rebalance_grid(
     let mut adjusted_fund_allocation = calculate_dynamic_fund_allocation(grid_state, current_price, grid_config);
     
     // 根据趋势调整网格策略
-    match market_analysis.trend.as_str() {
-        "上升" => {
+    match market_analysis.trend {
+        MarketTrend::Upward => {
             // 上升趋势：增加买单密度，减少卖单密度
             adjusted_fund_allocation.buy_spacing_adjustment *= 0.8 * risk_adjustment;
             adjusted_fund_allocation.sell_spacing_adjustment *= 1.2;
             info!("📈 检测到上升趋势，调整买单密度");
         }
-        "下降" => {
+        MarketTrend::Downward => {
             // 下降趋势：减少买单密度，增加卖单密度
             adjusted_fund_allocation.buy_spacing_adjustment *= 1.2;
             adjusted_fund_allocation.sell_spacing_adjustment *= 0.8 * risk_adjustment;
             info!("📉 检测到下降趋势，调整卖单密度");
         }
-        "震荡" => {
+        MarketTrend::Sideways => {
             // 震荡趋势：保持均衡的网格密度，应用风险调整
             adjusted_fund_allocation.buy_spacing_adjustment *= risk_adjustment;
             adjusted_fund_allocation.sell_spacing_adjustment *= risk_adjustment;
             info!("📊 检测到震荡趋势，保持均衡网格");
         }
-        _ => {}
     }
     
     // 使用 RSI 指标调整交易激进程度
