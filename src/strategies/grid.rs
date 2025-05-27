@@ -523,6 +523,71 @@ enum MarketTrend {
     Sideways, // 震荡
 }
 
+// 市场状态枚举
+#[derive(Debug, Clone, PartialEq)]
+enum MarketState {
+    Normal,         // 正常市场
+    HighVolatility, // 高波动市场
+    Extreme,        // 极端市场状况
+    ThinLiquidity,  // 流动性不足
+    Flash,          // 闪崩/闪涨
+    Consolidation,  // 盘整状态
+}
+
+impl MarketState {
+    fn as_str(&self) -> &'static str {
+        match self {
+            MarketState::Normal => "正常市场",
+            MarketState::HighVolatility => "高波动市场",
+            MarketState::Extreme => "极端市场状况",
+            MarketState::ThinLiquidity => "流动性不足",
+            MarketState::Flash => "闪崩/闪涨",
+            MarketState::Consolidation => "盘整状态",
+        }
+    }
+
+    fn as_english(&self) -> &'static str {
+        match self {
+            MarketState::Normal => "Normal",
+            MarketState::HighVolatility => "High Volatility",
+            MarketState::Extreme => "Extreme",
+            MarketState::ThinLiquidity => "Thin Liquidity",
+            MarketState::Flash => "Flash Move",
+            MarketState::Consolidation => "Consolidation",
+        }
+    }
+
+    fn risk_level(&self) -> u8 {
+        match self {
+            MarketState::Normal => 1,
+            MarketState::Consolidation => 1,
+            MarketState::HighVolatility => 3,
+            MarketState::ThinLiquidity => 4,
+            MarketState::Extreme => 5,
+            MarketState::Flash => 5,
+        }
+    }
+
+    fn requires_conservative_strategy(&self) -> bool {
+        matches!(self, MarketState::Extreme | MarketState::Flash | MarketState::ThinLiquidity)
+    }
+
+    fn should_pause_trading(&self) -> bool {
+        matches!(self, MarketState::Extreme | MarketState::Flash)
+    }
+
+    fn grid_reduction_factor(&self) -> f64 {
+        match self {
+            MarketState::Normal => 1.0,
+            MarketState::Consolidation => 1.0,
+            MarketState::HighVolatility => 0.8,
+            MarketState::ThinLiquidity => 0.6,
+            MarketState::Extreme => 0.4,
+            MarketState::Flash => 0.2,
+        }
+    }
+}
+
 impl MarketTrend {
     fn as_str(&self) -> &'static str {
         match self {
@@ -566,6 +631,10 @@ struct MarketAnalysis {
     short_ma: f64,
     long_ma: f64,
     price_change_5min: f64, // 5分钟价格变化率
+    market_state: MarketState, // 市场状态
+    liquidity_score: f64,   // 流动性评分 (0-100)
+    price_stability: f64,   // 价格稳定性 (0-100)
+    volume_anomaly: f64,    // 成交量异常度 (0-100)
 }
 
 // 动态资金分配结果
@@ -726,6 +795,97 @@ fn calculate_rsi(prices: &[f64], period: usize) -> f64 {
     100.0 - (100.0 / (1.0 + rs))
 }
 
+// 检测市场状态
+fn detect_market_state(
+    price_history: &[f64], 
+    volatility: f64,
+    price_change_5min: f64,
+    rsi: f64,
+) -> (MarketState, f64, f64, f64) {
+    let mut liquidity_score = 100.0;
+    let mut price_stability = 100.0;
+    let mut volume_anomaly = 0.0;
+    
+    // 1. 基于波动率判断
+    let volatility_state = if volatility > 0.08 {
+        // 极端波动 (日波动率 > 8%)
+        price_stability = 10.0;
+        volume_anomaly = 80.0;
+        MarketState::Extreme
+    } else if volatility > 0.05 {
+        // 高波动 (日波动率 > 5%)
+        price_stability = 30.0;
+        volume_anomaly = 60.0;
+        MarketState::HighVolatility
+    } else if volatility > 0.03 {
+        // 中等波动 (日波动率 > 3%)
+        price_stability = 60.0;
+        volume_anomaly = 30.0;
+        MarketState::HighVolatility
+    } else if volatility < 0.005 {
+        // 极低波动，可能是盘整
+        price_stability = 95.0;
+        MarketState::Consolidation
+    } else {
+        // 正常波动
+        price_stability = 80.0;
+        MarketState::Normal
+    };
+    
+    // 2. 基于短期价格变化判断闪崩/闪涨
+    let flash_threshold = 0.05; // 5分钟内5%的变化
+    if price_change_5min.abs() > flash_threshold {
+        price_stability = 5.0;
+        volume_anomaly = 95.0;
+        liquidity_score = 20.0;
+        return (MarketState::Flash, liquidity_score, price_stability, volume_anomaly);
+    }
+    
+    // 3. 基于RSI判断极端状态
+    if rsi > 85.0 || rsi < 15.0 {
+        // RSI极端值，可能是超买超卖
+        price_stability = (price_stability * 0.7_f64).max(20.0_f64);
+        volume_anomaly = (volume_anomaly + 20.0_f64).min(100.0_f64);
+        
+        if volatility > 0.05 {
+            return (MarketState::Extreme, liquidity_score, price_stability, volume_anomaly);
+        }
+    }
+    
+    // 4. 流动性评估
+    if price_history.len() >= 10 {
+        let recent_prices = &price_history[price_history.len()-10..];
+        let price_gaps: Vec<f64> = recent_prices.windows(2)
+            .map(|w| (w[1] / w[0] - 1.0).abs())
+            .collect();
+        
+        let avg_gap = price_gaps.iter().sum::<f64>() / price_gaps.len() as f64;
+        let max_gap = price_gaps.iter().fold(0.0_f64, |a, &b| a.max(b));
+        
+        // 如果价格跳跃过大，可能是流动性不足
+        if max_gap > 0.02 || avg_gap > 0.005 {
+            liquidity_score = f64::max(100.0 - max_gap * 2000.0, 10.0);
+            if liquidity_score < 40.0 {
+                return (MarketState::ThinLiquidity, liquidity_score, price_stability, volume_anomaly);
+            }
+        }
+    }
+    
+    // 5. 综合判断
+    let final_state = match volatility_state {
+        MarketState::Extreme => {
+            if liquidity_score < 50.0 {
+                MarketState::Extreme
+            } else {
+                MarketState::HighVolatility
+            }
+        }
+        other => other,
+    };
+    
+    (final_state, liquidity_score, price_stability, volume_anomaly)
+}
+
 // 分析市场趋势
 fn analyze_market_trend(price_history: &[f64]) -> MarketAnalysis {
     if price_history.len() < 25 {
@@ -736,6 +896,10 @@ fn analyze_market_trend(price_history: &[f64]) -> MarketAnalysis {
             short_ma: price_history.last().copied().unwrap_or(0.0),
             long_ma: price_history.last().copied().unwrap_or(0.0),
             price_change_5min: 0.0,
+            market_state: MarketState::Normal,
+            liquidity_score: 100.0,
+            price_stability: 100.0,
+            volume_anomaly: 0.0,
         };
     }
 
@@ -762,6 +926,10 @@ fn analyze_market_trend(price_history: &[f64]) -> MarketAnalysis {
         MarketTrend::Sideways
     };
 
+    // 检测市场状态
+    let (market_state, liquidity_score, price_stability, volume_anomaly) = 
+        detect_market_state(price_history, volatility, price_change_5min, rsi);
+
     MarketAnalysis {
         volatility,
         trend,
@@ -769,6 +937,10 @@ fn analyze_market_trend(price_history: &[f64]) -> MarketAnalysis {
         short_ma,
         long_ma,
         price_change_5min,
+        market_state,
+        liquidity_score,
+        price_stability,
+        volume_anomaly,
     }
 }
 
@@ -1946,6 +2118,25 @@ async fn create_dynamic_grid(
 ) -> Result<(), GridStrategyError> {
     info!("🔄 开始创建动态网格...");
 
+    // 分析市场状态
+    let market_analysis = analyze_market_trend(price_history);
+    
+    info!(
+        "📊 市场状态检测 - 状态: {}, 风险等级: {}, 流动性: {:.1}, 稳定性: {:.1}",
+        market_analysis.market_state.as_str(),
+        market_analysis.market_state.risk_level(),
+        market_analysis.liquidity_score,
+        market_analysis.price_stability
+    );
+
+    // 检查是否应暂停交易
+    if market_analysis.market_state.should_pause_trading() {
+        warn!("🚨 市场状态异常，暂停网格交易: {} ({})", 
+              market_analysis.market_state.as_str(),
+              market_analysis.market_state.as_english());
+        return Ok(());
+    }
+
     // 获取动态资金分配
     let mut fund_allocation =
         calculate_dynamic_fund_allocation(grid_state, current_price, grid_config);
@@ -1967,6 +2158,21 @@ async fn create_dynamic_grid(
     fund_allocation.buy_spacing_adjustment *= amplitude_adjustment;
     fund_allocation.sell_spacing_adjustment *= amplitude_adjustment;
 
+    // 基于市场状态调整网格策略
+    let grid_reduction = market_analysis.market_state.grid_reduction_factor();
+    let adjusted_grid_count = (grid_config.grid_count as f64 * grid_reduction) as u32;
+    
+    if market_analysis.market_state.requires_conservative_strategy() {
+        // 保守策略：减少资金使用，增加间距
+        fund_allocation.buy_spacing_adjustment *= 1.2;
+        fund_allocation.sell_spacing_adjustment *= 1.2;
+        fund_allocation.buy_order_funds *= 0.8;
+        fund_allocation.sell_order_funds *= 0.8;
+        
+        warn!("⚠️ 启用保守策略 - 网格缩减: {:.0}%, 间距增加: 20%", 
+              (1.0 - grid_reduction) * 100.0);
+    }
+
     info!(
         "💰 资金分配 - 买单资金: {:.2}, 卖单资金: {:.2}, 持仓比例: {:.2}%, 振幅调整: {:.2}",
         fund_allocation.buy_order_funds,
@@ -1987,7 +2193,7 @@ async fn create_dynamic_grid(
 
     while current_buy_price > current_price * 0.8
         && allocated_buy_funds < max_buy_funds
-        && buy_count < grid_config.grid_count
+        && buy_count < adjusted_grid_count
     {
         // 动态计算网格间距，使用优化后的参数和振幅调整
         let dynamic_spacing = grid_state.dynamic_params.current_min_spacing
@@ -2225,7 +2431,7 @@ async fn create_dynamic_grid(
 
     while current_sell_price < current_price * 1.2
         && allocated_sell_quantity < max_sell_quantity
-        && sell_count < grid_config.grid_count
+        && sell_count < adjusted_grid_count
     {
         // 动态计算网格间距，使用优化后的参数和振幅调整
         let dynamic_spacing = grid_state.dynamic_params.current_min_spacing
