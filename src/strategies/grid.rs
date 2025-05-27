@@ -6,7 +6,7 @@ use hyperliquid_rust_sdk::{
 use log::{error, info, warn};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::mpsc::unbounded_channel;
@@ -700,6 +700,550 @@ struct StopLossResult {
     action: StopLossAction,
     reason: String,
     stop_quantity: f64,
+}
+
+// ===== 增强风险控制模块 =====
+
+/// 风险事件类型
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+enum RiskEventType {
+    MarginInsufficient,    // 保证金不足
+    MaxDrawdownExceeded,   // 最大回撤超限
+    DailyLossExceeded,     // 每日亏损超限
+    PositionSizeExceeded,  // 持仓规模超限
+    VolatilitySpike,       // 波动率激增
+    LiquidityDrop,         // 流动性下降
+    NetworkIssue,          // 网络问题
+    OrderFailure,          // 订单失败
+    PriceGap,              // 价格跳空
+    SystemOverload,        // 系统过载
+}
+
+impl RiskEventType {
+    fn as_str(&self) -> &'static str {
+        match self {
+            RiskEventType::MarginInsufficient => "保证金不足",
+            RiskEventType::MaxDrawdownExceeded => "最大回撤超限",
+            RiskEventType::DailyLossExceeded => "每日亏损超限",
+            RiskEventType::PositionSizeExceeded => "持仓规模超限",
+            RiskEventType::VolatilitySpike => "波动率激增",
+            RiskEventType::LiquidityDrop => "流动性下降",
+            RiskEventType::NetworkIssue => "网络问题",
+            RiskEventType::OrderFailure => "订单失败",
+            RiskEventType::PriceGap => "价格跳空",
+            RiskEventType::SystemOverload => "系统过载",
+        }
+    }
+
+    fn as_english(&self) -> &'static str {
+        match self {
+            RiskEventType::MarginInsufficient => "Margin Insufficient",
+            RiskEventType::MaxDrawdownExceeded => "Max Drawdown Exceeded",
+            RiskEventType::DailyLossExceeded => "Daily Loss Exceeded",
+            RiskEventType::PositionSizeExceeded => "Position Size Exceeded",
+            RiskEventType::VolatilitySpike => "Volatility Spike",
+            RiskEventType::LiquidityDrop => "Liquidity Drop",
+            RiskEventType::NetworkIssue => "Network Issue",
+            RiskEventType::OrderFailure => "Order Failure",
+            RiskEventType::PriceGap => "Price Gap",
+            RiskEventType::SystemOverload => "System Overload",
+        }
+    }
+
+    fn severity_level(&self) -> u8 {
+        match self {
+            RiskEventType::MarginInsufficient => 5,    // 最高风险
+            RiskEventType::MaxDrawdownExceeded => 5,   // 最高风险
+            RiskEventType::DailyLossExceeded => 4,     // 高风险
+            RiskEventType::PositionSizeExceeded => 4,  // 高风险
+            RiskEventType::VolatilitySpike => 3,       // 中等风险
+            RiskEventType::LiquidityDrop => 3,         // 中等风险
+            RiskEventType::PriceGap => 3,              // 中等风险
+            RiskEventType::NetworkIssue => 2,          // 低风险
+            RiskEventType::OrderFailure => 2,          // 低风险
+            RiskEventType::SystemOverload => 2,        // 低风险
+        }
+    }
+
+    fn requires_immediate_action(&self) -> bool {
+        self.severity_level() >= 4
+    }
+
+    fn should_pause_trading(&self) -> bool {
+        matches!(
+            self,
+            RiskEventType::MarginInsufficient
+                | RiskEventType::MaxDrawdownExceeded
+                | RiskEventType::DailyLossExceeded
+                | RiskEventType::VolatilitySpike
+        )
+    }
+}
+
+/// 风险事件
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct RiskEvent {
+    event_type: RiskEventType,
+    #[serde(with = "system_time_serde")]
+    timestamp: SystemTime,
+    description: String,
+    current_value: f64,
+    threshold_value: f64,
+    severity: u8,
+    handled: bool,
+    action_taken: Option<String>,
+}
+
+impl RiskEvent {
+    fn new(
+        event_type: RiskEventType,
+        description: String,
+        current_value: f64,
+        threshold_value: f64,
+    ) -> Self {
+        Self {
+            severity: event_type.severity_level(),
+            event_type,
+            timestamp: SystemTime::now(),
+            description,
+            current_value,
+            threshold_value,
+            handled: false,
+            action_taken: None,
+        }
+    }
+
+    fn mark_handled(&mut self, action: String) {
+        self.handled = true;
+        self.action_taken = Some(action);
+    }
+
+    fn is_critical(&self) -> bool {
+        self.severity >= 4
+    }
+
+    fn age_seconds(&self) -> u64 {
+        SystemTime::now()
+            .duration_since(self.timestamp)
+            .unwrap_or_default()
+            .as_secs()
+    }
+}
+
+/// 风险检查结果
+#[derive(Debug, Clone)]
+struct RiskCheckResult {
+    overall_risk_level: u8,        // 1-5级风险等级
+    should_pause_trading: bool,    // 是否应暂停交易
+    should_reduce_position: bool,  // 是否应减仓
+    should_emergency_exit: bool,   // 是否应紧急退出
+    new_events: Vec<RiskEvent>,    // 新发现的风险事件
+    recommendations: Vec<String>,  // 风险控制建议
+    margin_ratio: f64,             // 当前保证金率
+    drawdown_ratio: f64,           // 当前回撤率
+    daily_loss_ratio: f64,         // 当前日亏损率
+    position_risk_score: f64,      // 持仓风险评分 (0-100)
+}
+
+impl RiskCheckResult {
+    fn new() -> Self {
+        Self {
+            overall_risk_level: 1,
+            should_pause_trading: false,
+            should_reduce_position: false,
+            should_emergency_exit: false,
+            new_events: Vec::new(),
+            recommendations: Vec::new(),
+            margin_ratio: 100.0,
+            drawdown_ratio: 0.0,
+            daily_loss_ratio: 0.0,
+            position_risk_score: 0.0,
+        }
+    }
+
+    fn add_event(&mut self, event: RiskEvent) {
+        if event.is_critical() {
+            self.overall_risk_level = self.overall_risk_level.max(event.severity);
+        }
+        
+        if event.event_type.should_pause_trading() {
+            self.should_pause_trading = true;
+        }
+        
+        if event.event_type.requires_immediate_action() {
+            self.should_reduce_position = true;
+        }
+        
+        if event.severity >= 5 {
+            self.should_emergency_exit = true;
+        }
+        
+        self.new_events.push(event);
+    }
+
+    fn add_recommendation(&mut self, recommendation: String) {
+        self.recommendations.push(recommendation);
+    }
+
+    fn has_critical_events(&self) -> bool {
+        self.new_events.iter().any(|e| e.is_critical())
+    }
+}
+
+/// 增强风险控制模块
+#[derive(Debug)]
+struct RiskControlModule {
+    grid_state: Arc<Mutex<GridState>>,
+    grid_config: Arc<crate::config::GridConfig>,
+    stop_trading: Arc<AtomicBool>,
+    risk_events: Vec<RiskEvent>,
+    last_check_time: SystemTime,
+    check_interval: Duration,
+    daily_start_capital: f64,
+    daily_start_time: SystemTime,
+    consecutive_failures: u32,
+    last_margin_ratio: f64,
+    risk_metrics_history: Vec<(SystemTime, f64, f64, f64)>, // (时间, 保证金率, 回撤率, 日亏损率)
+}
+
+impl RiskControlModule {
+    /// 创建新的风险控制模块
+    fn new(
+        grid_state: Arc<Mutex<GridState>>,
+        grid_config: Arc<crate::config::GridConfig>,
+        stop_trading: Arc<AtomicBool>,
+    ) -> Self {
+        let daily_start_capital = {
+            let state = grid_state.lock().unwrap();
+            state.total_capital
+        };
+
+        Self {
+            grid_state,
+            grid_config,
+            stop_trading,
+            risk_events: Vec::new(),
+            last_check_time: SystemTime::now(),
+            check_interval: Duration::from_secs(30), // 30秒检查一次
+            daily_start_capital,
+            daily_start_time: SystemTime::now(),
+            consecutive_failures: 0,
+            last_margin_ratio: 100.0,
+            risk_metrics_history: Vec::new(),
+        }
+    }
+
+    /// 运行风险检查
+    async fn run_checks(
+        &mut self,
+        current_price: f64,
+        price_history: &[f64],
+        info_client: &InfoClient,
+        user_address: ethers::types::Address,
+    ) -> Result<RiskCheckResult, GridStrategyError> {
+        let now = SystemTime::now();
+        
+        // 检查是否到了检查时间
+        if now.duration_since(self.last_check_time).unwrap_or_default() < self.check_interval {
+            return Ok(RiskCheckResult::new());
+        }
+        
+        self.last_check_time = now;
+        
+        let mut result = RiskCheckResult::new();
+        
+        // 获取当前状态
+        let (current_capital, position_quantity, realized_profit, max_drawdown) = {
+            let state = self.grid_state.lock().unwrap();
+            (
+                state.available_funds + state.position_quantity * current_price,
+                state.position_quantity,
+                state.realized_profit,
+                state.current_metrics.max_drawdown,
+            )
+        };
+        
+        // 1. 检查保证金率
+        match self.check_margin_ratio(info_client, user_address).await {
+            Ok(margin_ratio) => {
+                result.margin_ratio = margin_ratio;
+                self.last_margin_ratio = margin_ratio;
+                
+                if margin_ratio < self.grid_config.margin_safety_threshold {
+                    let event = RiskEvent::new(
+                        RiskEventType::MarginInsufficient,
+                        format!("保证金率({:.1}%)低于安全阈值({:.1}%)", 
+                            margin_ratio * 100.0, 
+                            self.grid_config.margin_safety_threshold * 100.0),
+                        margin_ratio,
+                        self.grid_config.margin_safety_threshold,
+                    );
+                    result.add_event(event);
+                }
+            }
+            Err(e) => {
+                warn!("⚠️ 保证金率检查失败: {:?}", e);
+                self.consecutive_failures += 1;
+                
+                if self.consecutive_failures >= 3 {
+                    let event = RiskEvent::new(
+                        RiskEventType::NetworkIssue,
+                        format!("连续{}次保证金检查失败", self.consecutive_failures),
+                        self.consecutive_failures as f64,
+                        3.0,
+                    );
+                    result.add_event(event);
+                }
+            }
+        }
+        
+        // 2. 检查最大回撤
+        result.drawdown_ratio = max_drawdown;
+        if max_drawdown > self.grid_config.max_drawdown {
+            let event = RiskEvent::new(
+                RiskEventType::MaxDrawdownExceeded,
+                format!("最大回撤({:.2}%)超过限制({:.2}%)", 
+                    max_drawdown * 100.0, 
+                    self.grid_config.max_drawdown * 100.0),
+                max_drawdown,
+                self.grid_config.max_drawdown,
+            );
+            result.add_event(event);
+        }
+        
+        // 3. 检查每日亏损
+        let daily_loss_ratio = (self.daily_start_capital - current_capital) / self.daily_start_capital;
+        result.daily_loss_ratio = daily_loss_ratio;
+        
+        if daily_loss_ratio > self.grid_config.max_daily_loss {
+            let event = RiskEvent::new(
+                RiskEventType::DailyLossExceeded,
+                format!("每日亏损({:.2}%)超过限制({:.2}%)", 
+                    daily_loss_ratio * 100.0, 
+                    self.grid_config.max_daily_loss * 100.0),
+                daily_loss_ratio,
+                self.grid_config.max_daily_loss,
+            );
+            result.add_event(event);
+        }
+        
+        // 4. 检查持仓规模
+        let position_value = position_quantity.abs() * current_price;
+        let position_ratio = position_value / current_capital;
+        result.position_risk_score = position_ratio * 100.0;
+        
+        if position_value > self.grid_config.max_position {
+            let event = RiskEvent::new(
+                RiskEventType::PositionSizeExceeded,
+                format!("持仓价值({:.2})超过最大限制({:.2})", 
+                    position_value, 
+                    self.grid_config.max_position),
+                position_value,
+                self.grid_config.max_position,
+            );
+            result.add_event(event);
+        }
+        
+        // 5. 检查市场波动率
+        if price_history.len() >= 10 {
+            let volatility = calculate_market_volatility(price_history);
+            if volatility > 0.15 { // 15%的波动率阈值
+                let event = RiskEvent::new(
+                    RiskEventType::VolatilitySpike,
+                    format!("市场波动率({:.2}%)异常高", volatility * 100.0),
+                    volatility,
+                    0.15,
+                );
+                result.add_event(event);
+            }
+        }
+        
+        // 6. 检查价格跳空
+        if price_history.len() >= 2 {
+            let last_price = price_history[price_history.len() - 2];
+            let price_gap = ((current_price - last_price) / last_price).abs();
+            
+            if price_gap > 0.05 { // 5%的价格跳空阈值
+                let event = RiskEvent::new(
+                    RiskEventType::PriceGap,
+                    format!("价格跳空({:.2}%)过大", price_gap * 100.0),
+                    price_gap,
+                    0.05,
+                );
+                result.add_event(event);
+            }
+        }
+        
+        // 7. 生成风险控制建议
+        self.generate_recommendations(&mut result);
+        
+        // 8. 记录风险指标历史
+        self.risk_metrics_history.push((
+            now,
+            result.margin_ratio,
+            result.drawdown_ratio,
+            result.daily_loss_ratio,
+        ));
+        
+        // 保留最近100条记录
+        if self.risk_metrics_history.len() > 100 {
+            self.risk_metrics_history.remove(0);
+        }
+        
+        // 9. 检查是否需要重置每日统计
+        if now.duration_since(self.daily_start_time).unwrap_or_default().as_secs() >= 24 * 60 * 60 {
+            self.reset_daily_stats();
+        }
+        
+        Ok(result)
+    }
+
+    /// 处理风险事件
+    async fn handle_risk_event(&mut self, mut event: RiskEvent) -> Result<(), GridStrategyError> {
+        info!("🚨 处理风险事件: {} - {}", event.event_type.as_str(), event.description);
+        
+        let action = match event.event_type {
+            RiskEventType::MarginInsufficient => {
+                self.stop_trading.store(true, Ordering::SeqCst);
+                "暂停交易，等待保证金补充".to_string()
+            }
+            RiskEventType::MaxDrawdownExceeded => {
+                self.stop_trading.store(true, Ordering::SeqCst);
+                "触发最大回撤保护，暂停交易".to_string()
+            }
+            RiskEventType::DailyLossExceeded => {
+                self.stop_trading.store(true, Ordering::SeqCst);
+                "每日亏损超限，暂停交易".to_string()
+            }
+            RiskEventType::PositionSizeExceeded => {
+                "建议减仓，降低持仓风险".to_string()
+            }
+            RiskEventType::VolatilitySpike => {
+                "市场波动加剧，建议减少网格密度".to_string()
+            }
+            RiskEventType::LiquidityDrop => {
+                "流动性下降，建议暂停新订单".to_string()
+            }
+            RiskEventType::NetworkIssue => {
+                "网络问题，增加重试机制".to_string()
+            }
+            RiskEventType::OrderFailure => {
+                "订单失败，检查订单参数".to_string()
+            }
+            RiskEventType::PriceGap => {
+                "价格跳空，暂停交易等待市场稳定".to_string()
+            }
+            RiskEventType::SystemOverload => {
+                "系统过载，降低交易频率".to_string()
+            }
+        };
+        
+        event.mark_handled(action.clone());
+        self.risk_events.push(event);
+        
+        // 保留最近50个风险事件
+        if self.risk_events.len() > 50 {
+            self.risk_events.remove(0);
+        }
+        
+        info!("✅ 风险事件处理完成: {}", action);
+        Ok(())
+    }
+
+    /// 生成风险控制建议
+    fn generate_recommendations(&self, result: &mut RiskCheckResult) {
+        if result.margin_ratio < 1.5 {
+            result.add_recommendation("保证金率过低，建议立即补充保证金或减仓".to_string());
+        } else if result.margin_ratio < 2.0 {
+            result.add_recommendation("保证金率偏低，建议适当减仓".to_string());
+        }
+        
+        if result.drawdown_ratio > 0.8 * self.grid_config.max_drawdown {
+            result.add_recommendation("回撤接近限制，建议降低风险敞口".to_string());
+        }
+        
+        if result.daily_loss_ratio > 0.8 * self.grid_config.max_daily_loss {
+            result.add_recommendation("日亏损接近限制，建议暂停交易".to_string());
+        }
+        
+        if result.position_risk_score > 80.0 {
+            result.add_recommendation("持仓风险过高，建议分批减仓".to_string());
+        }
+        
+        if self.consecutive_failures > 0 {
+            result.add_recommendation(format!("连续{}次检查失败，建议检查网络连接", self.consecutive_failures));
+        }
+    }
+
+    /// 检查保证金率
+    async fn check_margin_ratio(
+        &self,
+        info_client: &InfoClient,
+        user_address: ethers::types::Address,
+    ) -> Result<f64, GridStrategyError> {
+        match get_account_info(info_client, user_address).await {
+            Ok(account_info) => {
+                let margin_summary = &account_info.margin_summary;
+                let account_value = margin_summary.account_value.parse().unwrap_or(0.0);
+                let total_margin_used = margin_summary.total_margin_used.parse().unwrap_or(0.0);
+                
+                if total_margin_used > 0.0 {
+                    Ok(account_value / total_margin_used)
+                } else {
+                    Ok(f64::INFINITY) // 无持仓时保证金率为无穷大
+                }
+            }
+            Err(e) => {
+                // 注意：这里不能修改self，因为方法是&self
+                // consecutive_failures的增加在run_checks方法中处理
+                Err(e)
+            }
+        }
+    }
+
+    /// 重置每日统计
+    fn reset_daily_stats(&mut self) {
+        let current_capital = {
+            let state = self.grid_state.lock().unwrap();
+            state.available_funds + state.position_quantity * 0.0 // 需要当前价格
+        };
+        
+        self.daily_start_capital = current_capital;
+        self.daily_start_time = SystemTime::now();
+        self.consecutive_failures = 0;
+        
+        info!("🔄 每日风险统计已重置");
+    }
+
+    /// 获取风险事件历史
+    fn get_recent_events(&self, hours: u64) -> Vec<&RiskEvent> {
+        let cutoff_time = SystemTime::now() - Duration::from_secs(hours * 3600);
+        self.risk_events
+            .iter()
+            .filter(|event| event.timestamp > cutoff_time)
+            .collect()
+    }
+
+    /// 获取风险统计报告
+    fn get_risk_report(&self) -> String {
+        let recent_events = self.get_recent_events(24);
+        let critical_events = recent_events.iter().filter(|e| e.is_critical()).count();
+        
+        format!(
+            "=== 风险控制报告 ===\n\
+            最近24小时风险事件: {}\n\
+            其中严重事件: {}\n\
+            连续失败次数: {}\n\
+            最近保证金率: {:.2}%\n\
+            风险指标历史记录: {} 条\n\
+            ==================",
+            recent_events.len(),
+            critical_events,
+            self.consecutive_failures,
+            self.last_margin_ratio * 100.0,
+            self.risk_metrics_history.len()
+        )
+    }
 }
 
 // 格式化价格到指定精度
@@ -3207,6 +3751,25 @@ pub async fn run_grid_strategy(
             }
         };
 
+    // ===== 初始化风险控制模块 =====
+    
+    // 创建风险控制标志
+    let stop_trading_flag = Arc::new(AtomicBool::new(false));
+    
+    info!("🛡️ 风险控制模块已初始化");
+    info!("   - 检查间隔: 30秒");
+    info!("   - 保证金安全阈值: {:.1}%", grid_config.margin_safety_threshold * 100.0);
+    info!("   - 最大回撤限制: {:.1}%", grid_config.max_drawdown * 100.0);
+    info!("   - 每日最大亏损: {:.1}%", grid_config.max_daily_loss * 100.0);
+    
+    // 风险控制状态
+    let mut last_risk_check = SystemTime::now();
+    let mut risk_events: Vec<RiskEvent> = Vec::new();
+    let mut daily_start_capital = grid_state.total_capital;
+    let mut daily_start_time = SystemTime::now();
+    let mut consecutive_failures = 0u32;
+    let mut last_margin_ratio = 100.0f64;
+
     let mut last_price: Option<f64> = None;
 
     let mut last_daily_reset = SystemTime::now();
@@ -3370,6 +3933,228 @@ pub async fn run_grid_strategy(
                             error!("❌ 止损执行失败，策略退出");
                             break;
                         }
+                    }
+
+                    // 1.5. 风险控制检查
+                    let risk_check_interval = Duration::from_secs(30); // 30秒检查一次
+                    if now.duration_since(last_risk_check).unwrap_or_default() >= risk_check_interval {
+                        last_risk_check = now;
+                        
+                        // 执行风险检查
+                        let mut new_risk_events = Vec::new();
+                        let mut should_pause_trading = false;
+                        let mut should_emergency_exit = false;
+                        
+                        // 检查保证金率
+                        match check_margin_ratio(&info_client, user_address, grid_config).await {
+                            Ok(margin_ratio) => {
+                                last_margin_ratio = margin_ratio;
+                                consecutive_failures = 0; // 重置失败计数
+                                
+                                if margin_ratio < grid_config.margin_safety_threshold {
+                                    let event = RiskEvent::new(
+                                        RiskEventType::MarginInsufficient,
+                                        format!("保证金率({:.1}%)低于安全阈值({:.1}%)", 
+                                            margin_ratio * 100.0, 
+                                            grid_config.margin_safety_threshold * 100.0),
+                                        margin_ratio,
+                                        grid_config.margin_safety_threshold,
+                                    );
+                                    new_risk_events.push(event);
+                                    should_pause_trading = true;
+                                    
+                                    if margin_ratio < grid_config.margin_safety_threshold * 0.8 {
+                                        should_emergency_exit = true;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("⚠️ 保证金率检查失败: {:?}", e);
+                                consecutive_failures += 1;
+                                
+                                if consecutive_failures >= 3 {
+                                    let event = RiskEvent::new(
+                                        RiskEventType::NetworkIssue,
+                                        format!("连续{}次保证金检查失败", consecutive_failures),
+                                        consecutive_failures as f64,
+                                        3.0,
+                                    );
+                                    new_risk_events.push(event);
+                                }
+                            }
+                        }
+                        
+                        // 检查最大回撤
+                        if grid_state.current_metrics.max_drawdown > grid_config.max_drawdown {
+                            let event = RiskEvent::new(
+                                RiskEventType::MaxDrawdownExceeded,
+                                format!("最大回撤({:.2}%)超过限制({:.2}%)", 
+                                    grid_state.current_metrics.max_drawdown * 100.0, 
+                                    grid_config.max_drawdown * 100.0),
+                                grid_state.current_metrics.max_drawdown,
+                                grid_config.max_drawdown,
+                            );
+                            new_risk_events.push(event);
+                            should_pause_trading = true;
+                        }
+                        
+                        // 检查每日亏损
+                        let current_capital = grid_state.available_funds + grid_state.position_quantity * current_price;
+                        let daily_loss_ratio = (daily_start_capital - current_capital) / daily_start_capital;
+                        
+                        if daily_loss_ratio > grid_config.max_daily_loss {
+                            let event = RiskEvent::new(
+                                RiskEventType::DailyLossExceeded,
+                                format!("每日亏损({:.2}%)超过限制({:.2}%)", 
+                                    daily_loss_ratio * 100.0, 
+                                    grid_config.max_daily_loss * 100.0),
+                                daily_loss_ratio,
+                                grid_config.max_daily_loss,
+                            );
+                            new_risk_events.push(event);
+                            should_pause_trading = true;
+                        }
+                        
+                        // 检查持仓规模
+                        let position_value = grid_state.position_quantity.abs() * current_price;
+                        if position_value > grid_config.max_position {
+                            let event = RiskEvent::new(
+                                RiskEventType::PositionSizeExceeded,
+                                format!("持仓价值({:.2})超过最大限制({:.2})", 
+                                    position_value, 
+                                    grid_config.max_position),
+                                position_value,
+                                grid_config.max_position,
+                            );
+                            new_risk_events.push(event);
+                        }
+                        
+                        // 检查市场波动率
+                        if price_history.len() >= 10 {
+                            let volatility = calculate_market_volatility(&price_history);
+                            if volatility > 0.15 { // 15%的波动率阈值
+                                let event = RiskEvent::new(
+                                    RiskEventType::VolatilitySpike,
+                                    format!("市场波动率({:.2}%)异常高", volatility * 100.0),
+                                    volatility,
+                                    0.15,
+                                );
+                                new_risk_events.push(event);
+                            }
+                        }
+                        
+                        // 检查价格跳空
+                        if price_history.len() >= 2 {
+                            let last_price_val = price_history[price_history.len() - 2];
+                            let price_gap = ((current_price - last_price_val) / last_price_val).abs();
+                            
+                            if price_gap > 0.05 { // 5%的价格跳空阈值
+                                let event = RiskEvent::new(
+                                    RiskEventType::PriceGap,
+                                    format!("价格跳空({:.2}%)过大", price_gap * 100.0),
+                                    price_gap,
+                                    0.05,
+                                );
+                                new_risk_events.push(event);
+                                should_pause_trading = true;
+                            }
+                        }
+                        
+                        // 处理新的风险事件
+                        for mut event in new_risk_events {
+                            info!("🚨 检测到风险事件: {} - {}", event.event_type.as_str(), event.description);
+                            
+                            let action = match event.event_type {
+                                RiskEventType::MarginInsufficient => {
+                                    stop_trading_flag.store(true, Ordering::SeqCst);
+                                    "暂停交易，等待保证金补充".to_string()
+                                }
+                                RiskEventType::MaxDrawdownExceeded => {
+                                    stop_trading_flag.store(true, Ordering::SeqCst);
+                                    "触发最大回撤保护，暂停交易".to_string()
+                                }
+                                RiskEventType::DailyLossExceeded => {
+                                    stop_trading_flag.store(true, Ordering::SeqCst);
+                                    "每日亏损超限，暂停交易".to_string()
+                                }
+                                RiskEventType::PositionSizeExceeded => {
+                                    "建议减仓，降低持仓风险".to_string()
+                                }
+                                RiskEventType::VolatilitySpike => {
+                                    "市场波动加剧，建议减少网格密度".to_string()
+                                }
+                                RiskEventType::PriceGap => {
+                                    "价格跳空，暂停交易等待市场稳定".to_string()
+                                }
+                                _ => "风险事件已记录".to_string(),
+                            };
+                            
+                            event.mark_handled(action.clone());
+                            risk_events.push(event);
+                            
+                            info!("✅ 风险事件处理完成: {}", action);
+                        }
+                        
+                        // 保留最近50个风险事件
+                        if risk_events.len() > 50 {
+                            risk_events.drain(0..risk_events.len() - 50);
+                        }
+                        
+                        // 检查是否需要紧急退出
+                        if should_emergency_exit {
+                            error!("🚨 触发紧急风险控制，立即退出");
+                            
+                            if let Err(e) = safe_shutdown(
+                                &exchange_client,
+                                grid_config,
+                                &mut grid_state,
+                                &mut active_orders,
+                                &mut buy_orders,
+                                &mut sell_orders,
+                                current_price,
+                                ShutdownReason::EmergencyShutdown,
+                                start_time,
+                            ).await {
+                                error!("❌ 紧急退出过程中发生错误: {:?}", e);
+                            }
+                            
+                            break;
+                        }
+                        
+                        // 检查是否需要暂停交易
+                        if should_pause_trading && !stop_trading_flag.load(Ordering::SeqCst) {
+                            warn!("⚠️ 风险控制触发，暂停新的交易操作");
+                            stop_trading_flag.store(true, Ordering::SeqCst);
+                        }
+                        
+                        // 检查是否需要重置每日统计
+                        if now.duration_since(daily_start_time).unwrap_or_default().as_secs() >= 24 * 60 * 60 {
+                            daily_start_capital = current_capital;
+                            daily_start_time = now;
+                            consecutive_failures = 0;
+                            info!("🔄 每日风险统计已重置");
+                        }
+                        
+                        // 定期显示风险报告（每小时一次）
+                        if risk_events.len() > 0 && now.duration_since(daily_start_time).unwrap_or_default().as_secs() % 3600 < 30 {
+                            let recent_events: Vec<_> = risk_events.iter()
+                                .filter(|e| now.duration_since(e.timestamp).unwrap_or_default().as_secs() < 24 * 3600)
+                                .collect();
+                            let critical_events = recent_events.iter().filter(|e| e.is_critical()).count();
+                            
+                            info!("📊 风险控制报告:");
+                            info!("   - 最近24小时风险事件: {}", recent_events.len());
+                            info!("   - 其中严重事件: {}", critical_events);
+                            info!("   - 连续失败次数: {}", consecutive_failures);
+                            info!("   - 最近保证金率: {:.2}%", last_margin_ratio * 100.0);
+                        }
+                    }
+                    
+                    // 检查风险控制标志
+                    if stop_trading_flag.load(Ordering::SeqCst) {
+                        warn!("⚠️ 风险控制已激活，跳过交易操作");
+                        sleep(Duration::from_secs(grid_config.check_interval)).await;
+                        continue;
                     }
 
                     // 2. 检查是否需要重平衡（每24小时）
