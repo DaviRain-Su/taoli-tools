@@ -1899,9 +1899,9 @@ impl DynamicGridParams {
                                 params.current_max_spacing = grid_config.max_grid_spacing;
                             }
 
-                            // 修复交易金额
+                            // 修复交易金额 - 移除对total_capital的依赖
                             if params.current_trade_amount < grid_config.trade_amount * 0.1
-                                || params.current_trade_amount > grid_config.total_capital * 0.2
+                                || params.current_trade_amount > grid_config.trade_amount * 10.0
                             {
                                 warn!(
                                     "🔧 修复交易金额: {:.2} -> {:.2}",
@@ -4493,22 +4493,10 @@ impl ValidationResult {
 
 // 验证网格配置参数
 fn validate_grid_config(grid_config: &crate::config::GridConfig) -> Result<(), GridStrategyError> {
-    // 检查基本参数
-    if grid_config.total_capital <= 0.0 {
-        return Err(GridStrategyError::ConfigError(
-            "总资金必须大于0".to_string(),
-        ));
-    }
-
+    // 检查基本参数 - 移除对total_capital的依赖
     if grid_config.trade_amount <= 0.0 {
         return Err(GridStrategyError::ConfigError(
             "每格交易金额必须大于0".to_string(),
-        ));
-    }
-
-    if grid_config.trade_amount > grid_config.total_capital {
-        return Err(GridStrategyError::ConfigError(
-            "每格交易金额不能超过总资金".to_string(),
         ));
     }
 
@@ -4669,22 +4657,20 @@ fn validate_grid_config_enhanced(grid_config: &crate::config::GridConfig) -> Val
         result.add_suggestion("建议将最大网格间距设置为最小间距的2-5倍".to_string());
     }
 
-    // 3. 资金分配合理性验证
-    let max_possible_orders = (grid_config.total_capital / grid_config.trade_amount) as u32;
-    if grid_config.grid_count > max_possible_orders {
-        result.add_error(format!(
-            "网格数量({})超过资金支持的最大订单数({})",
-            grid_config.grid_count, max_possible_orders
-        ));
-    } else if grid_config.grid_count > max_possible_orders / 2 {
+    // 3. 资金分配合理性验证 - 移除对total_capital的依赖
+    // 使用简化的验证逻辑，基于网格数量和交易金额的合理性
+    if grid_config.grid_count > 50 {
         result.add_warning(format!(
             "网格数量({})较多，可能导致资金过度分散",
             grid_config.grid_count
         ));
-        result.add_suggestion(format!(
-            "建议将网格数量控制在{}以内",
-            max_possible_orders / 2
+        result.add_suggestion("建议将网格数量控制在20以内".to_string());
+    } else if grid_config.grid_count < 3 {
+        result.add_warning(format!(
+            "网格数量({})较少，可能限制策略效果",
+            grid_config.grid_count
         ));
+        result.add_suggestion("建议将网格数量设置为5-15个".to_string());
     }
 
     // 4. 风险参数一致性验证
@@ -4826,11 +4812,11 @@ fn validate_dynamic_parameters(
         ));
     }
 
-    // 3. 安全边界验证
+    // 3. 安全边界验证 - 移除对total_capital的依赖
     let min_safe_spacing = grid_config.fee_rate * 2.5;
     let max_safe_spacing = grid_config.max_grid_spacing * 2.0;
     let min_safe_amount = grid_config.trade_amount * 0.1;
-    let max_safe_amount = grid_config.total_capital * 0.2;
+    let max_safe_amount = grid_config.trade_amount * 20.0; // 使用交易金额的20倍作为上限
 
     if dynamic_params.current_min_spacing < min_safe_spacing {
         result.add_error(format!(
@@ -6700,9 +6686,18 @@ pub async fn run_grid_strategy(
         .await
         .map_err(|e| GridStrategyError::ClientError(format!("交易客户端初始化失败: {:?}", e)))?;
 
+    // ===== 获取账户真实资金 =====
+    
+    // 获取账户信息以确定真实的总资金
+    let account_info = get_account_info(&info_client, user_address).await?;
+    let real_total_capital = account_info.margin_summary.account_value.parse::<f64>()
+        .map_err(|e| GridStrategyError::PriceParseError(format!("解析账户总价值失败: {:?}", e)))?;
+    
+    let grid_config = &app_config.grid;
+    
     info!("=== 交易参数 ===");
     info!("交易资产: {}", grid_config.trading_asset);
-    info!("总资金: {}", grid_config.total_capital);
+    info!("账户真实资金: {:.2} USDT (从账户地址读取)", real_total_capital);
     info!("网格数量: {}", grid_config.grid_count);
     info!("每格交易金额: {}", grid_config.trade_amount);
     info!("最大持仓: {}", grid_config.max_position);
@@ -6760,8 +6755,8 @@ pub async fn run_grid_strategy(
                 warn!("⚠️ 状态验证失败: {:?}", e);
                 warn!("将使用默认状态重新开始");
                 GridState {
-                    total_capital: grid_config.total_capital,
-                    available_funds: grid_config.total_capital,
+                    total_capital: real_total_capital,
+                    available_funds: real_total_capital,
                     position_quantity: 0.0,
                     position_avg_price: 0.0,
                     realized_profit: 0.0,
@@ -6826,8 +6821,8 @@ pub async fn run_grid_strategy(
         None => {
             info!("📄 未找到已保存的网格状态，使用默认配置初始化");
             GridState {
-                total_capital: grid_config.total_capital,
-                available_funds: grid_config.total_capital,
+                total_capital: real_total_capital,
+                available_funds: real_total_capital,
                 position_quantity: 0.0,
                 position_avg_price: 0.0,
                 realized_profit: 0.0,
@@ -10324,11 +10319,11 @@ fn validate_loaded_state(
     let is_valid = true;
     let mut warnings = Vec::new();
 
-    // 检查总资金是否匹配
-    if (grid_state.total_capital - grid_config.total_capital).abs() > 0.01 {
+    // 检查总资金是否合理 - 移除对配置文件total_capital的依赖
+    if grid_state.total_capital <= 0.0 {
         warnings.push(format!(
-            "总资金不匹配: 状态文件={:.2}, 配置文件={:.2}",
-            grid_state.total_capital, grid_config.total_capital
+            "状态文件中的总资金无效: {:.2}",
+            grid_state.total_capital
         ));
     }
 
@@ -10344,12 +10339,12 @@ fn validate_loaded_state(
         ));
     }
 
-    // 检查交易金额是否合理
-    if grid_state.dynamic_params.current_trade_amount > grid_config.total_capital * 0.5 {
+    // 检查交易金额是否合理 - 移除对配置文件total_capital的依赖
+    if grid_state.dynamic_params.current_trade_amount > grid_state.total_capital * 0.5 {
         warnings.push(format!(
             "交易金额过大: {:.2} (总资金的{:.1}%)",
             grid_state.dynamic_params.current_trade_amount,
-            grid_state.dynamic_params.current_trade_amount / grid_config.total_capital * 100.0
+            grid_state.dynamic_params.current_trade_amount / grid_state.total_capital * 100.0
         ));
     }
 

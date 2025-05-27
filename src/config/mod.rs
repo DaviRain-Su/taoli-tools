@@ -28,12 +28,12 @@ pub struct TriangleConfig {
     pub pair3: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct GridConfig {
     // Configuration for grid trading strategy
     // 交易参数 (Trading parameters)
     pub trading_asset: String,
-    pub total_capital: f64,
+    // total_capital 已完全移除 - 现在直接从账户地址读取实际资金
     pub grid_count: u32,
     pub trade_amount: f64,
     pub max_position: f64,
