@@ -4246,96 +4246,62 @@ fn check_stop_loss(
     grid_config: &crate::config::GridConfig,
     price_history: &[f64],
     active_orders_count: usize,
+    account_total_value: Option<f64>, // 从外部传入真实的账户总价值
 ) -> StopLossResult {
-    // 1. 总资产止损 - 区分持仓亏损和手续费损失
-    // 修复：正确计算当前总资产价值
-    // 注意：available_funds可能不包含挂单预留的资金，需要使用真实的账户总资产
-    // 当前总资产 = 流动资金 + 持仓价值 + 挂单预留资金
-    let current_total_value = grid_state.available_funds + grid_state.position_quantity * current_price;
-    
-    // 计算真实的资产变化率（基于总资产对比）
-    let asset_change_rate = if grid_state.total_capital > 0.0 {
-        (current_total_value - grid_state.total_capital) / grid_state.total_capital
-    } else {
-        0.0
-    };
-
-    // 区分持仓亏损和手续费损失
-    let has_significant_position = grid_state.position_quantity.abs() > 0.001; // 持仓大于0.001才算有持仓
-    let position_value = grid_state.position_quantity * current_price;
-    let unrealized_pnl = if grid_state.position_avg_price > 0.0 && has_significant_position {
-        position_value - (grid_state.position_quantity * grid_state.position_avg_price)
-    } else {
-        0.0
-    };
-    
-    // 修复：更准确的手续费估算
-    // 手续费损失主要来自已实现的交易损失，而不是总资产减少
-    let estimated_fee_loss = if grid_state.realized_profit < 0.0 {
-        // 如果已实现利润为负，这部分主要是手续费和小额亏损
-        grid_state.realized_profit.abs()
-    } else {
-        // 如果没有持仓且资产减少，估算为合理的手续费范围
-        if !has_significant_position && asset_change_rate < 0.0 {
-            // 估算手续费：假设进行了一些交易，每笔交易手续费约0.02%
-            // 基于当前资产的0.1%作为合理的手续费估算上限
-            let reasonable_fee_estimate = grid_state.total_capital * 0.001; // 0.1%
-            let actual_loss = grid_state.total_capital - current_total_value;
-            actual_loss.min(reasonable_fee_estimate)
+    // 1. 总资产止损 - 简化逻辑，使用外部传入的真实账户总价值
+    if let Some(real_total_value) = account_total_value {
+        // 使用真实的账户总价值进行计算
+        let asset_change_rate = if grid_state.total_capital > 0.0 {
+            (real_total_value - grid_state.total_capital) / grid_state.total_capital
         } else {
             0.0
+        };
+        
+        // 只有在有显著持仓时才检查总资产止损
+        let has_significant_position = grid_state.position_quantity.abs() > 0.001;
+        
+        // 使用保守的止损阈值（配置值的2倍）
+        let conservative_drawdown_threshold = grid_config.max_drawdown * 2.0;
+        
+        if has_significant_position && asset_change_rate < -conservative_drawdown_threshold {
+            warn!(
+                "🚨 触发总资产止损 - 真实总资产: {:.2}, 初始资产: {:.2}, 亏损率: {:.2}%, 保守阈值: {:.1}% (配置: {:.1}%)",
+                real_total_value,
+                grid_state.total_capital,
+                asset_change_rate * 100.0,
+                conservative_drawdown_threshold * 100.0,
+                grid_config.max_drawdown * 100.0
+            );
+
+            return StopLossResult {
+                action: StopLossAction::FullStop,
+                reason: format!("总资产亏损{:.2}%，超过保守止损阈值{:.1}%", (-asset_change_rate) * 100.0, conservative_drawdown_threshold * 100.0),
+                stop_quantity: grid_state.position_quantity,
+            };
+        } else if has_significant_position && asset_change_rate < -grid_config.max_drawdown {
+            // 在原始阈值和保守阈值之间，给出警告但不触发止损
+            warn!(
+                "⚠️ 资产亏损警告 - 真实总资产: {:.2}, 初始资产: {:.2}, 亏损率: {:.2}%, 已超过配置阈值{:.1}%但未达到保守阈值{:.1}%",
+                real_total_value,
+                grid_state.total_capital,
+                asset_change_rate * 100.0,
+                grid_config.max_drawdown * 100.0,
+                conservative_drawdown_threshold * 100.0
+            );
+        } else if !has_significant_position {
+            // 无持仓时只记录信息，不触发止损
+            info!(
+                "📊 无持仓状态 - 真实总资产: {:.2}, 初始资产: {:.2}, 变化: {:.2} ({:.2}%), 活跃挂单: {}",
+                real_total_value,
+                grid_state.total_capital,
+                real_total_value - grid_state.total_capital,
+                asset_change_rate * 100.0,
+                active_orders_count
+            );
         }
-    };
-
-    // 只有在有显著持仓且总资产亏损超过阈值时才触发总资产止损
-    if has_significant_position && asset_change_rate < -grid_config.max_drawdown {
-        warn!(
-            "🚨 触发总资产止损 - 当前总资产: {:.2}, 初始资产: {:.2}, 总资产亏损率: {:.2}%, 持仓价值: {:.2}, 未实现盈亏: {:.2}, 最大回撤限制: {:.1}%",
-            current_total_value,
-            grid_state.total_capital,
-            asset_change_rate * 100.0,
-            position_value,
-            unrealized_pnl,
-            grid_config.max_drawdown * 100.0
-        );
-
-        return StopLossResult {
-            action: StopLossAction::FullStop,
-            reason: format!("总资产亏损{:.2}%，超过{:.1}%限制", (-asset_change_rate) * 100.0, grid_config.max_drawdown * 100.0),
-            stop_quantity: grid_state.position_quantity,
-        };
-    } else if !has_significant_position && asset_change_rate < 0.0 {
-        // 无持仓时的资产减少分析
-        let actual_loss = grid_state.total_capital - current_total_value;
-        
-        // 更准确的原因分析：考虑挂单预留资金
-        let possible_causes = if actual_loss > estimated_fee_loss * 10.0 {
-            "原因: 挂单预留资金（非真实损失）"
-        } else if actual_loss > estimated_fee_loss * 2.0 {
-            "可能原因: 挂单预留资金或账户同步延迟"
-        } else {
-            "可能原因: 交易手续费"
-        };
-        
-        info!(
-            "📊 无持仓状态 - 流动资金: {:.2}, 初始资产: {:.2}, 差额: {:.2} ({:.2}%), 活跃挂单: {}, 估算手续费: {:.2}, {}",
-            current_total_value,
-            grid_state.total_capital,
-            actual_loss,
-            (-asset_change_rate) * 100.0,
-            active_orders_count,
-            estimated_fee_loss,
-            possible_causes
-        );
-    } else if !has_significant_position && asset_change_rate >= 0.0 {
-        // 无持仓且资产增加或持平
-        info!(
-            "📊 无持仓状态 - 当前资产: {:.2}, 初始资产: {:.2}, 资产变化: {:.2} ({:.2}%), 状态: 正常",
-            current_total_value,
-            grid_state.total_capital,
-            current_total_value - grid_state.total_capital,
-            asset_change_rate * 100.0
-        );
+    } else {
+        // 如果没有传入真实账户价值，则跳过总资产止损检查
+        info!("📊 跳过总资产止损检查 - 未获取到真实账户总价值");
     }
 
     // 2. 浮动止损 (Trailing Stop) - 使用配置的浮动止损比例
@@ -7171,13 +7137,22 @@ pub async fn run_grid_strategy(
                         warn!("⚠️ 定期状态保存失败: {:?}", e);
                     }
 
-                    // 1. 止损检查
+                    // 1. 止损检查 - 获取真实账户总价值
+                    let account_total_value = match get_account_info(&info_client, user_address).await {
+                        Ok(account_info) => {
+                            // 尝试解析账户总价值
+                            account_info.margin_summary.account_value.parse::<f64>().ok()
+                        }
+                        Err(_) => None, // 如果获取失败，传入None跳过总资产止损检查
+                    };
+                    
                     let stop_result = check_stop_loss(
                         &mut grid_state,
                         current_price,
                         grid_config,
                         &price_history,
                         active_orders.len(),
+                        account_total_value,
                     );
 
                     if stop_result.action.requires_action() {
