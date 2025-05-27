@@ -4248,19 +4248,26 @@ fn check_stop_loss(
     // 1. 总资产止损 - 使用配置的最大回撤参数
     let current_total_value =
         grid_state.available_funds + grid_state.position_quantity * current_price;
-    let total_stop_threshold = grid_state.total_capital * (1.0 - grid_config.max_drawdown);
+    
+    // 计算实际亏损率，而不是使用固定阈值
+    let actual_loss_rate = if grid_state.total_capital > 0.0 {
+        (grid_state.total_capital - current_total_value) / grid_state.total_capital
+    } else {
+        0.0
+    };
 
-    if current_total_value < total_stop_threshold {
+    if actual_loss_rate > grid_config.max_drawdown {
         warn!(
-            "🚨 触发总资产止损 - 当前总资产: {:.2}, 止损阈值: {:.2}, 最大回撤: {:.1}%",
+            "🚨 触发总资产止损 - 当前总资产: {:.2}, 初始资产: {:.2}, 实际亏损率: {:.2}%, 最大回撤限制: {:.1}%",
             current_total_value,
-            total_stop_threshold,
+            grid_state.total_capital,
+            actual_loss_rate * 100.0,
             grid_config.max_drawdown * 100.0
         );
 
         return StopLossResult {
             action: StopLossAction::FullStop,
-            reason: format!("总资产亏损超过{:.1}%", grid_config.max_drawdown * 100.0),
+            reason: format!("总资产亏损{:.2}%，超过{:.1}%限制", actual_loss_rate * 100.0, grid_config.max_drawdown * 100.0),
             stop_quantity: grid_state.position_quantity,
         };
     }
