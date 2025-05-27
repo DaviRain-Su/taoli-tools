@@ -15,57 +15,12 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 // 导入错误类型
-use super::error::{GridStrategyError, RetryStrategy, ErrorStatistics};
+use super::error::{GridStrategyError};
 
-// 性能指标结构体
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct PerformanceMetrics {
-    total_trades: u32,
-    winning_trades: u32,
-    losing_trades: u32,
-    win_rate: f64,
-    total_profit: f64,
-    max_drawdown: f64,
-    sharpe_ratio: f64,
-    profit_factor: f64,
-    average_win: f64,
-    average_loss: f64,
-    largest_win: f64,
-    largest_loss: f64,
-}
+// 导入性能类型
+use super::performance::{PerformanceMetrics, PerformanceRecord, PerformanceSnapshot};
+use super::performance::system_time_serde;
 
-// 性能记录结构体
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct PerformanceRecord {
-    #[serde(with = "system_time_serde")]
-    timestamp: SystemTime,
-    price: f64,
-    action: String,
-    profit: f64,
-    total_capital: f64,
-}
-
-// SystemTime 序列化辅助模块
-mod system_time_serde {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    pub fn serialize<S>(time: &SystemTime, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let duration = time.duration_since(UNIX_EPOCH).unwrap();
-        duration.as_secs().serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<SystemTime, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let secs = u64::deserialize(deserializer)?;
-        Ok(UNIX_EPOCH + std::time::Duration::from_secs(secs))
-    }
-}
 
 /// 安全的时间差计算，处理时间倒退的情况
 fn safe_duration_since(now: SystemTime, earlier: SystemTime) -> Duration {
@@ -1757,24 +1712,6 @@ impl ShutdownReason {
     }
 }
 
-// 性能数据保存结构体
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct PerformanceSnapshot {
-    timestamp: u64,
-    total_capital: f64,
-    available_funds: f64,
-    position_quantity: f64,
-    position_avg_price: f64,
-    realized_profit: f64,
-    total_trades: u32,
-    winning_trades: u32,
-    win_rate: f64,
-    max_drawdown: f64,
-    sharpe_ratio: f64,
-    profit_factor: f64,
-    trading_duration_hours: f64,
-    final_roi: f64,
-}
 
 // 动态网格参数结构体
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -10345,22 +10282,16 @@ async fn save_performance_data(
         0.0
     };
 
-    let snapshot = PerformanceSnapshot {
-        timestamp: safe_unix_timestamp(),
-        total_capital: grid_state.total_capital,
-        available_funds: grid_state.available_funds,
-        position_quantity: grid_state.position_quantity,
-        position_avg_price: grid_state.position_avg_price,
-        realized_profit: grid_state.realized_profit,
-        total_trades: final_metrics.total_trades,
-        winning_trades: final_metrics.winning_trades,
-        win_rate: final_metrics.win_rate,
-        max_drawdown: final_metrics.max_drawdown,
-        sharpe_ratio: final_metrics.sharpe_ratio,
-        profit_factor: final_metrics.profit_factor,
-        trading_duration_hours: trading_duration.as_secs_f64() / 3600.0,
-        final_roi,
-    };
+    let snapshot = PerformanceSnapshot::from_metrics(
+        &final_metrics,
+        grid_state.total_capital,
+        grid_state.available_funds,
+        grid_state.position_quantity,
+        grid_state.position_avg_price,
+        grid_state.realized_profit,
+        trading_duration.as_secs_f64() / 3600.0,
+        grid_state.total_capital, // 使用当前总资金作为初始资金
+    );
 
     // 保存到文件
     let filename = format!(
