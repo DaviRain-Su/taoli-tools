@@ -6592,14 +6592,23 @@ fn generate_status_report(
     sell_orders: &HashMap<u64, OrderInfo>,
     grid_config: &crate::config::GridConfig,
 ) -> String {
-    let current_total_value =
+    // 计算流动资产（不包括挂单占用的资金）
+    let liquid_total_value =
         grid_state.available_funds + grid_state.position_quantity * current_price;
+    
+    // 计算挂单占用的资金
+    let pending_order_funds: f64 = buy_orders.values().map(|order| order.allocated_funds).sum::<f64>()
+        + sell_orders.values().map(|order| order.allocated_funds).sum::<f64>();
+    
+    // 计算真实总资产（包括挂单占用的资金）
+    let actual_total_value = liquid_total_value + pending_order_funds;
+    
     let position_ratio = if grid_state.total_capital > 0.0 {
         (grid_state.position_quantity * current_price) / grid_state.total_capital * 100.0
     } else {
         0.0
     };
-    let asset_change = (current_total_value / grid_state.total_capital - 1.0) * 100.0;
+    let asset_change = (actual_total_value / grid_state.total_capital - 1.0) * 100.0;
     let profit_rate = grid_state.realized_profit / grid_state.total_capital * 100.0;
 
     format!(
@@ -6613,7 +6622,9 @@ fn generate_status_report(
         持仓数量: {:.4}\n\
         持仓均价: {:.4}\n\
         持仓比例: {:.2}%\n\
-        当前总资产: {:.2}\n\
+        流动资产: {:.2}\n\
+        挂单占用资金: {:.2}\n\
+        真实总资产: {:.2}\n\
         资产变化: {:.2}%\n\
         已实现利润: {:.2}\n\
         利润率: {:.2}%\n\
@@ -6644,7 +6655,9 @@ fn generate_status_report(
         grid_state.position_quantity,
         grid_state.position_avg_price,
         position_ratio,
-        current_total_value,
+        liquid_total_value,
+        pending_order_funds,
+        actual_total_value,
         asset_change,
         grid_state.realized_profit,
         profit_rate,
@@ -7244,9 +7257,12 @@ pub async fn run_grid_strategy(
                             should_pause_trading = true;
                         }
 
-                        // 检查每日亏损
+                        // 检查每日亏损 - 需要考虑挂单占用的资金
+                        let pending_order_funds: f64 = buy_orders.values().map(|order| order.allocated_funds).sum::<f64>()
+                            + sell_orders.values().map(|order| order.allocated_funds).sum::<f64>();
                         let current_capital = grid_state.available_funds
-                            + grid_state.position_quantity * current_price;
+                            + grid_state.position_quantity * current_price
+                            + pending_order_funds; // 加上挂单占用的资金
                         let daily_loss_ratio =
                             (daily_start_capital - current_capital) / daily_start_capital;
 
