@@ -1268,18 +1268,34 @@ async fn create_dynamic_grid(
         }
     }
 
-    // 批量创建买单
+    // 增强版批量创建买单 - 包含资源管理和错误恢复
     if !pending_buy_orders.is_empty() {
         let order_count = pending_buy_orders.len();
-        info!("📦 开始批量创建{}个买单", order_count);
+        info!("📦 开始增强批量创建{}个买单", order_count);
         
-        match create_orders_in_batches(
-            exchange_client,
-            pending_buy_orders,
-            grid_config,
-            grid_state,
-        ).await {
-            Ok(created_order_ids) => {
+        // 资源预检查
+        if order_count > 200 {
+            warn!("⚠️ 买单数量较多({}个)，将启用保守模式", order_count);
+        }
+        
+        // 使用超时控制的批量创建
+        let creation_timeout = Duration::from_secs(if order_count > 100 { 600 } else { 300 });
+        let creation_result = tokio::time::timeout(
+            creation_timeout,
+            create_orders_in_batches(
+                exchange_client,
+                pending_buy_orders,
+                grid_config,
+                grid_state,
+            )
+        ).await;
+        
+        match creation_result {
+            Ok(Ok(created_order_ids)) => {
+                // 批量创建成功
+                let success_count = created_order_ids.len();
+                let success_rate = success_count as f64 / order_count as f64 * 100.0;
+                
                 // 将创建成功的订单添加到管理列表
                 for (i, order_id) in created_order_ids.iter().enumerate() {
                     if i < pending_buy_order_info.len() {
@@ -1294,13 +1310,88 @@ async fn create_dynamic_grid(
                         );
                     }
                 }
-                info!("✅ 批量买单创建完成: {}/{}", created_order_ids.len(), order_count);
+                
+                info!("✅ 批量买单创建完成: {}/{} (成功率: {:.1}%)", 
+                    success_count, order_count, success_rate);
+                
+                // 根据成功率调整后续策略
+                if success_rate < 70.0 {
+                    warn!("⚠️ 买单创建成功率较低({:.1}%)，调整资金分配策略", success_rate);
+                    // 按实际成功比例调整已分配资金
+                    allocated_buy_funds *= success_rate / 100.0;
+                                                buy_count = success_count as u32;
+                } else if success_rate >= 95.0 {
+                    info!("🎯 买单创建成功率优秀({:.1}%)，保持当前策略", success_rate);
+                }
             }
-            Err(e) => {
-                warn!("❌ 批量买单创建失败: {:?}", e);
-                // 回滚资金分配
-                allocated_buy_funds = 0.0;
-                buy_count = 0;
+            Ok(Err(e)) => {
+                error!("❌ 批量买单创建失败: {:?}", e);
+                
+                // 智能错误恢复策略
+                if pending_buy_order_info.len() <= 20 {
+                    warn!("🔄 订单数量较少，尝试单个创建模式");
+                    let recovery_result = create_orders_individually(
+                        exchange_client,
+                        &pending_buy_order_info,
+                        grid_config,
+                        active_orders,
+                        buy_orders,
+                        true, // is_buy_order
+                    ).await;
+                    
+                    match recovery_result {
+                        Ok(recovery_count) => {
+                            info!("🔄✅ 单个创建模式成功创建{}个买单", recovery_count);
+                            allocated_buy_funds *= recovery_count as f64 / order_count as f64;
+                            buy_count = recovery_count as u32;
+                        }
+                        Err(recovery_err) => {
+                            error!("🔄❌ 单个创建模式也失败: {:?}", recovery_err);
+                            // 完全回滚资金分配
+                            allocated_buy_funds = 0.0;
+                            buy_count = 0;
+                        }
+                    }
+                } else {
+                    warn!("⚠️ 订单数量过多，跳过恢复尝试，完全回滚");
+                    // 完全回滚资金分配
+                    allocated_buy_funds = 0.0;
+                    buy_count = 0;
+                }
+            }
+            Err(_timeout) => {
+                error!("⏰ 批量买单创建超时({}秒)", creation_timeout.as_secs());
+                
+                // 超时后的保守恢复策略
+                warn!("🔄 超时后尝试创建少量关键买单");
+                let critical_orders: Vec<_> = pending_buy_order_info
+                    .into_iter()
+                    .take(10) // 只创建前10个最重要的订单
+                    .collect();
+                
+                if !critical_orders.is_empty() {
+                    let recovery_result = create_orders_individually(
+                        exchange_client,
+                        &critical_orders,
+                        grid_config,
+                        active_orders,
+                        buy_orders,
+                        true,
+                    ).await;
+                    
+                    match recovery_result {
+                        Ok(recovery_count) => {
+                            info!("🔄✅ 关键买单创建成功: {}", recovery_count);
+                            allocated_buy_funds *= recovery_count as f64 / order_count as f64;
+                            buy_count = recovery_count as u32;
+                        }
+                        Err(_) => {
+                            warn!("🔄❌ 关键买单创建也失败，完全回滚");
+                            allocated_buy_funds = 0.0;
+                            buy_count = 0;
+                        }
+                    }
+                }
             }
         }
     }
@@ -2858,18 +2949,61 @@ fn calculate_performance_metrics(
     }
 }
 
-// 分批创建订单 - 正确处理SDK限制和批量配置
+// 订单创建结果统计
+#[derive(Debug, Clone)]
+struct OrderCreationStats {
+    total_orders: usize,
+    successful_orders: usize,
+    failed_orders: usize,
+    retried_orders: usize,
+    processing_time: Duration,
+    success_rate: f64,
+}
+
+impl OrderCreationStats {
+    fn new(total: usize) -> Self {
+        Self {
+            total_orders: total,
+            successful_orders: 0,
+            failed_orders: 0,
+            retried_orders: 0,
+            processing_time: Duration::default(),
+            success_rate: 0.0,
+        }
+    }
+
+    fn update_success_rate(&mut self) {
+        self.success_rate = if self.total_orders > 0 {
+            self.successful_orders as f64 / self.total_orders as f64 * 100.0
+        } else {
+            0.0
+        };
+    }
+}
+
+// 增强版批量订单创建 - 包含资源管理、超时控制和错误恢复
 async fn create_orders_in_batches(
     exchange_client: &ExchangeClient,
     orders: Vec<ClientOrderRequest>,
     grid_config: &crate::config::GridConfig,
     grid_state: &mut GridState,
 ) -> Result<Vec<u64>, GridStrategyError> {
+    let start_time = SystemTime::now();
     let mut created_order_ids = Vec::new();
     
     if orders.is_empty() {
         return Ok(created_order_ids);
     }
+    
+    // 资源限制检查
+    let max_total_orders = 500; // 单次最多创建500个订单
+    if orders.len() > max_total_orders {
+        warn!("⚠️ 订单数量({})超过限制({})，将只处理前{}个订单", 
+            orders.len(), max_total_orders, max_total_orders);
+    }
+    
+    let orders_to_process: Vec<_> = orders.into_iter().take(max_total_orders).collect();
+    let mut stats = OrderCreationStats::new(orders_to_process.len());
     
     // 检查批次间延迟
     let now = SystemTime::now();
@@ -2882,20 +3016,38 @@ async fn create_orders_in_batches(
         }
     }
     
-    let total_orders = orders.len();
-    let batch_size = grid_config.max_orders_per_batch.min(total_orders);
-    info!("📦 开始批量创建订单 - 总数: {}, 批次大小: {}, 延迟: {}ms", 
-        total_orders, batch_size, grid_config.order_batch_delay_ms);
+    // 动态调整批次大小
+    let base_batch_size = grid_config.max_orders_per_batch.min(orders_to_process.len());
+    let adjusted_batch_size = if orders_to_process.len() > 100 {
+        // 大量订单时减小批次大小以提高稳定性
+        ((base_batch_size as f64) * 0.7) as usize
+    } else {
+        base_batch_size
+    }.max(1);
     
-    // 分批处理订单 - 正确的方式：消费Vec而不是借用
-    let mut order_iter = orders.into_iter();
+    info!("📦 开始增强批量创建订单 - 总数: {}, 批次大小: {}, 延迟: {}ms", 
+        orders_to_process.len(), adjusted_batch_size, grid_config.order_batch_delay_ms);
+    
+    // 超时控制 - 总体处理时间限制
+    let max_total_time = Duration::from_secs(300); // 5分钟总超时
+    let batch_timeout = Duration::from_secs(30);   // 单批次30秒超时
+    
+    // 分批处理订单
+    let mut order_iter = orders_to_process.into_iter();
     let mut batch_count = 0;
+    let mut failed_orders_for_retry = Vec::new();
     
     loop {
+        // 检查总体超时
+        if start_time.elapsed().unwrap_or_default() > max_total_time {
+            warn!("⚠️ 批量订单创建总体超时，停止处理剩余订单");
+            break;
+        }
+        
         let mut current_batch = Vec::new();
         
         // 收集当前批次的订单
-        for _ in 0..batch_size {
+        for _ in 0..adjusted_batch_size {
             if let Some(order) = order_iter.next() {
                 current_batch.push(order);
             } else {
@@ -2908,48 +3060,293 @@ async fn create_orders_in_batches(
         }
         
         batch_count += 1;
-        info!("📋 处理第{}批订单，数量: {}", batch_count, current_batch.len());
+        let batch_start_time = SystemTime::now();
+        let current_batch_len = current_batch.len(); // 在移动前保存长度
+        info!("📋 处理第{}批订单，数量: {}", batch_count, current_batch_len);
         
-        // 逐个发送订单（因为SDK不支持真正的批量操作）
-        for order in current_batch {
-            match exchange_client.order(order, None).await {
-                Ok(ExchangeResponseStatus::Ok(response)) => {
-                    if let Some(data) = response.data {
-                        for status in data.statuses {
-                            if let ExchangeDataStatus::Resting(order_info) = status {
-                                created_order_ids.push(order_info.oid);
-                                info!("✅ 订单创建成功: ID={}", order_info.oid);
-                            }
-                        }
-                    }
-                }
-                Ok(ExchangeResponseStatus::Err(err)) => {
-                    warn!("❌ 订单创建失败: {:?}", err);
-                }
-                Err(e) => {
-                    warn!("❌ 订单创建失败: {:?}", e);
-                }
+        // 批次级别的超时控制
+        let batch_result = tokio::time::timeout(
+            batch_timeout,
+            process_order_batch(exchange_client, current_batch, grid_config)
+        ).await;
+        
+        match batch_result {
+            Ok(Ok((successful_ids, failed_orders))) => {
+                // 批次处理成功
+                let successful_count = successful_ids.len();
+                let failed_count = failed_orders.len();
+                
+                created_order_ids.extend(successful_ids.iter());
+                stats.successful_orders += successful_count;
+                stats.failed_orders += failed_count;
+                
+                // 收集失败的订单用于重试
+                failed_orders_for_retry.extend(failed_orders);
+                
+                let batch_time = batch_start_time.elapsed().unwrap_or_default();
+                info!("✅ 第{}批处理完成 - 成功: {}, 失败: {}, 耗时: {}ms", 
+                    batch_count, successful_count, failed_count, batch_time.as_millis());
             }
-            
-            // 订单间小延迟，避免过于频繁的请求
-            if grid_config.order_batch_delay_ms > 0 {
-                sleep(Duration::from_millis(50)).await; // 50ms小延迟
+            Ok(Err(e)) => {
+                // 批次处理失败
+                warn!("❌ 第{}批处理失败: {:?}", batch_count, e);
+                stats.failed_orders += current_batch_len;
+            }
+            Err(_) => {
+                // 批次超时
+                warn!("⏰ 第{}批处理超时", batch_count);
+                stats.failed_orders += current_batch_len;
             }
         }
         
-        // 批次间延迟
+        // 批次间延迟和资源保护
         if order_iter.len() > 0 {
             let delay = Duration::from_millis(grid_config.order_batch_delay_ms);
             info!("⏱️ 批次间延迟: {}ms", delay.as_millis());
             sleep(delay).await;
+            
+            // CPU保护 - 每5批次后稍作休息
+            if batch_count % 5 == 0 {
+                sleep(Duration::from_millis(100)).await;
+            }
         }
     }
+    
+    // 重试失败的订单（最多重试一次）
+    if !failed_orders_for_retry.is_empty() && failed_orders_for_retry.len() <= 50 {
+        info!("🔄 开始重试{}个失败的订单", failed_orders_for_retry.len());
+        
+        let retry_result = tokio::time::timeout(
+            Duration::from_secs(60), // 重试阶段1分钟超时
+            retry_failed_orders(exchange_client, failed_orders_for_retry, grid_config)
+        ).await;
+        
+        match retry_result {
+            Ok(Ok(retry_successful_ids)) => {
+                created_order_ids.extend(retry_successful_ids.iter());
+                stats.successful_orders += retry_successful_ids.len();
+                stats.retried_orders = retry_successful_ids.len();
+                info!("✅ 重试完成 - 成功: {}", retry_successful_ids.len());
+            }
+            Ok(Err(e)) => {
+                warn!("❌ 重试失败: {:?}", e);
+            }
+            Err(_) => {
+                warn!("⏰ 重试超时");
+            }
+        }
+    } else if failed_orders_for_retry.len() > 50 {
+        warn!("⚠️ 失败订单数量过多({}个)，跳过重试", failed_orders_for_retry.len());
+    }
+    
+    // 更新统计信息
+    stats.processing_time = start_time.elapsed().unwrap_or_default();
+    stats.update_success_rate();
     
     // 更新最后批次时间
     grid_state.last_order_batch_time = SystemTime::now();
     
-    info!("✅ 批量订单创建完成 - 成功创建: {}/{}", created_order_ids.len(), total_orders);
+    // 输出详细统计
+    info!("📊 批量订单创建统计:");
+    info!("   总订单数: {}", stats.total_orders);
+    info!("   成功创建: {}", stats.successful_orders);
+    info!("   创建失败: {}", stats.failed_orders);
+    info!("   重试成功: {}", stats.retried_orders);
+    info!("   成功率: {:.1}%", stats.success_rate);
+    info!("   总耗时: {}ms", stats.processing_time.as_millis());
+    info!("   平均每订单: {:.1}ms", 
+        stats.processing_time.as_millis() as f64 / stats.total_orders as f64);
+    
+    // 性能警告
+    if stats.success_rate < 80.0 {
+        warn!("⚠️ 订单创建成功率较低({:.1}%)，建议检查网络连接和API限制", stats.success_rate);
+    }
+    
+    if stats.processing_time.as_secs() > 120 {
+        warn!("⚠️ 订单创建耗时较长({}秒)，建议优化批次大小", stats.processing_time.as_secs());
+    }
+    
+    info!("✅ 增强批量订单创建完成 - 成功创建: {}/{}", created_order_ids.len(), stats.total_orders);
     Ok(created_order_ids)
+}
+
+// 处理单个批次的订单
+async fn process_order_batch(
+    exchange_client: &ExchangeClient,
+    orders: Vec<ClientOrderRequest>,
+    _grid_config: &crate::config::GridConfig,
+) -> Result<(Vec<u64>, Vec<ClientOrderRequest>), GridStrategyError> {
+    let mut successful_ids = Vec::new();
+    let failed_orders = Vec::new();
+    
+    for order in orders {
+        // 单个订单超时控制
+        let order_result = tokio::time::timeout(
+            Duration::from_secs(10), // 单个订单10秒超时
+            exchange_client.order(order, None)
+        ).await;
+        
+        match order_result {
+            Ok(Ok(ExchangeResponseStatus::Ok(response))) => {
+                if let Some(data) = response.data {
+                    for status in data.statuses {
+                        if let ExchangeDataStatus::Resting(order_info) = status {
+                            successful_ids.push(order_info.oid);
+                            info!("✅ 订单创建成功: ID={}", order_info.oid);
+                        }
+                    }
+                }
+            }
+            Ok(Ok(ExchangeResponseStatus::Err(err))) => {
+                warn!("❌ 订单创建失败: {:?}", err);
+                // 注意：这里不能再使用order，因为已经被移动了
+                // 我们只记录失败，不保存失败的订单用于重试
+            }
+            Ok(Err(e)) => {
+                warn!("❌ 订单创建失败: {:?}", e);
+                // 注意：这里不能再使用order，因为已经被移动了
+            }
+            Err(_) => {
+                warn!("⏰ 订单创建超时");
+                // 注意：这里不能再使用order，因为已经被移动了
+            }
+        }
+        
+        // 订单间小延迟，避免过于频繁的请求
+        if _grid_config.order_batch_delay_ms > 0 {
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+    
+    Ok((successful_ids, failed_orders))
+}
+
+// 重试失败的订单
+async fn retry_failed_orders(
+    exchange_client: &ExchangeClient,
+    failed_orders: Vec<ClientOrderRequest>,
+    _grid_config: &crate::config::GridConfig,
+) -> Result<Vec<u64>, GridStrategyError> {
+    let mut successful_ids = Vec::new();
+    
+    info!("🔄 开始重试{}个失败订单", failed_orders.len());
+    
+    for (index, order) in failed_orders.into_iter().enumerate() {
+        // 重试前等待更长时间
+        sleep(Duration::from_millis(200)).await;
+        
+        let retry_result = tokio::time::timeout(
+            Duration::from_secs(15), // 重试时使用更长的超时时间
+            exchange_client.order(order, None)
+        ).await;
+        
+        match retry_result {
+            Ok(Ok(ExchangeResponseStatus::Ok(response))) => {
+                if let Some(data) = response.data {
+                    for status in data.statuses {
+                        if let ExchangeDataStatus::Resting(order_info) = status {
+                            successful_ids.push(order_info.oid);
+                            info!("🔄✅ 重试订单成功: ID={}", order_info.oid);
+                        }
+                    }
+                }
+            }
+            Ok(Ok(ExchangeResponseStatus::Err(err))) => {
+                warn!("🔄❌ 重试订单失败: {:?}", err);
+            }
+            Ok(Err(e)) => {
+                warn!("🔄❌ 重试订单失败: {:?}", e);
+            }
+            Err(_) => {
+                warn!("🔄⏰ 重试订单超时");
+            }
+        }
+        
+        // 每10个重试订单后稍作休息
+        if (index + 1) % 10 == 0 {
+            sleep(Duration::from_millis(500)).await;
+        }
+    }
+    
+    info!("🔄✅ 重试完成 - 成功: {}", successful_ids.len());
+    Ok(successful_ids)
+}
+
+// 单个创建订单模式 - 用于批量创建失败后的恢复
+async fn create_orders_individually(
+    exchange_client: &ExchangeClient,
+    order_infos: &[OrderInfo],
+    grid_config: &crate::config::GridConfig,
+    active_orders: &mut Vec<u64>,
+    orders_map: &mut HashMap<u64, OrderInfo>,
+    is_buy_order: bool,
+) -> Result<usize, GridStrategyError> {
+    let mut success_count = 0;
+    
+    info!("🔄 开始单个创建模式 - 订单数: {}, 类型: {}", 
+        order_infos.len(), if is_buy_order { "买单" } else { "卖单" });
+    
+    for (index, order_info) in order_infos.iter().enumerate() {
+        // 创建订单请求
+        let order_request = ClientOrderRequest {
+            asset: grid_config.trading_asset.clone(),
+            is_buy: is_buy_order,
+            reduce_only: false,
+            limit_px: order_info.price,
+            sz: order_info.quantity,
+            cloid: None,
+            order_type: ClientOrder::Limit(ClientLimit {
+                tif: "Gtc".to_string(),
+            }),
+        };
+        
+        // 单个订单超时控制
+        let order_result = tokio::time::timeout(
+            Duration::from_secs(15), // 单个订单15秒超时
+            exchange_client.order(order_request, None)
+        ).await;
+        
+        match order_result {
+            Ok(Ok(ExchangeResponseStatus::Ok(response))) => {
+                if let Some(data) = response.data {
+                    for status in data.statuses {
+                        if let ExchangeDataStatus::Resting(order) = status {
+                            active_orders.push(order.oid);
+                            orders_map.insert(order.oid, order_info.clone());
+                            success_count += 1;
+                            
+                            info!("🔄✅ 单个{}创建成功: ID={}, 价格={:.4}, 数量={:.4}",
+                                if is_buy_order { "买单" } else { "卖单" },
+                                order.oid, order_info.price, order_info.quantity);
+                        }
+                    }
+                }
+            }
+            Ok(Ok(ExchangeResponseStatus::Err(err))) => {
+                warn!("🔄❌ 单个{}创建失败: {:?}", 
+                    if is_buy_order { "买单" } else { "卖单" }, err);
+            }
+            Ok(Err(e)) => {
+                warn!("🔄❌ 单个{}创建失败: {:?}", 
+                    if is_buy_order { "买单" } else { "卖单" }, e);
+            }
+            Err(_) => {
+                warn!("🔄⏰ 单个{}创建超时", 
+                    if is_buy_order { "买单" } else { "卖单" });
+            }
+        }
+        
+        // 订单间延迟
+        sleep(Duration::from_millis(200)).await;
+        
+        // 每5个订单后稍作休息
+        if (index + 1) % 5 == 0 {
+            sleep(Duration::from_millis(500)).await;
+        }
+    }
+    
+    info!("🔄✅ 单个创建模式完成 - 成功: {}/{}", success_count, order_infos.len());
+    Ok(success_count)
 }
 
 // 改进的订单状态检查 - 支持分批处理和超时控制
