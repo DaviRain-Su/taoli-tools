@@ -1,2 +1,8 @@
 /target
 config.toml
+dynamic_*
+performance_snapshot_*
+dynamic_grid_params*
+performance_snapshot_*
+grid_state*
+orders_state*
