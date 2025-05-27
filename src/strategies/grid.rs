@@ -4293,9 +4293,10 @@ fn check_stop_loss(
             stop_quantity: grid_state.position_quantity,
         };
     } else if !has_significant_position && liquid_loss_rate > 0.0 {
-        // 无持仓时的资金减少主要是手续费和挂单占用，记录但不触发止损
+        // 无持仓时的资金减少主要是手续费，不触发止损
+        // 注意：挂单不占用资金，所以这里的减少主要是手续费成本
         info!(
-            "📊 无持仓状态 - 流动资产: {:.2}, 初始资产: {:.2}, 流动资产减少: {:.2} ({:.2}%), 主要原因: 手续费损失约{:.2} + 挂单占用资金",
+            "📊 无持仓状态 - 流动资产: {:.2}, 初始资产: {:.2}, 流动资产减少: {:.2} ({:.2}%), 主要原因: 交易手续费成本约{:.2}",
             liquid_total_value,
             grid_state.total_capital,
             grid_state.total_capital - liquid_total_value,
@@ -5602,7 +5603,7 @@ async fn create_dynamic_grid(
                 quantity: buy_quantity,
                 cost_price: None,
                 potential_sell_price: Some(potential_sell_price),
-                allocated_funds: current_grid_funds,
+                allocated_funds: 0.0, // 挂单不占用资金，只有成交时才扣除
             });
 
             allocated_buy_funds += current_grid_funds;
@@ -5907,7 +5908,7 @@ async fn create_dynamic_grid(
                 quantity: formatted_quantity,
                 cost_price: Some(grid_state.position_avg_price),
                 potential_sell_price: None,
-                allocated_funds: 0.0,
+                allocated_funds: 0.0, // 挂单不占用资金，只有成交时才扣除
             });
 
             allocated_sell_quantity += formatted_quantity;
@@ -5963,8 +5964,9 @@ async fn create_dynamic_grid(
         }
     }
 
-    // 更新可用资金
-    grid_state.available_funds -= allocated_buy_funds;
+    // 注意：挂单不占用资金，所以不需要从可用资金中扣除
+    // 只有订单成交时才会扣除实际资金
+    // grid_state.available_funds -= allocated_buy_funds; // 已注释，因为挂单不占用资金
 
     info!("✅ 自适应网格创建完成 - 策略: {}, 买单数量: {}, 卖单数量: {}, 已分配买单资金: {:.2}, 已分配卖单数量: {:.4}, 最大做空敞口: {:.2}", 
         fund_allocation.grid_strategy.as_str(), buy_count, sell_count, allocated_buy_funds, allocated_sell_quantity, fund_allocation.max_short_exposure);
@@ -6592,23 +6594,16 @@ fn generate_status_report(
     sell_orders: &HashMap<u64, OrderInfo>,
     grid_config: &crate::config::GridConfig,
 ) -> String {
-    // 计算流动资产（不包括挂单占用的资金）
-    let liquid_total_value =
+    // 计算总资产（挂单不占用资金）
+    let current_total_value =
         grid_state.available_funds + grid_state.position_quantity * current_price;
-    
-    // 计算挂单占用的资金
-    let pending_order_funds: f64 = buy_orders.values().map(|order| order.allocated_funds).sum::<f64>()
-        + sell_orders.values().map(|order| order.allocated_funds).sum::<f64>();
-    
-    // 计算真实总资产（包括挂单占用的资金）
-    let actual_total_value = liquid_total_value + pending_order_funds;
     
     let position_ratio = if grid_state.total_capital > 0.0 {
         (grid_state.position_quantity * current_price) / grid_state.total_capital * 100.0
     } else {
         0.0
     };
-    let asset_change = (actual_total_value / grid_state.total_capital - 1.0) * 100.0;
+    let asset_change = (current_total_value / grid_state.total_capital - 1.0) * 100.0;
     let profit_rate = grid_state.realized_profit / grid_state.total_capital * 100.0;
 
     format!(
@@ -6622,9 +6617,7 @@ fn generate_status_report(
         持仓数量: {:.4}\n\
         持仓均价: {:.4}\n\
         持仓比例: {:.2}%\n\
-        流动资产: {:.2}\n\
-        挂单占用资金: {:.2}\n\
-        真实总资产: {:.2}\n\
+        当前总资产: {:.2}\n\
         资产变化: {:.2}%\n\
         已实现利润: {:.2}\n\
         利润率: {:.2}%\n\
@@ -6655,9 +6648,7 @@ fn generate_status_report(
         grid_state.position_quantity,
         grid_state.position_avg_price,
         position_ratio,
-        liquid_total_value,
-        pending_order_funds,
-        actual_total_value,
+        current_total_value,
         asset_change,
         grid_state.realized_profit,
         profit_rate,
@@ -6922,10 +6913,12 @@ pub async fn run_grid_strategy(
     // 风险控制状态
     let mut last_risk_check = SystemTime::now();
     let mut risk_events: Vec<RiskEvent> = Vec::new();
+    // 修复：初始化为配置值，稍后在获取到第一个价格时更新为实际流动资产
     let mut daily_start_capital = grid_state.total_capital;
     let mut daily_start_time = SystemTime::now();
     let mut consecutive_failures = 0u32;
     let mut last_margin_ratio = 100.0f64;
+    let mut daily_start_capital_initialized = false; // 标记是否已初始化每日起始资本
 
     // ===== 初始化订单优先级管理器 =====
 
@@ -7095,6 +7088,13 @@ pub async fn run_grid_strategy(
                     // 更新网格状态
                     grid_state.available_funds = usdc_balance;
 
+                    // 初始化每日起始资本（仅在第一次获取价格时）
+                    if !daily_start_capital_initialized {
+                        daily_start_capital = grid_state.available_funds + grid_state.position_quantity * current_price;
+                        daily_start_capital_initialized = true;
+                        info!("📊 每日起始资本已初始化: {:.2} USDC", daily_start_capital);
+                    }
+
                     // 更新价格历史
                     price_history.push(current_price);
                     if price_history.len() > grid_config.history_length {
@@ -7257,14 +7257,23 @@ pub async fn run_grid_strategy(
                             should_pause_trading = true;
                         }
 
-                        // 检查每日亏损 - 需要考虑挂单占用的资金
-                        let pending_order_funds: f64 = buy_orders.values().map(|order| order.allocated_funds).sum::<f64>()
-                            + sell_orders.values().map(|order| order.allocated_funds).sum::<f64>();
+                        // 检查每日亏损 - 挂单不占用资金，所以只计算流动资产
                         let current_capital = grid_state.available_funds
-                            + grid_state.position_quantity * current_price
-                            + pending_order_funds; // 加上挂单占用的资金
+                            + grid_state.position_quantity * current_price;
                         let daily_loss_ratio =
                             (daily_start_capital - current_capital) / daily_start_capital;
+
+                        // 添加调试信息，帮助理解风险控制计算
+                        if daily_loss_ratio > 0.01 || daily_loss_ratio < -0.01 {
+                            info!(
+                                "📊 每日资产变化 - 起始: {:.2}, 当前: {:.2}, 变化: {:.2} ({:.2}%), 限制: {:.1}%",
+                                daily_start_capital,
+                                current_capital,
+                                current_capital - daily_start_capital,
+                                daily_loss_ratio * 100.0,
+                                grid_config.max_daily_loss * 100.0
+                            );
+                        }
 
                         if daily_loss_ratio > grid_config.max_daily_loss {
                             let event = RiskEvent::new(
