@@ -4191,6 +4191,28 @@ fn calculate_adaptive_fund_allocation(
     }
 }
 
+
+/*
+修复说明：
+
+1. 问题根源：
+   - 原代码使用 grid_state.total_capital * 0.5 导致资金过少
+   - 依赖 grid_state.available_funds，当全部资金用于持仓时变为0
+   - 没有为止盈订单预留专门资金
+
+2. 修复方案：
+   - 不再依赖 available_funds，直接使用 total_capital
+   - 有持仓时使用20%总资金专门用于止盈网格
+   - 无持仓时使用80%总资金正常分配
+   - 设置合理的单笔订单限制（0.5%-15%）
+
+3. 预期效果：
+   - 有多头持仓时能创建卖单止盈
+   - 有空头持仓时能创建买单止盈
+   - 资金使用率控制在合理范围内
+   - 避免订单数量为0的问题
+*/ 
+
 fn calculate_dynamic_fund_allocation(
     grid_state: &GridState,
     current_price: f64,
@@ -4221,14 +4243,38 @@ fn calculate_dynamic_fund_allocation(
     let buy_spacing_adjustment = 1.0 + (price_position * 0.5);
     let sell_spacing_adjustment = 1.0 + ((1.0 - price_position) * 0.5);
 
-    // 计算动态单网格资金
-    let base_fund_per_grid = grid_state.total_capital / grid_config.grid_count as f64 * 0.5; // 风险系数
+    // 计算动态单网格资金 - 修复持仓后无法止盈的问题
+    let total_capital = grid_state.total_capital.max(0.01); // 防止除零
+    
+    // 智能资金分配：根据持仓情况调整策略
+    let effective_funds = if grid_state.position_quantity.abs() > 0.001 {
+        // 有持仓时：为止盈订单预留专门资金（不依赖available_funds）
+        total_capital * 0.2  // 使用20%总资金用于止盈网格
+    } else {
+        // 无持仓时：使用正常资金分配
+        total_capital * 0.8  // 使用80%总资金
+    };
+    
+    let base_fund_per_grid = effective_funds / grid_config.grid_count as f64;
     let buy_order_funds = base_fund_per_grid * buy_fund_bias;
     let sell_order_funds = base_fund_per_grid * sell_fund_bias;
 
-    // 确保单个网格资金不超过可用资金的20%
-    let max_single_grid_fund = grid_state.available_funds * 0.2;
-    let buy_order_funds = buy_order_funds.min(max_single_grid_fund);
+    // 设置合理的资金限制
+    let max_single_grid_fund = total_capital * 0.15; // 最大15%
+    let min_single_grid_fund = total_capital * 0.005; // 最小0.5%
+    let buy_order_funds = buy_order_funds.min(max_single_grid_fund).max(min_single_grid_fund);
+    let sell_order_funds = sell_order_funds.min(max_single_grid_fund).max(min_single_grid_fund);
+
+    // 详细日志
+    info!(
+        "💰 智能资金分配 - 总资金: {:.4}, 持仓: {:.4}, 有效资金: {:.4} ({:.1}%), 买单: {:.4}, 卖单: {:.4}",
+        total_capital,
+        grid_state.position_quantity,
+        effective_funds,
+        (effective_funds / total_capital) * 100.0,
+        buy_order_funds,
+        sell_order_funds
+    );
 
     DynamicFundAllocation {
         buy_order_funds,
