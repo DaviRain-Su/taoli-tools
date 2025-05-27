@@ -1088,17 +1088,21 @@ async fn close_all_positions(
     current_price: f64,
 ) -> Result<(), GridStrategyError> {
     if long_position > 0.0 {
+        // 多头清仓：卖出时考虑向下滑点
+        let sell_price = current_price * (1.0 - grid_config.slippage_tolerance);
         let order = ClientOrderRequest {
             asset: grid_config.trading_asset.clone(),
             is_buy: false,
             reduce_only: true,
-            limit_px: current_price,
+            limit_px: sell_price,
             sz: long_position,
             cloid: None,
             order_type: ClientOrder::Limit(ClientLimit {
-                tif: "Gtc".to_string(),
+                tif: "Ioc".to_string(), // 使用IOC确保快速成交
             }),
         };
+        info!("🔄 清仓多头 - 数量: {:.4}, 价格: {:.4} (含滑点: {:.2}%)", 
+            long_position, sell_price, grid_config.slippage_tolerance * 100.0);
         if let Err(e) = exchange_client.order(order, None).await {
             return Err(GridStrategyError::OrderError(format!(
                 "清仓多头失败: {:?}",
@@ -1106,19 +1110,23 @@ async fn close_all_positions(
             )));
         }
     }
-
+    
     if short_position > 0.0 {
+        // 空头清仓：买入时考虑向上滑点
+        let buy_price = current_price * (1.0 + grid_config.slippage_tolerance);
         let order = ClientOrderRequest {
             asset: grid_config.trading_asset.clone(),
             is_buy: true,
             reduce_only: true,
-            limit_px: current_price,
+            limit_px: buy_price,
             sz: short_position,
             cloid: None,
             order_type: ClientOrder::Limit(ClientLimit {
-                tif: "Gtc".to_string(),
+                tif: "Ioc".to_string(), // 使用IOC确保快速成交
             }),
         };
+        info!("🔄 清仓空头 - 数量: {:.4}, 价格: {:.4} (含滑点: {:.2}%)", 
+            short_position, buy_price, grid_config.slippage_tolerance * 100.0);
         if let Err(e) = exchange_client.order(order, None).await {
             return Err(GridStrategyError::OrderError(format!(
                 "清仓空头失败: {:?}",
@@ -1126,7 +1134,7 @@ async fn close_all_positions(
             )));
         }
     }
-
+    
     Ok(())
 }
 
@@ -1188,6 +1196,10 @@ async fn create_dynamic_grid(
     let max_buy_funds = grid_state.available_funds * 0.7; // 最多使用70%资金做买单
     let mut allocated_buy_funds = 0.0;
     let mut buy_count = 0;
+    
+    // 收集要批量创建的买单
+    let mut pending_buy_orders: Vec<ClientOrderRequest> = Vec::new();
+    let mut pending_buy_order_info: Vec<OrderInfo> = Vec::new();
 
     while current_buy_price > current_price * 0.8
         && allocated_buy_funds < max_buy_funds
@@ -1241,39 +1253,54 @@ async fn create_dynamic_grid(
                 }),
             };
 
-            match exchange_client.order(buy_order, None).await {
-                Ok(ExchangeResponseStatus::Ok(response)) => {
-                    if let Some(data) = response.data {
-                        if !data.statuses.is_empty() {
-                            if let ExchangeDataStatus::Resting(order) = &data.statuses[0] {
-                                active_orders.push(order.oid);
-                                buy_orders.insert(
-                                    order.oid,
-                                    OrderInfo {
-                                        price: formatted_price,
-                                        quantity: buy_quantity,
-                                        cost_price: None,
-                                        potential_sell_price: Some(potential_sell_price),
-                                        allocated_funds: current_grid_funds,
-                                    },
-                                );
-                                allocated_buy_funds += current_grid_funds;
-                                buy_count += 1;
+            // 收集订单信息，准备批量创建
+            pending_buy_orders.push(buy_order);
+            pending_buy_order_info.push(OrderInfo {
+                price: formatted_price,
+                quantity: buy_quantity,
+                cost_price: None,
+                potential_sell_price: Some(potential_sell_price),
+                allocated_funds: current_grid_funds,
+            });
+            
+            allocated_buy_funds += current_grid_funds;
+            buy_count += 1;
+        }
+    }
 
-                                info!(
-                                    "🟢 创建买单: 价格={:.4}, 数量={:.4}, 资金={:.2}",
-                                    formatted_price, buy_quantity, current_grid_funds
-                                );
-                            }
-                        }
+    // 批量创建买单
+    if !pending_buy_orders.is_empty() {
+        let order_count = pending_buy_orders.len();
+        info!("📦 开始批量创建{}个买单", order_count);
+        
+        match create_orders_in_batches(
+            exchange_client,
+            pending_buy_orders,
+            grid_config,
+            grid_state,
+        ).await {
+            Ok(created_order_ids) => {
+                // 将创建成功的订单添加到管理列表
+                for (i, order_id) in created_order_ids.iter().enumerate() {
+                    if i < pending_buy_order_info.len() {
+                        active_orders.push(*order_id);
+                        buy_orders.insert(*order_id, pending_buy_order_info[i].clone());
+                        
+                        info!("🟢 买单创建成功: ID={}, 价格={:.4}, 数量={:.4}, 资金={:.2}",
+                            order_id, 
+                            pending_buy_order_info[i].price,
+                            pending_buy_order_info[i].quantity,
+                            pending_buy_order_info[i].allocated_funds
+                        );
                     }
                 }
-                Ok(ExchangeResponseStatus::Err(err)) => {
-                    warn!("❌ 创建买单失败: {:?}", err);
-                }
-                Err(e) => {
-                    warn!("❌ 创建买单失败: {:?}", e);
-                }
+                info!("✅ 批量买单创建完成: {}/{}", created_order_ids.len(), order_count);
+            }
+            Err(e) => {
+                warn!("❌ 批量买单创建失败: {:?}", e);
+                // 回滚资金分配
+                allocated_buy_funds = 0.0;
+                buy_count = 0;
             }
         }
     }
@@ -1283,6 +1310,10 @@ async fn create_dynamic_grid(
     let max_sell_quantity = grid_state.position_quantity * 0.8; // 最多卖出80%持仓
     let mut allocated_sell_quantity = 0.0;
     let mut sell_count = 0;
+    
+    // 收集要批量创建的卖单
+    let mut pending_sell_orders: Vec<ClientOrderRequest> = Vec::new();
+    let mut pending_sell_order_info: Vec<OrderInfo> = Vec::new();
 
     while current_sell_price < current_price * 1.2
         && allocated_sell_quantity < max_sell_quantity
@@ -1341,39 +1372,53 @@ async fn create_dynamic_grid(
                 }),
             };
 
-            match exchange_client.order(sell_order, None).await {
-                Ok(ExchangeResponseStatus::Ok(response)) => {
-                    if let Some(data) = response.data {
-                        if !data.statuses.is_empty() {
-                            if let ExchangeDataStatus::Resting(order) = &data.statuses[0] {
-                                active_orders.push(order.oid);
-                                sell_orders.insert(
-                                    order.oid,
-                                    OrderInfo {
-                                        price: formatted_price,
-                                        quantity: formatted_quantity,
-                                        cost_price: Some(grid_state.position_avg_price),
-                                        potential_sell_price: None,
-                                        allocated_funds: 0.0,
-                                    },
-                                );
-                                allocated_sell_quantity += formatted_quantity;
-                                sell_count += 1;
+            // 收集卖单信息，准备批量创建
+            pending_sell_orders.push(sell_order);
+            pending_sell_order_info.push(OrderInfo {
+                price: formatted_price,
+                quantity: formatted_quantity,
+                cost_price: Some(grid_state.position_avg_price),
+                potential_sell_price: None,
+                allocated_funds: 0.0,
+            });
+            
+            allocated_sell_quantity += formatted_quantity;
+            sell_count += 1;
+        }
+    }
 
-                                info!(
-                                    "🔴 创建卖单: 价格={:.4}, 数量={:.4}",
-                                    formatted_price, formatted_quantity
-                                );
-                            }
-                        }
+    // 批量创建卖单
+    if !pending_sell_orders.is_empty() {
+        let sell_order_count = pending_sell_orders.len();
+        info!("📦 开始批量创建{}个卖单", sell_order_count);
+        
+        match create_orders_in_batches(
+            exchange_client,
+            pending_sell_orders,
+            grid_config,
+            grid_state,
+        ).await {
+            Ok(created_order_ids) => {
+                // 将创建成功的订单添加到管理列表
+                for (i, order_id) in created_order_ids.iter().enumerate() {
+                    if i < pending_sell_order_info.len() {
+                        active_orders.push(*order_id);
+                        sell_orders.insert(*order_id, pending_sell_order_info[i].clone());
+                        
+                        info!("🔴 卖单创建成功: ID={}, 价格={:.4}, 数量={:.4}",
+                            order_id, 
+                            pending_sell_order_info[i].price,
+                            pending_sell_order_info[i].quantity
+                        );
                     }
                 }
-                Ok(ExchangeResponseStatus::Err(err)) => {
-                    warn!("❌ 创建卖单失败: {:?}", err);
-                }
-                Err(e) => {
-                    warn!("❌ 创建卖单失败: {:?}", e);
-                }
+                info!("✅ 批量卖单创建完成: {}/{}", created_order_ids.len(), sell_order_count);
+            }
+            Err(e) => {
+                warn!("❌ 批量卖单创建失败: {:?}", e);
+                // 回滚数量分配
+                allocated_sell_quantity = 0.0;
+                sell_count = 0;
             }
         }
     }
@@ -1396,6 +1441,7 @@ async fn execute_stop_loss(
     active_orders: &mut Vec<u64>,
     buy_orders: &mut HashMap<u64, OrderInfo>,
     sell_orders: &mut HashMap<u64, OrderInfo>,
+    current_price: f64,
 ) -> Result<(), GridStrategyError> {
     info!(
         "🚨 执行止损操作: {}, 原因: {}, 止损数量: {:.4}",
@@ -1451,18 +1497,30 @@ async fn execute_stop_loss(
     } else if stop_result.action.is_partial_stop() && stop_result.stop_quantity > 0.0 {
         grid_state.stop_loss_status = StopLossStatus::Monitoring;
         
-        // 部分清仓
+        // 部分清仓 - 使用滑点容忍度设置限价
+        let stop_price = if grid_state.position_avg_price > 0.0 {
+            grid_state.position_avg_price
+        } else {
+            current_price
+        };
+        
+        // 考虑滑点的卖出价格
+        let sell_price_with_slippage = stop_price * (1.0 - grid_config.slippage_tolerance);
+        
         let market_sell_order = ClientOrderRequest {
             asset: grid_config.trading_asset.clone(),
             is_buy: false,
             reduce_only: true,
-            limit_px: 0.0, // 市价单
+            limit_px: sell_price_with_slippage, // 使用滑点容忍度
             sz: stop_result.stop_quantity,
             cloid: None,
             order_type: ClientOrder::Limit(ClientLimit {
                 tif: "Ioc".to_string(),
             }),
         };
+        
+        info!("🔄 执行部分止损 - 价格: {:.4} (含滑点: {:.2}%)", 
+            sell_price_with_slippage, grid_config.slippage_tolerance * 100.0);
 
         match exchange_client.order(market_sell_order, None).await {
             Ok(_) => {
@@ -1553,25 +1611,24 @@ async fn rebalance_grid(
         calculate_dynamic_fund_allocation(grid_state, current_price, grid_config);
 
     // 根据趋势调整网格策略
-    match market_analysis.trend {
-        MarketTrend::Upward => {
-            // 上升趋势：增加买单密度，减少卖单密度
-            adjusted_fund_allocation.buy_spacing_adjustment *= 0.8 * risk_adjustment;
-            adjusted_fund_allocation.sell_spacing_adjustment *= 1.2;
-            info!("📈 检测到上升趋势，调整买单密度");
-        }
-        MarketTrend::Downward => {
-            // 下降趋势：减少买单密度，增加卖单密度
-            adjusted_fund_allocation.buy_spacing_adjustment *= 1.2;
-            adjusted_fund_allocation.sell_spacing_adjustment *= 0.8 * risk_adjustment;
-            info!("📉 检测到下降趋势，调整卖单密度");
-        }
-        MarketTrend::Sideways => {
-            // 震荡趋势：保持均衡的网格密度，应用风险调整
-            adjusted_fund_allocation.buy_spacing_adjustment *= risk_adjustment;
-            adjusted_fund_allocation.sell_spacing_adjustment *= risk_adjustment;
-            info!("📊 检测到震荡趋势，保持均衡网格");
-        }
+    if market_analysis.trend.is_bullish() {
+        // 上升趋势：增加买单密度，减少卖单密度
+        adjusted_fund_allocation.buy_spacing_adjustment *= 0.8 * risk_adjustment;
+        adjusted_fund_allocation.sell_spacing_adjustment *= 1.2;
+        info!("📈 检测到{}趋势({}), 调整买单密度", 
+            market_analysis.trend.as_str(), market_analysis.trend.as_english());
+    } else if market_analysis.trend.is_bearish() {
+        // 下降趋势：减少买单密度，增加卖单密度
+        adjusted_fund_allocation.buy_spacing_adjustment *= 1.2;
+        adjusted_fund_allocation.sell_spacing_adjustment *= 0.8 * risk_adjustment;
+        info!("📉 检测到{}趋势({}), 调整卖单密度", 
+            market_analysis.trend.as_str(), market_analysis.trend.as_english());
+    } else if market_analysis.trend.is_sideways() {
+        // 震荡趋势：保持均衡的网格密度，应用风险调整
+        adjusted_fund_allocation.buy_spacing_adjustment *= risk_adjustment;
+        adjusted_fund_allocation.sell_spacing_adjustment *= risk_adjustment;
+        info!("📊 检测到{}趋势({}), 保持均衡网格", 
+            market_analysis.trend.as_str(), market_analysis.trend.as_english());
     }
 
     // 使用 RSI 指标调整交易激进程度
@@ -1914,6 +1971,7 @@ pub async fn run_grid_strategy(
     let mut last_price: Option<f64> = None;
     let mut buy_orders: HashMap<u64, OrderInfo> = HashMap::new();
     let mut sell_orders: HashMap<u64, OrderInfo> = HashMap::new();
+
     let mut last_daily_reset = SystemTime::now();
     let mut last_status_report = SystemTime::now();
 
@@ -1990,9 +2048,12 @@ pub async fn run_grid_strategy(
 
                     if stop_result.action.requires_action() {
                         warn!(
-                            "🚨 触发止损: {}, 原因: {}",
+                            "🚨 触发止损: {} ({}), 原因: {}, 当前状态: {} ({})",
                             stop_result.action.as_str(),
-                            stop_result.reason
+                            stop_result.action.as_english(),
+                            stop_result.reason,
+                            grid_state.stop_loss_status.as_str(),
+                            grid_state.stop_loss_status.as_english()
                         );
 
                         execute_stop_loss(
@@ -2003,11 +2064,21 @@ pub async fn run_grid_strategy(
                             &mut active_orders,
                             &mut buy_orders,
                             &mut sell_orders,
+                            current_price,
                         )
                         .await?;
 
                         if stop_result.action.is_full_stop() {
                             error!("🛑 策略已全部止损，退出");
+                            break;
+                        }
+                    }
+
+                    // 检查止损状态是否允许继续交易
+                    if !grid_state.stop_loss_status.can_continue_trading() {
+                        warn!("⚠️ 止损状态({})不允许继续交易", grid_state.stop_loss_status.as_str());
+                        if grid_state.stop_loss_status.is_failed() {
+                            error!("❌ 止损执行失败，策略退出");
                             break;
                         }
                     }
@@ -2024,9 +2095,60 @@ pub async fn run_grid_strategy(
 
                         // 在重平衡前优化参数
                         if grid_state.performance_history.len() >= 20 {
-                            info!("📈 基于历史表现优化网格参数");
-                            // 注意：由于grid_config是不可变借用，这里只记录优化建议
-                            // 实际的参数优化可以在配置文件中手动调整
+                            info!("📈 基于历史表现分析网格参数优化建议");
+                            analyze_grid_performance_and_suggest_optimization(grid_config, &grid_state);
+                            
+                            // 创建一个临时的配置副本进行优化分析
+                            let mut temp_min_spacing = grid_config.min_grid_spacing;
+                            let mut temp_max_spacing = grid_config.max_grid_spacing;
+                            
+                            // 手动应用优化逻辑
+                            if grid_state.performance_history.len() >= 10 {
+                                let recent_records: Vec<&PerformanceRecord> = grid_state
+                                    .performance_history
+                                    .iter()
+                                    .rev()
+                                    .take(20)
+                                    .collect();
+                                
+                                let recent_profit: f64 = recent_records.iter().map(|r| r.profit).sum();
+                                let recent_win_rate = recent_records
+                                    .iter()
+                                    .filter(|r| r.profit > 0.0)
+                                    .count() as f64
+                                    / recent_records.len() as f64;
+                                
+                                // 根据表现调整网格间距
+                                if recent_profit > 0.0 && recent_win_rate > 0.6 {
+                                    // 表现良好，可以稍微增加网格间距以获得更大利润
+                                    temp_min_spacing *= 1.05;
+                                    temp_max_spacing *= 1.05;
+                                    info!("🔧 参数优化建议 - 表现良好，建议增加网格间距");
+                                } else if recent_profit < 0.0 || recent_win_rate < 0.4 {
+                                    // 表现不佳，减少网格间距以提高成交频率
+                                    temp_min_spacing *= 0.95;
+                                    temp_max_spacing *= 0.95;
+                                    info!("🔧 参数优化建议 - 表现不佳，建议减少网格间距");
+                                }
+                                
+                                // 确保网格间距在合理范围内
+                                temp_min_spacing = temp_min_spacing.max(0.001).min(0.05);
+                                temp_max_spacing = temp_max_spacing.max(temp_min_spacing).min(0.1);
+                                
+                                // 显示优化建议
+                                if (temp_min_spacing - grid_config.min_grid_spacing).abs() > 0.0001 {
+                                    info!("🔧 参数优化建议 - 最小网格间距: {:.4}% -> {:.4}%", 
+                                        grid_config.min_grid_spacing * 100.0,
+                                        temp_min_spacing * 100.0);
+                                }
+                                if (temp_max_spacing - grid_config.max_grid_spacing).abs() > 0.0001 {
+                                    info!("🔧 参数优化建议 - 最大网格间距: {:.4}% -> {:.4}%", 
+                                        grid_config.max_grid_spacing * 100.0,
+                                        temp_max_spacing * 100.0);
+                                }
+                            }
+                            
+                            info!("💡 参数优化分析完成，建议在配置文件中手动调整参数");
                         }
 
                         rebalance_grid(
@@ -2071,6 +2193,12 @@ pub async fn run_grid_strategy(
                             &mut sell_orders,
                         )
                         .await?;
+                        
+                        // 如果配置了批量订单，可以在这里使用批量创建功能
+                        if grid_config.max_orders_per_batch > 1 && grid_config.order_batch_delay_ms > 0 {
+                            info!("💡 批量订单配置已启用 - 批次大小: {}, 延迟: {}ms", 
+                                grid_config.max_orders_per_batch, grid_config.order_batch_delay_ms);
+                        }
                     }
 
                     // 4. 资金分配监控
@@ -2109,6 +2237,7 @@ pub async fn run_grid_strategy(
                                                 &mut active_orders,
                                                 &mut buy_orders,
                                                 &mut sell_orders,
+                                                current_price,
                                             ).await {
                                                 error!("❌ 紧急止损执行失败: {:?}", stop_err);
                                             }
@@ -2145,12 +2274,29 @@ pub async fn run_grid_strategy(
                         );
                         info!("\n{}", report);
                         
-                        // 输出性能指标
-                        info!("📊 性能指标 - 总交易: {}, 胜率: {:.1}%, 利润因子: {:.2}, 夏普比率: {:.2}", 
+                        // 输出详细性能指标
+                        info!("📊 详细性能指标:");
+                        info!("   总交易数: {} (胜: {}, 负: {})", 
                             grid_state.current_metrics.total_trades,
+                            grid_state.current_metrics.winning_trades,
+                            grid_state.current_metrics.losing_trades
+                        );
+                        info!("   胜率: {:.1}%, 利润因子: {:.2}, 夏普比率: {:.2}", 
                             grid_state.current_metrics.win_rate * 100.0,
                             grid_state.current_metrics.profit_factor,
                             grid_state.current_metrics.sharpe_ratio
+                        );
+                        info!("   总利润: {:.2}, 最大回撤: {:.2}%", 
+                            grid_state.current_metrics.total_profit,
+                            grid_state.current_metrics.max_drawdown * 100.0
+                        );
+                        info!("   平均盈利: {:.2}, 平均亏损: {:.2}", 
+                            grid_state.current_metrics.average_win,
+                            grid_state.current_metrics.average_loss
+                        );
+                        info!("   最大单笔盈利: {:.2}, 最大单笔亏损: {:.2}", 
+                            grid_state.current_metrics.largest_win,
+                            grid_state.current_metrics.largest_loss
                         );
                         
                         last_status_report = now;
@@ -2257,13 +2403,19 @@ pub async fn run_grid_strategy(
                                     grid_state.available_funds += sell_revenue;
 
                                     // 记录交易历史
-                                    grid_state.performance_history.push(PerformanceRecord {
+                                    let record = PerformanceRecord {
                                         timestamp: SystemTime::now(),
                                         price: fill_price,
                                         action: "SELL".to_string(),
                                         profit,
                                         total_capital: grid_state.available_funds + grid_state.position_quantity * fill_price,
-                                    });
+                                    };
+                                    grid_state.performance_history.push(record.clone());
+                                    
+                                    // 输出交易记录详情
+                                    info!("📝 交易记录 - 时间: {:?}, 动作: {}, 价格: {:.4}, 利润: {:.2}, 总资产: {:.2}", 
+                                        record.timestamp.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                                        record.action, record.price, record.profit, record.total_capital);
 
                                     info!("💰 卖单成交 - 成本价: {:.4}, 卖出价: {:.4}, 利润: {:.2}, 利润率: {:.2}%", 
                                         cost_price, fill_price, profit, (profit / buy_cost) * 100.0);
@@ -2503,17 +2655,98 @@ fn calculate_performance_metrics(
     }
 }
 
-// 分批创建订单 - 简化版本，避免复杂的类型处理
+// 分批创建订单 - 正确处理SDK限制和批量配置
 async fn create_orders_in_batches(
-    _exchange_client: &ExchangeClient,
-    _orders: Vec<ClientOrderRequest>,
-    _grid_config: &crate::config::GridConfig,
-    _grid_state: &mut GridState,
+    exchange_client: &ExchangeClient,
+    orders: Vec<ClientOrderRequest>,
+    grid_config: &crate::config::GridConfig,
+    grid_state: &mut GridState,
 ) -> Result<Vec<u64>, GridStrategyError> {
-    // 暂时返回空结果，避免复杂的类型处理
-    // 在实际使用时可以根据需要实现具体逻辑
-    warn!("⚠️ 批量订单创建功能暂未实现");
-    Ok(Vec::new())
+    let mut created_order_ids = Vec::new();
+    
+    if orders.is_empty() {
+        return Ok(created_order_ids);
+    }
+    
+    // 检查批次间延迟
+    let now = SystemTime::now();
+    if let Ok(duration) = now.duration_since(grid_state.last_order_batch_time) {
+        let required_delay = Duration::from_millis(grid_config.order_batch_delay_ms);
+        if duration < required_delay {
+            let remaining_delay = required_delay - duration;
+            info!("⏱️ 等待批次间延迟: {}ms", remaining_delay.as_millis());
+            sleep(remaining_delay).await;
+        }
+    }
+    
+    let total_orders = orders.len();
+    let batch_size = grid_config.max_orders_per_batch.min(total_orders);
+    info!("📦 开始批量创建订单 - 总数: {}, 批次大小: {}, 延迟: {}ms", 
+        total_orders, batch_size, grid_config.order_batch_delay_ms);
+    
+    // 分批处理订单 - 正确的方式：消费Vec而不是借用
+    let mut order_iter = orders.into_iter();
+    let mut batch_count = 0;
+    
+    loop {
+        let mut current_batch = Vec::new();
+        
+        // 收集当前批次的订单
+        for _ in 0..batch_size {
+            if let Some(order) = order_iter.next() {
+                current_batch.push(order);
+            } else {
+                break;
+            }
+        }
+        
+        if current_batch.is_empty() {
+            break;
+        }
+        
+        batch_count += 1;
+        info!("📋 处理第{}批订单，数量: {}", batch_count, current_batch.len());
+        
+        // 逐个发送订单（因为SDK不支持真正的批量操作）
+        for order in current_batch {
+            match exchange_client.order(order, None).await {
+                Ok(ExchangeResponseStatus::Ok(response)) => {
+                    if let Some(data) = response.data {
+                        for status in data.statuses {
+                            if let ExchangeDataStatus::Resting(order_info) = status {
+                                created_order_ids.push(order_info.oid);
+                                info!("✅ 订单创建成功: ID={}", order_info.oid);
+                            }
+                        }
+                    }
+                }
+                Ok(ExchangeResponseStatus::Err(err)) => {
+                    warn!("❌ 订单创建失败: {:?}", err);
+                }
+                Err(e) => {
+                    warn!("❌ 订单创建失败: {:?}", e);
+                }
+            }
+            
+            // 订单间小延迟，避免过于频繁的请求
+            if grid_config.order_batch_delay_ms > 0 {
+                sleep(Duration::from_millis(50)).await; // 50ms小延迟
+            }
+        }
+        
+        // 批次间延迟
+        if order_iter.len() > 0 {
+            let delay = Duration::from_millis(grid_config.order_batch_delay_ms);
+            info!("⏱️ 批次间延迟: {}ms", delay.as_millis());
+            sleep(delay).await;
+        }
+    }
+    
+    // 更新最后批次时间
+    grid_state.last_order_batch_time = SystemTime::now();
+    
+    info!("✅ 批量订单创建完成 - 成功创建: {}/{}", created_order_ids.len(), total_orders);
+    Ok(created_order_ids)
 }
 
 // 检查订单状态
@@ -2549,13 +2782,13 @@ async fn check_order_status(
     Ok(())
 }
 
-// 优化网格参数
-fn optimize_grid_parameters(
-    grid_config: &mut crate::config::GridConfig,
+// 分析网格性能并提供优化建议
+fn analyze_grid_performance_and_suggest_optimization(
+    grid_config: &crate::config::GridConfig,
     grid_state: &GridState,
 ) {
     if grid_state.performance_history.len() < 10 {
-        return; // 数据不足，无法优化
+        return; // 数据不足，无法分析
     }
     
     // 分析最近的表现
@@ -2573,20 +2806,47 @@ fn optimize_grid_parameters(
         .count() as f64
         / recent_records.len() as f64;
     
-    // 根据表现调整网格间距
+    let avg_profit_per_trade = recent_profit / recent_records.len() as f64;
+    
+    info!("📊 网格性能分析:");
+    info!("   最近20笔交易利润: {:.2}", recent_profit);
+    info!("   胜率: {:.1}%", recent_win_rate * 100.0);
+    info!("   平均每笔利润: {:.2}", avg_profit_per_trade);
+    
+    // 提供优化建议
     if recent_profit > 0.0 && recent_win_rate > 0.6 {
-        // 表现良好，可以稍微增加网格间距以获得更大利润
-        grid_config.min_grid_spacing *= 1.05;
-        grid_config.max_grid_spacing *= 1.05;
-        info!("📈 表现良好，增加网格间距以优化利润");
+        info!("💡 优化建议: 表现良好，可考虑:");
+        info!("   - 适当增加网格间距({:.3}% -> {:.3}%)以获得更大利润", 
+            grid_config.min_grid_spacing * 100.0, 
+            (grid_config.min_grid_spacing * 1.05) * 100.0);
+        info!("   - 或增加单格交易金额({:.2} -> {:.2})扩大收益", 
+            grid_config.trade_amount, 
+            grid_config.trade_amount * 1.1);
     } else if recent_profit < 0.0 || recent_win_rate < 0.4 {
-        // 表现不佳，减少网格间距以提高成交频率
-        grid_config.min_grid_spacing *= 0.95;
-        grid_config.max_grid_spacing *= 0.95;
-        info!("📉 表现不佳，减少网格间距以提高成交频率");
+        info!("⚠️ 优化建议: 表现不佳，建议:");
+        info!("   - 减少网格间距({:.3}% -> {:.3}%)提高成交频率", 
+            grid_config.min_grid_spacing * 100.0, 
+            (grid_config.min_grid_spacing * 0.95) * 100.0);
+        info!("   - 降低单格交易金额({:.2} -> {:.2})减少风险", 
+            grid_config.trade_amount, 
+            grid_config.trade_amount * 0.9);
+        info!("   - 考虑调整止损参数以更好控制风险");
+    } else {
+        info!("📈 优化建议: 表现中等，可考虑:");
+        info!("   - 根据市场波动率动态调整网格间距");
+        info!("   - 优化资金分配策略");
     }
     
-    // 确保网格间距在合理范围内
-    grid_config.min_grid_spacing = grid_config.min_grid_spacing.max(0.001).min(0.05);
-    grid_config.max_grid_spacing = grid_config.max_grid_spacing.max(grid_config.min_grid_spacing).min(0.1);
+    // 分析交易频率
+    if recent_records.len() < 5 {
+        info!("⚠️ 交易频率建议: 成交频率较低，可考虑:");
+        info!("   - 减少网格间距增加成交机会");
+        info!("   - 增加网格数量覆盖更大价格范围");
+    } else if recent_records.len() > 15 {
+        info!("💡 交易频率建议: 成交频率较高，可考虑:");
+        info!("   - 适当增加网格间距减少频繁交易");
+        info!("   - 优化手续费成本");
+    }
 }
+
+
