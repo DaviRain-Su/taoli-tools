@@ -322,23 +322,69 @@ impl DynamicGridParams {
                         info!("✅ 成功加载动态参数 - 优化次数: {}, 检查点数: {}", 
                             params.optimization_count, params.checkpoints.len());
                         
-                        // 验证参数合理性
-                        if params.current_min_spacing < grid_config.min_grid_spacing * 0.1 
-                            || params.current_min_spacing > grid_config.max_grid_spacing {
-                            warn!("⚠️ 加载的最小间距参数异常，重置为默认值");
-                            params.current_min_spacing = grid_config.min_grid_spacing;
-                        }
+                        // 使用增强的参数验证
+                        let validation_result = validate_dynamic_parameters(&params, grid_config, "加载时");
+                        validation_result.log_results("动态参数加载");
                         
-                        if params.current_max_spacing < params.current_min_spacing 
-                            || params.current_max_spacing > grid_config.max_grid_spacing * 2.0 {
-                            warn!("⚠️ 加载的最大间距参数异常，重置为默认值");
-                            params.current_max_spacing = grid_config.max_grid_spacing;
-                        }
-                        
-                        if params.current_trade_amount < grid_config.trade_amount * 0.1 
-                            || params.current_trade_amount > grid_config.total_capital * 0.2 {
-                            warn!("⚠️ 加载的交易金额参数异常，重置为默认值");
-                            params.current_trade_amount = grid_config.trade_amount;
+                        // 如果验证失败，进行参数修复
+                        if !validation_result.is_valid {
+                            warn!("⚠️ 加载的动态参数验证失败，进行自动修复");
+                            
+                            // 修复最小间距
+                            if params.current_min_spacing < grid_config.min_grid_spacing * 0.1 
+                                || params.current_min_spacing > grid_config.max_grid_spacing {
+                                warn!("🔧 修复最小间距: {:.4}% -> {:.4}%", 
+                                    params.current_min_spacing * 100.0,
+                                    grid_config.min_grid_spacing * 100.0);
+                                params.current_min_spacing = grid_config.min_grid_spacing;
+                            }
+                            
+                            // 修复最大间距
+                            if params.current_max_spacing < params.current_min_spacing 
+                                || params.current_max_spacing > grid_config.max_grid_spacing * 2.0 {
+                                warn!("🔧 修复最大间距: {:.4}% -> {:.4}%", 
+                                    params.current_max_spacing * 100.0,
+                                    grid_config.max_grid_spacing * 100.0);
+                                params.current_max_spacing = grid_config.max_grid_spacing;
+                            }
+                            
+                            // 修复交易金额
+                            if params.current_trade_amount < grid_config.trade_amount * 0.1 
+                                || params.current_trade_amount > grid_config.total_capital * 0.2 {
+                                warn!("🔧 修复交易金额: {:.2} -> {:.2}", 
+                                    params.current_trade_amount,
+                                    grid_config.trade_amount);
+                                params.current_trade_amount = grid_config.trade_amount;
+                            }
+                            
+                            // 修复回滚阈值
+                            if params.rollback_threshold < 5.0 || params.rollback_threshold > 50.0 {
+                                warn!("🔧 修复回滚阈值: {:.1} -> 15.0", params.rollback_threshold);
+                                params.rollback_threshold = 15.0;
+                            }
+                            
+                            // 清理过多的检查点
+                            if params.checkpoints.len() > 20 {
+                                let excess = params.checkpoints.len() - 10;
+                                params.checkpoints.drain(0..excess);
+                                warn!("🔧 清理{}个过期检查点", excess);
+                            }
+                            
+                            // 清理过多的性能窗口数据
+                            if params.performance_window.len() > 50 {
+                                let excess = params.performance_window.len() - 20;
+                                params.performance_window.drain(0..excess);
+                                warn!("🔧 清理{}个过期性能数据", excess);
+                            }
+                            
+                            // 重新验证修复后的参数
+                            let fixed_validation = validate_dynamic_parameters(&params, grid_config, "修复后");
+                            if fixed_validation.is_valid {
+                                info!("✅ 参数修复成功");
+                            } else {
+                                warn!("⚠️ 参数修复后仍有问题，将使用默认参数");
+                                return Self::new(grid_config);
+                            }
                         }
                         
                         params
@@ -929,6 +975,68 @@ fn calculate_expected_profit_rate(buy_price: f64, sell_price: f64, fee_rate: f64
     (sell_revenue - buy_cost) / buy_cost
 }
 
+// 参数验证结果结构体
+#[derive(Debug, Clone)]
+struct ValidationResult {
+    is_valid: bool,
+    warnings: Vec<String>,
+    errors: Vec<String>,
+    suggestions: Vec<String>,
+}
+
+impl ValidationResult {
+    fn new() -> Self {
+        Self {
+            is_valid: true,
+            warnings: Vec::new(),
+            errors: Vec::new(),
+            suggestions: Vec::new(),
+        }
+    }
+
+    fn add_error(&mut self, error: String) {
+        self.is_valid = false;
+        self.errors.push(error);
+    }
+
+    fn add_warning(&mut self, warning: String) {
+        self.warnings.push(warning);
+    }
+
+    fn add_suggestion(&mut self, suggestion: String) {
+        self.suggestions.push(suggestion);
+    }
+
+    fn log_results(&self, context: &str) {
+        if !self.errors.is_empty() {
+            error!("❌ {}参数验证失败:", context);
+            for error in &self.errors {
+                error!("   - {}", error);
+            }
+        }
+
+        if !self.warnings.is_empty() {
+            warn!("⚠️ {}参数验证警告:", context);
+            for warning in &self.warnings {
+                warn!("   - {}", warning);
+            }
+        }
+
+        if !self.suggestions.is_empty() {
+            info!("💡 {}参数优化建议:", context);
+            for suggestion in &self.suggestions {
+                info!("   - {}", suggestion);
+            }
+        }
+
+        if self.is_valid && self.warnings.is_empty() && self.suggestions.is_empty() {
+            info!("✅ {}参数验证通过", context);
+        }
+    }
+}
+
+
+
 // 验证网格配置参数
 fn validate_grid_config(grid_config: &crate::config::GridConfig) -> Result<(), GridStrategyError> {
     // 检查基本参数
@@ -1057,8 +1165,421 @@ fn validate_grid_config(grid_config: &crate::config::GridConfig) -> Result<(), G
         ));
     }
 
+    // 进行增强的一致性检查
+    let validation_result = validate_grid_config_enhanced(grid_config);
+    validation_result.log_results("网格配置");
+    
+    if !validation_result.is_valid {
+        return Err(GridStrategyError::ConfigError(
+            "网格配置验证失败，请检查参数设置".to_string()
+        ));
+    }
+
     info!("✅ 网格配置验证通过");
     Ok(())
+}
+
+// 增强的网格配置验证
+fn validate_grid_config_enhanced(grid_config: &crate::config::GridConfig) -> ValidationResult {
+    let mut result = ValidationResult::new();
+    
+    // 1. 网格间距与手续费的关系验证
+    let min_profitable_spacing = grid_config.fee_rate * 3.0; // 至少是手续费的3倍才能盈利
+    if grid_config.min_grid_spacing < min_profitable_spacing {
+        result.add_error(format!(
+            "最小网格间距({:.4}%)过小，无法覆盖手续费成本，建议至少设置为{:.4}%",
+            grid_config.min_grid_spacing * 100.0,
+            min_profitable_spacing * 100.0
+        ));
+    } else if grid_config.min_grid_spacing < min_profitable_spacing * 1.5 {
+        result.add_warning(format!(
+            "最小网格间距({:.4}%)较小，利润空间有限，建议设置为{:.4}%以上",
+            grid_config.min_grid_spacing * 100.0,
+            min_profitable_spacing * 1.5 * 100.0
+        ));
+    }
+    
+    // 2. 网格间距比例验证
+    let spacing_ratio = grid_config.max_grid_spacing / grid_config.min_grid_spacing;
+    if spacing_ratio > 10.0 {
+        result.add_warning(format!(
+            "网格间距范围过大(比例: {:.1}:1)，可能导致策略不稳定",
+            spacing_ratio
+        ));
+        result.add_suggestion("建议将最大网格间距控制在最小间距的5倍以内".to_string());
+    } else if spacing_ratio < 1.5 {
+        result.add_warning(format!(
+            "网格间距范围过小(比例: {:.1}:1)，可能限制策略适应性",
+            spacing_ratio
+        ));
+        result.add_suggestion("建议将最大网格间距设置为最小间距的2-5倍".to_string());
+    }
+    
+    // 3. 资金分配合理性验证
+    let max_possible_orders = (grid_config.total_capital / grid_config.trade_amount) as u32;
+    if grid_config.grid_count > max_possible_orders {
+        result.add_error(format!(
+            "网格数量({})超过资金支持的最大订单数({})",
+            grid_config.grid_count, max_possible_orders
+        ));
+    } else if grid_config.grid_count > max_possible_orders / 2 {
+        result.add_warning(format!(
+            "网格数量({})较多，可能导致资金过度分散",
+            grid_config.grid_count
+        ));
+        result.add_suggestion(format!(
+            "建议将网格数量控制在{}以内",
+            max_possible_orders / 2
+        ));
+    }
+    
+    // 4. 风险参数一致性验证
+    if grid_config.max_single_loss > grid_config.max_drawdown {
+        result.add_error(format!(
+            "单笔最大亏损({:.1}%)不应超过最大回撤({:.1}%)",
+            grid_config.max_single_loss * 100.0,
+            grid_config.max_drawdown * 100.0
+        ));
+    }
+    
+    if grid_config.max_daily_loss > grid_config.max_drawdown {
+        result.add_warning(format!(
+            "每日最大亏损({:.1}%)超过最大回撤({:.1}%)，可能过于激进",
+            grid_config.max_daily_loss * 100.0,
+            grid_config.max_drawdown * 100.0
+        ));
+    }
+    
+    // 5. 杠杆与风险的匹配验证
+    if grid_config.leverage > 5 && grid_config.max_drawdown > 0.2 {
+        result.add_warning(format!(
+            "高杠杆({})配合高回撤容忍度({:.1}%)风险较大",
+            grid_config.leverage,
+            grid_config.max_drawdown * 100.0
+        ));
+        result.add_suggestion("建议在高杠杆时降低最大回撤阈值".to_string());
+    }
+    
+    // 6. 保证金安全阈值验证
+    let recommended_margin_threshold = 1.0 / grid_config.leverage as f64 * 3.0; // 杠杆倒数的3倍
+    if grid_config.margin_safety_threshold < recommended_margin_threshold {
+        result.add_warning(format!(
+            "保证金安全阈值({:.1}%)可能过低，建议设置为{:.1}%以上",
+            grid_config.margin_safety_threshold * 100.0,
+            recommended_margin_threshold * 100.0
+        ));
+    }
+    
+    // 7. 最小利润与网格间距的关系验证
+    let min_profit_rate = grid_config.min_profit / grid_config.trade_amount;
+    if min_profit_rate > grid_config.min_grid_spacing * 0.5 {
+        result.add_warning(format!(
+            "最小利润要求({:.4}%)相对于网格间距({:.4}%)过高，可能影响成交频率",
+            min_profit_rate * 100.0,
+            grid_config.min_grid_spacing * 100.0
+        ));
+        result.add_suggestion("建议降低最小利润要求或增加网格间距".to_string());
+    }
+    
+    // 8. 时间参数合理性验证
+    if grid_config.check_interval < 5 {
+        result.add_warning(format!(
+            "检查间隔({} 秒)过短，可能导致过度频繁的API调用",
+            grid_config.check_interval
+        ));
+        result.add_suggestion("建议将检查间隔设置为10-30秒".to_string());
+    } else if grid_config.check_interval > 300 {
+        result.add_warning(format!(
+            "检查间隔({} 秒)过长，可能错过重要的市场变化",
+            grid_config.check_interval
+        ));
+        result.add_suggestion("建议将检查间隔设置为10-60秒".to_string());
+    }
+    
+    // 9. 批量订单参数验证
+    if grid_config.max_orders_per_batch > 50 {
+        result.add_warning(format!(
+            "批量订单数量({})较大，可能导致API限制",
+            grid_config.max_orders_per_batch
+        ));
+        result.add_suggestion("建议将批量订单数量控制在20-50之间".to_string());
+    }
+    
+    if grid_config.order_batch_delay_ms < 100 {
+        result.add_warning(format!(
+            "批量订单延迟({} ms)过短，可能触发API限制",
+            grid_config.order_batch_delay_ms
+        ));
+        result.add_suggestion("建议将批量订单延迟设置为200ms以上".to_string());
+    }
+    
+    result
+}
+
+// 验证动态参数的合理性和一致性
+fn validate_dynamic_parameters(
+    dynamic_params: &DynamicGridParams,
+    grid_config: &crate::config::GridConfig,
+    context: &str,
+) -> ValidationResult {
+    let mut result = ValidationResult::new();
+    
+    // 1. 基本范围验证
+    if dynamic_params.current_min_spacing <= 0.0 {
+        result.add_error("动态最小网格间距必须大于0".to_string());
+    }
+    
+    if dynamic_params.current_max_spacing <= dynamic_params.current_min_spacing {
+        result.add_error("动态最大网格间距必须大于最小间距".to_string());
+    }
+    
+    if dynamic_params.current_trade_amount <= 0.0 {
+        result.add_error("动态交易金额必须大于0".to_string());
+    }
+    
+    // 2. 与原始配置的偏离度验证
+    let min_spacing_deviation = (dynamic_params.current_min_spacing / grid_config.min_grid_spacing - 1.0).abs();
+    let max_spacing_deviation = (dynamic_params.current_max_spacing / grid_config.max_grid_spacing - 1.0).abs();
+    let trade_amount_deviation = (dynamic_params.current_trade_amount / grid_config.trade_amount - 1.0).abs();
+    
+    if min_spacing_deviation > 0.5 {
+        result.add_warning(format!(
+            "最小网格间距偏离原始配置{:.1}%，当前: {:.4}%，原始: {:.4}%",
+            min_spacing_deviation * 100.0,
+            dynamic_params.current_min_spacing * 100.0,
+            grid_config.min_grid_spacing * 100.0
+        ));
+    }
+    
+    if max_spacing_deviation > 0.5 {
+        result.add_warning(format!(
+            "最大网格间距偏离原始配置{:.1}%，当前: {:.4}%，原始: {:.4}%",
+            max_spacing_deviation * 100.0,
+            dynamic_params.current_max_spacing * 100.0,
+            grid_config.max_grid_spacing * 100.0
+        ));
+    }
+    
+    if trade_amount_deviation > 0.3 {
+        result.add_warning(format!(
+            "交易金额偏离原始配置{:.1}%，当前: {:.2}，原始: {:.2}",
+            trade_amount_deviation * 100.0,
+            dynamic_params.current_trade_amount,
+            grid_config.trade_amount
+        ));
+    }
+    
+    // 3. 安全边界验证
+    let min_safe_spacing = grid_config.fee_rate * 2.5;
+    let max_safe_spacing = grid_config.max_grid_spacing * 2.0;
+    let min_safe_amount = grid_config.trade_amount * 0.1;
+    let max_safe_amount = grid_config.total_capital * 0.2;
+    
+    if dynamic_params.current_min_spacing < min_safe_spacing {
+        result.add_error(format!(
+            "动态最小网格间距({:.4}%)低于安全下限({:.4}%)",
+            dynamic_params.current_min_spacing * 100.0,
+            min_safe_spacing * 100.0
+        ));
+    }
+    
+    if dynamic_params.current_max_spacing > max_safe_spacing {
+        result.add_error(format!(
+            "动态最大网格间距({:.4}%)超过安全上限({:.4}%)",
+            dynamic_params.current_max_spacing * 100.0,
+            max_safe_spacing * 100.0
+        ));
+    }
+    
+    if dynamic_params.current_trade_amount < min_safe_amount {
+        result.add_error(format!(
+            "动态交易金额({:.2})低于安全下限({:.2})",
+            dynamic_params.current_trade_amount,
+            min_safe_amount
+        ));
+    }
+    
+    if dynamic_params.current_trade_amount > max_safe_amount {
+        result.add_error(format!(
+            "动态交易金额({:.2})超过安全上限({:.2})",
+            dynamic_params.current_trade_amount,
+            max_safe_amount
+        ));
+    }
+    
+    // 4. 手续费覆盖验证
+    let min_profitable_spacing = grid_config.fee_rate * 3.0;
+    if dynamic_params.current_min_spacing < min_profitable_spacing {
+        result.add_error(format!(
+            "动态最小网格间距({:.4}%)无法覆盖手续费成本，需要至少{:.4}%",
+            dynamic_params.current_min_spacing * 100.0,
+            min_profitable_spacing * 100.0
+        ));
+    }
+    
+    // 5. 网格间距比例验证
+    let spacing_ratio = dynamic_params.current_max_spacing / dynamic_params.current_min_spacing;
+    if spacing_ratio > 15.0 {
+        result.add_warning(format!(
+            "动态网格间距比例过大({:.1}:1)，可能导致策略不稳定",
+            spacing_ratio
+        ));
+        result.add_suggestion("建议调整参数使间距比例控制在10:1以内".to_string());
+    } else if spacing_ratio < 1.2 {
+        result.add_warning(format!(
+            "动态网格间距比例过小({:.1}:1)，可能限制策略灵活性",
+            spacing_ratio
+        ));
+        result.add_suggestion("建议调整参数使间距比例至少为1.5:1".to_string());
+    }
+    
+    // 6. 优化频率验证
+    if dynamic_params.optimization_count > 100 {
+        result.add_warning(format!(
+            "参数优化次数过多({}次)，可能存在过度优化",
+            dynamic_params.optimization_count
+        ));
+        result.add_suggestion("建议检查优化逻辑，避免过度频繁的参数调整".to_string());
+    }
+    
+    // 7. 检查点数量验证
+    if dynamic_params.checkpoints.len() > 20 {
+        result.add_warning(format!(
+            "检查点数量过多({}个)，建议清理旧的检查点",
+            dynamic_params.checkpoints.len()
+        ));
+    }
+    
+    // 8. 性能窗口验证
+    if dynamic_params.performance_window.len() > 50 {
+        result.add_warning(format!(
+            "性能窗口数据过多({}个)，可能影响计算效率",
+            dynamic_params.performance_window.len()
+        ));
+    }
+    
+    // 9. 回滚阈值验证
+    if dynamic_params.rollback_threshold > 50.0 {
+        result.add_warning(format!(
+            "回滚阈值过高({:.1})，可能错过回滚时机",
+            dynamic_params.rollback_threshold
+        ));
+        result.add_suggestion("建议将回滚阈值设置在10-30之间".to_string());
+    } else if dynamic_params.rollback_threshold < 5.0 {
+        result.add_warning(format!(
+            "回滚阈值过低({:.1})，可能导致过度频繁的回滚",
+            dynamic_params.rollback_threshold
+        ));
+        result.add_suggestion("建议将回滚阈值设置在10-30之间".to_string());
+    }
+    
+    // 10. 上下文特定验证
+    match context {
+        "优化前" => {
+            // 优化前的特殊检查
+            if dynamic_params.optimization_count == 0 {
+                result.add_suggestion("首次优化，建议保守调整参数".to_string());
+            }
+        }
+        "优化后" => {
+            // 优化后的特殊检查
+            if dynamic_params.checkpoints.is_empty() {
+                result.add_warning("优化后未创建检查点，无法回滚".to_string());
+            }
+        }
+        "加载时" => {
+            // 加载时的特殊检查
+            let current_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            
+            if current_time - dynamic_params.last_optimization_time > 7 * 24 * 60 * 60 {
+                result.add_suggestion("参数已超过7天未优化，建议检查是否需要更新".to_string());
+            }
+        }
+        _ => {}
+    }
+    
+    result
+}
+
+// 验证参数优化的合理性
+fn validate_parameter_optimization(
+    old_params: &DynamicGridParams,
+    new_params: &DynamicGridParams,
+    grid_config: &crate::config::GridConfig,
+    performance_score: f64,
+) -> ValidationResult {
+    let mut result = ValidationResult::new();
+    
+    // 1. 计算参数变化幅度
+    let min_spacing_change = (new_params.current_min_spacing / old_params.current_min_spacing - 1.0).abs();
+    let max_spacing_change = (new_params.current_max_spacing / old_params.current_max_spacing - 1.0).abs();
+    let trade_amount_change = (new_params.current_trade_amount / old_params.current_trade_amount - 1.0).abs();
+    
+    // 2. 验证变化幅度的合理性
+    if min_spacing_change > 0.2 {
+        result.add_warning(format!(
+            "最小网格间距变化幅度过大({:.1}%)，可能导致策略不稳定",
+            min_spacing_change * 100.0
+        ));
+        result.add_suggestion("建议单次优化的参数调整幅度控制在10%以内".to_string());
+    }
+    
+    if max_spacing_change > 0.2 {
+        result.add_warning(format!(
+            "最大网格间距变化幅度过大({:.1}%)，可能导致策略不稳定",
+            max_spacing_change * 100.0
+        ));
+    }
+    
+    if trade_amount_change > 0.15 {
+        result.add_warning(format!(
+            "交易金额变化幅度过大({:.1}%)，可能影响风险控制",
+            trade_amount_change * 100.0
+        ));
+    }
+    
+    // 3. 验证优化方向的合理性
+    if performance_score < 30.0 {
+        // 低性能时应该保守调整
+        if min_spacing_change > 0.1 || max_spacing_change > 0.1 || trade_amount_change > 0.1 {
+            result.add_warning("性能较差时建议更保守地调整参数".to_string());
+        }
+        
+        if new_params.current_trade_amount > old_params.current_trade_amount {
+            result.add_warning("性能较差时不建议增加交易金额".to_string());
+        }
+    } else if performance_score > 70.0 {
+        // 高性能时可以适度激进
+        if min_spacing_change < 0.02 && max_spacing_change < 0.02 && trade_amount_change < 0.02 {
+            result.add_suggestion("性能良好时可以适度增加参数调整幅度以获得更好收益".to_string());
+        }
+    }
+    
+    // 4. 验证新参数的一致性
+    let new_validation = validate_dynamic_parameters(new_params, grid_config, "优化后");
+    if !new_validation.is_valid {
+        result.add_error("优化后的参数不满足基本要求".to_string());
+        result.errors.extend(new_validation.errors);
+    }
+    
+    // 5. 验证优化频率
+    let time_since_last_optimization = new_params.last_optimization_time - old_params.last_optimization_time;
+    if time_since_last_optimization < 12 * 60 * 60 {
+        result.add_warning(format!(
+            "距离上次优化时间过短({:.1}小时)，可能存在过度优化",
+            time_since_last_optimization as f64 / 3600.0
+        ));
+    }
+    
+    // 6. 验证检查点创建
+    if new_params.checkpoints.len() <= old_params.checkpoints.len() {
+        result.add_warning("优化后未创建新的检查点，无法回滚".to_string());
+    }
+    
+    result
 }
 
 // 处理买单成交
@@ -4147,6 +4668,8 @@ fn auto_optimize_grid_parameters(
     grid_state: &mut GridState,
     grid_config: &crate::config::GridConfig,
 ) -> bool {
+    // 保存优化前的参数状态
+    let old_params = grid_state.dynamic_params.clone();
     let now = SystemTime::now();
     
     // 检查是否需要优化（每24小时最多优化一次）
@@ -4304,6 +4827,23 @@ fn auto_optimize_grid_parameters(
             grid_state.dynamic_params.performance_window.remove(0);
         }
         
+        // 验证优化后的参数
+        let optimization_validation = validate_parameter_optimization(
+            &old_params,
+            &grid_state.dynamic_params,
+            grid_config,
+            performance_score,
+        );
+        
+        optimization_validation.log_results("参数优化");
+        
+        // 如果验证失败，回滚参数
+        if !optimization_validation.is_valid {
+            error!("❌ 参数优化验证失败，回滚到优化前状态");
+            grid_state.dynamic_params = old_params;
+            return false;
+        }
+
         // 保存参数到文件
         if let Err(e) = grid_state.dynamic_params.save_to_file("dynamic_grid_params.json") {
             warn!("⚠️ 保存动态参数失败: {:?}", e);
