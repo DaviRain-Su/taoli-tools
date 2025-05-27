@@ -17,14 +17,15 @@ pair3 = "ETH/BTC"
 [grid]
 # 交易参数
 trading_asset = "FARTCOIN"    # 交易的币种名称
-## total_capital 已完全移除 - 现在直接从账户地址读取实际资金
 grid_count = 8                # 网格数量，增加到8个（从5个增加），提高交易频率
 trade_amount = 80.0           # 每格交易金额，降低到80（从100降低），分散风险
 max_position = 10000.0          # 最大持仓量，防止过度持仓
 max_drawdown = 0.02           # 最大回撤限制，当亏损超过2%时触发清仓
 price_precision = 4           # 价格精度，保留2位小数
 quantity_precision = 1        # 数量精度，保留1位小数
-check_interval = 1            # 检查间隔，减少到3秒（从5秒），更快响应
+check_interval = 10           # 检查间隔，增加到10秒，减少频繁检查
+max_order_age_minutes = 5.0   # 订单最大存活时间5分钟，给订单更多成交机会
+order_status_check_interval = 15  # 订单状态检查间隔（秒），默认15秒
 leverage = 3                  # 杠杆倍数，使用3倍杠杆
 max_active_orders = 20        # 每次最多挂单数量，增加到10个（从6个）
 fee_rate = 0.0004              # 手续费率，0.04%

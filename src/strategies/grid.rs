@@ -1578,9 +1578,9 @@ impl<'de> serde::Deserialize<'de> for AdaptiveOrderConfig {
 impl AdaptiveOrderConfig {
     fn new() -> Self {
         Self {
-            base_max_age_minutes: 30.0,     // 基础30分钟
-            min_age_minutes: 0.5,           // 最小30秒
-            max_age_minutes: 120.0,         // 最大2小时
+            base_max_age_minutes: 5.0,      // 基础5分钟（与配置文件一致）
+            min_age_minutes: 2.0,           // 最小2分钟
+            max_age_minutes: 15.0,          // 最大15分钟
             
             volatility_factor: 1.0,
             trend_factor: 1.0,
@@ -6792,7 +6792,7 @@ pub async fn run_grid_strategy(
                 last_grid_price: 0.0,
                 order_update_threshold: grid_config.order_update_threshold, // 从配置文件读取价格变化触发更新阈值
                 // 修改为存活10s
-                max_order_age_minutes: 0.1,     // 订单最大存活10s  TODO(需要修改进配置文件)
+                max_order_age_minutes: grid_config.max_order_age_minutes,
                     // 自适应订单管理
                     adaptive_order_config: AdaptiveOrderConfig::new(),
                 }
@@ -6857,7 +6857,7 @@ pub async fn run_grid_strategy(
                 last_price_update: SystemTime::now(),
                 last_grid_price: 0.0,
                 order_update_threshold: grid_config.order_update_threshold, // 从配置文件读取价格变化触发更新阈值
-                max_order_age_minutes: 0.1,     // 订单最大存活10s TODO(需要修改进配置文件)
+                max_order_age_minutes: grid_config.max_order_age_minutes,
                 // 自适应订单管理
                 adaptive_order_config: AdaptiveOrderConfig::new(),
             }
@@ -7771,10 +7771,10 @@ pub async fn run_grid_strategy(
                         .await?;
                     }
 
-                    // 3. 定期检查订单状态（每30秒）
+                    // 3. 定期检查订单状态（可配置间隔）
                     if should_execute_periodic_task(
                         grid_state.last_order_batch_time,
-                        30,
+                        grid_config.order_status_check_interval,
                         "订单状态检查"
                     ) {
                         if let Err(e) = check_order_status(
