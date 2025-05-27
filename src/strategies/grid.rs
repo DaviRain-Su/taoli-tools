@@ -59,6 +59,67 @@ struct OrderInfo {
     allocated_funds: f64, // 分配的资金
 }
 
+// 止损状态枚举
+#[derive(Debug, Clone, PartialEq)]
+enum StopLossStatus {
+    Normal,           // 正常
+    Monitoring,       // 监控中
+    PartialExecuted,  // 部分执行
+    FullyExecuted,    // 完全执行
+    Failed,           // 执行失败
+    Disabled,         // 已禁用
+}
+
+impl StopLossStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            StopLossStatus::Normal => "正常",
+            StopLossStatus::Monitoring => "监控中",
+            StopLossStatus::PartialExecuted => "部分执行",
+            StopLossStatus::FullyExecuted => "完全执行",
+            StopLossStatus::Failed => "执行失败",
+            StopLossStatus::Disabled => "已禁用",
+        }
+    }
+    
+    /// 获取英文名称
+    fn as_english(&self) -> &'static str {
+        match self {
+            StopLossStatus::Normal => "Normal",
+            StopLossStatus::Monitoring => "Monitoring",
+            StopLossStatus::PartialExecuted => "Partial Executed",
+            StopLossStatus::FullyExecuted => "Fully Executed",
+            StopLossStatus::Failed => "Failed",
+            StopLossStatus::Disabled => "Disabled",
+        }
+    }
+    
+    /// 判断是否为正常状态
+    fn is_normal(&self) -> bool {
+        matches!(self, StopLossStatus::Normal)
+    }
+    
+    /// 判断是否正在监控
+    fn is_monitoring(&self) -> bool {
+        matches!(self, StopLossStatus::Monitoring)
+    }
+    
+    /// 判断是否已执行（部分或完全）
+    fn is_executed(&self) -> bool {
+        matches!(self, StopLossStatus::PartialExecuted | StopLossStatus::FullyExecuted)
+    }
+    
+    /// 判断是否执行失败
+    fn is_failed(&self) -> bool {
+        matches!(self, StopLossStatus::Failed)
+    }
+    
+    /// 判断是否可以继续交易
+    fn can_continue_trading(&self) -> bool {
+        matches!(self, StopLossStatus::Normal | StopLossStatus::Monitoring | StopLossStatus::PartialExecuted)
+    }
+}
+
 // 网格状态结构体
 #[derive(Debug, Clone)]
 struct GridState {
@@ -69,7 +130,7 @@ struct GridState {
     realized_profit: f64,
     highest_price_after_position: f64, // 持仓后最高价
     trailing_stop_price: f64, // 浮动止损价
-    stop_loss_status: String, // 止损状态
+    stop_loss_status: StopLossStatus, // 止损状态
     last_rebalance_time: SystemTime,
     historical_volatility: f64,
 }
@@ -1107,11 +1168,11 @@ async fn execute_stop_loss(
                     info!("✅ 全部清仓完成，数量: {:.4}", grid_state.position_quantity);
                     grid_state.position_quantity = 0.0;
                     grid_state.position_avg_price = 0.0;
-                    grid_state.stop_loss_status = "已清仓".to_string();
+                    grid_state.stop_loss_status = StopLossStatus::FullyExecuted;
                 }
                 Err(e) => {
                     error!("❌ 全部清仓失败: {:?}", e);
-                    grid_state.stop_loss_status = "清仓失败".to_string();
+                    grid_state.stop_loss_status = StopLossStatus::Failed;
                     return Err(e);
                 }
             }
@@ -1432,7 +1493,7 @@ fn generate_status_report(
         buy_orders.len(),
         sell_orders.len(),
         grid_state.trailing_stop_price,
-        grid_state.stop_loss_status
+        grid_state.stop_loss_status.as_str()
     )
 }
 
@@ -1502,7 +1563,7 @@ pub async fn run_grid_strategy(app_config: crate::config::AppConfig) -> Result<(
         realized_profit: 0.0,
         highest_price_after_position: 0.0,
         trailing_stop_price: 0.0,
-        stop_loss_status: "正常".to_string(),
+        stop_loss_status: StopLossStatus::Normal,
         last_rebalance_time: SystemTime::now(),
         historical_volatility: 0.0,
     };
