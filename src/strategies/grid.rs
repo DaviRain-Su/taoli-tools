@@ -7791,9 +7791,37 @@ pub async fn run_grid_strategy(
                         grid_state.last_order_batch_time = now;
                     }
 
-                    // 3.1 如果没有活跃订单，创建动态网格
-                    if active_orders.is_empty() {
-                        info!("📊 没有活跃订单，创建动态网格...");
+                    // 3.1 检查是否需要重新创建网格
+                    let buy_count = buy_orders.len();
+                    let sell_count = sell_orders.len();
+                    let should_recreate_grid = active_orders.is_empty() || 
+                        (buy_count == 0 && sell_count > 0) ||  // 只有卖单，没有买单
+                        (sell_count == 0 && buy_count > 0) ||  // 只有买单，没有卖单
+                        (buy_count + sell_count < grid_config.grid_count as usize / 2); // 订单数量过少
+                    
+                    if should_recreate_grid {
+                        if active_orders.is_empty() {
+                            info!("📊 没有活跃订单，创建动态网格...");
+                        } else if buy_count == 0 && sell_count > 0 {
+                            info!("📊 只有{}个卖单，没有买单，重新创建网格...", sell_count);
+                        } else if sell_count == 0 && buy_count > 0 {
+                            info!("📊 只有{}个买单，没有卖单，重新创建网格...", buy_count);
+                        } else {
+                            info!("📊 订单数量不足（买单:{}, 卖单:{}），重新创建网格...", buy_count, sell_count);
+                        }
+
+                        // 先取消现有订单
+                        if !active_orders.is_empty() {
+                            info!("🔄 取消现有不平衡的订单...");
+                            cancel_all_orders(
+                                &exchange_client,
+                                &mut active_orders,
+                                &grid_config.trading_asset,
+                            )
+                            .await?;
+                            buy_orders.clear();
+                            sell_orders.clear();
+                        }
 
                         create_dynamic_grid(
                             &exchange_client,
