@@ -2749,7 +2749,7 @@ async fn create_orders_in_batches(
     Ok(created_order_ids)
 }
 
-// 检查订单状态
+// 改进的订单状态检查 - 支持分批处理和超时控制
 async fn check_order_status(
     info_client: &InfoClient,
     user_address: ethers::types::Address,
@@ -2757,27 +2757,180 @@ async fn check_order_status(
     buy_orders: &mut HashMap<u64, OrderInfo>,
     sell_orders: &mut HashMap<u64, OrderInfo>,
 ) -> Result<(), GridStrategyError> {
-    // 获取当前开放订单
-    let open_orders = info_client.open_orders(user_address).await
-        .map_err(|e| GridStrategyError::ClientError(format!("获取开放订单失败: {:?}", e)))?;
+    let start_time = SystemTime::now();
+    let max_processing_time = Duration::from_secs(30); // 最大处理时间30秒
+    let max_orders_per_batch = 100; // 每批最多处理100个订单
     
+    // 如果订单数量过多，进行分批处理
+    if active_orders.len() > max_orders_per_batch {
+        info!("📊 订单数量较多({}个)，启用分批处理模式", active_orders.len());
+        return check_order_status_in_batches(
+            info_client,
+            user_address,
+            active_orders,
+            buy_orders,
+            sell_orders,
+            max_orders_per_batch,
+            max_processing_time,
+        ).await;
+    }
+    
+    // 使用超时控制的API调用
+    let open_orders_result = tokio::time::timeout(
+        Duration::from_secs(10), // API调用超时时间10秒
+        info_client.open_orders(user_address)
+    ).await;
+    
+    let open_orders = match open_orders_result {
+        Ok(Ok(orders)) => orders,
+        Ok(Err(e)) => {
+            return Err(GridStrategyError::ClientError(format!("获取开放订单失败: {:?}", e)));
+        }
+        Err(_) => {
+            warn!("⚠️ 获取开放订单超时，跳过本次检查");
+            return Ok(()); // 超时时不返回错误，避免阻塞主流程
+        }
+    };
+    
+    // 构建开放订单ID集合
     let open_order_ids: std::collections::HashSet<u64> = open_orders
         .iter()
         .map(|order| order.oid)
         .collect();
     
+    info!("🔍 订单状态检查 - 活跃订单: {}, 开放订单: {}", 
+        active_orders.len(), open_order_ids.len());
+    
+    // 统计清理的订单
+    let mut removed_buy_orders = 0;
+    let mut removed_sell_orders = 0;
+    let initial_count = active_orders.len();
+    
     // 检查活跃订单列表中的订单
     active_orders.retain(|&order_id| {
         if !open_order_ids.contains(&order_id) {
             // 订单不在开放订单列表中，可能已成交或取消
-            buy_orders.remove(&order_id);
-            sell_orders.remove(&order_id);
+            if buy_orders.remove(&order_id).is_some() {
+                removed_buy_orders += 1;
+            }
+            if sell_orders.remove(&order_id).is_some() {
+                removed_sell_orders += 1;
+            }
             info!("📋 订单{}已从活跃列表中移除（可能已成交或取消）", order_id);
             false
         } else {
             true
         }
     });
+    
+    let processing_time = start_time.elapsed().unwrap_or_default();
+    info!("✅ 订单状态检查完成 - 处理时间: {}ms, 移除订单: {} (买单: {}, 卖单: {})", 
+        processing_time.as_millis(),
+        initial_count - active_orders.len(),
+        removed_buy_orders,
+        removed_sell_orders
+    );
+    
+    Ok(())
+}
+
+// 分批处理订单状态检查
+async fn check_order_status_in_batches(
+    info_client: &InfoClient,
+    user_address: ethers::types::Address,
+    active_orders: &mut Vec<u64>,
+    buy_orders: &mut HashMap<u64, OrderInfo>,
+    sell_orders: &mut HashMap<u64, OrderInfo>,
+    batch_size: usize,
+    max_total_time: Duration,
+) -> Result<(), GridStrategyError> {
+    let start_time = SystemTime::now();
+    let mut total_removed = 0;
+    let mut batch_count = 0;
+    
+    info!("🔄 开始分批订单状态检查 - 总订单: {}, 批次大小: {}", 
+        active_orders.len(), batch_size);
+    
+    // 首先获取所有开放订单（只调用一次API）
+    let open_orders_result = tokio::time::timeout(
+        Duration::from_secs(15), // 增加超时时间，因为可能订单较多
+        info_client.open_orders(user_address)
+    ).await;
+    
+    let open_orders = match open_orders_result {
+        Ok(Ok(orders)) => orders,
+        Ok(Err(e)) => {
+            return Err(GridStrategyError::ClientError(format!("获取开放订单失败: {:?}", e)));
+        }
+        Err(_) => {
+            warn!("⚠️ 获取开放订单超时，跳过本次检查");
+            return Ok(());
+        }
+    };
+    
+    let open_order_ids: std::collections::HashSet<u64> = open_orders
+        .iter()
+        .map(|order| order.oid)
+        .collect();
+    
+    info!("📊 获取到{}个开放订单，开始分批处理", open_order_ids.len());
+    
+    // 分批处理活跃订单
+    let mut orders_to_remove = Vec::new();
+    
+    for chunk in active_orders.chunks(batch_size) {
+        // 检查是否超时
+        if start_time.elapsed().unwrap_or_default() > max_total_time {
+            warn!("⚠️ 分批处理超时，停止处理剩余订单");
+            break;
+        }
+        
+        batch_count += 1;
+        let mut batch_removed = 0;
+        
+        for &order_id in chunk {
+            if !open_order_ids.contains(&order_id) {
+                orders_to_remove.push(order_id);
+                batch_removed += 1;
+            }
+        }
+        
+        info!("📋 第{}批处理完成 - 检查: {}, 移除: {}", 
+            batch_count, chunk.len(), batch_removed);
+        
+        total_removed += batch_removed;
+        
+        // 批次间小延迟，避免过度占用CPU
+        if batch_count % 5 == 0 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+    
+    // 统一移除订单
+    let mut removed_buy_orders = 0;
+    let mut removed_sell_orders = 0;
+    
+    for order_id in &orders_to_remove {
+        if buy_orders.remove(order_id).is_some() {
+            removed_buy_orders += 1;
+        }
+        if sell_orders.remove(order_id).is_some() {
+            removed_sell_orders += 1;
+        }
+        info!("📋 订单{}已从活跃列表中移除（可能已成交或取消）", order_id);
+    }
+    
+    // 从活跃订单列表中移除
+    active_orders.retain(|order_id| !orders_to_remove.contains(order_id));
+    
+    let processing_time = start_time.elapsed().unwrap_or_default();
+    info!("✅ 分批订单状态检查完成 - 处理时间: {}ms, 批次数: {}, 移除订单: {} (买单: {}, 卖单: {})", 
+        processing_time.as_millis(),
+        batch_count,
+        total_removed,
+        removed_buy_orders,
+        removed_sell_orders
+    );
     
     Ok(())
 }
