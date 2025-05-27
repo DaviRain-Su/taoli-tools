@@ -47,6 +47,66 @@ pub enum GridStrategyError {
 
     #[error("止损执行失败: {0}")]
     StopLossError(String),
+
+    #[error("保证金不足: {0}")]
+    MarginInsufficient(String),
+
+    #[error("网络连接失败: {0}")]
+    NetworkError(String),
+}
+
+// 性能指标结构体
+#[derive(Debug, Clone)]
+struct PerformanceMetrics {
+    total_trades: u32,
+    winning_trades: u32,
+    losing_trades: u32,
+    win_rate: f64,
+    total_profit: f64,
+    max_drawdown: f64,
+    sharpe_ratio: f64,
+    profit_factor: f64,
+    average_win: f64,
+    average_loss: f64,
+    largest_win: f64,
+    largest_loss: f64,
+}
+
+// 性能记录结构体
+#[derive(Debug, Clone)]
+struct PerformanceRecord {
+    timestamp: SystemTime,
+    price: f64,
+    action: String,
+    profit: f64,
+    total_capital: f64,
+}
+
+// 订单状态枚举
+#[derive(Debug, Clone, PartialEq)]
+enum OrderStatus {
+    Pending,    // 待处理
+    Active,     // 活跃
+    Filled,     // 已成交
+    Cancelled,  // 已取消
+    Rejected,   // 被拒绝
+    PartiallyFilled, // 部分成交
+}
+
+// 增强的订单信息结构体
+#[derive(Debug, Clone)]
+struct EnhancedOrderInfo {
+    order_id: u64,
+    price: f64,
+    quantity: f64,
+    filled_quantity: f64,
+    cost_price: Option<f64>,
+    potential_sell_price: Option<f64>,
+    allocated_funds: f64,
+    status: OrderStatus,
+    created_time: SystemTime,
+    last_update_time: SystemTime,
+    retry_count: u32,
 }
 
 // 订单信息结构体
@@ -139,6 +199,11 @@ struct GridState {
     stop_loss_status: StopLossStatus,  // 止损状态
     last_rebalance_time: SystemTime,
     historical_volatility: f64,
+    performance_history: Vec<PerformanceRecord>, // 性能历史记录
+    current_metrics: PerformanceMetrics,         // 当前性能指标
+    last_margin_check: SystemTime,              // 上次保证金检查时间
+    connection_retry_count: u32,                // 连接重试次数
+    last_order_batch_time: SystemTime,          // 上次批量下单时间
 }
 
 // 市场趋势枚举
@@ -1811,6 +1876,24 @@ pub async fn run_grid_strategy(
         stop_loss_status: StopLossStatus::Normal,
         last_rebalance_time: SystemTime::now(),
         historical_volatility: 0.0,
+        performance_history: Vec::new(),
+        current_metrics: PerformanceMetrics {
+            total_trades: 0,
+            winning_trades: 0,
+            losing_trades: 0,
+            win_rate: 0.0,
+            total_profit: 0.0,
+            max_drawdown: 0.0,
+            sharpe_ratio: 0.0,
+            profit_factor: 0.0,
+            average_win: 0.0,
+            average_loss: 0.0,
+            largest_win: 0.0,
+            largest_loss: 0.0,
+        },
+        last_margin_check: SystemTime::now(),
+        connection_retry_count: 0,
+        last_order_batch_time: SystemTime::now(),
     };
 
     let mut active_orders: Vec<u64> = Vec::new();
@@ -2123,4 +2206,280 @@ pub async fn run_grid_strategy(
 
     info!("🏁 网格交易策略已结束");
     Ok(())
+}
+
+// 检查保证金率
+async fn check_margin_ratio(
+    info_client: &InfoClient,
+    user_address: ethers::types::Address,
+    grid_config: &crate::config::GridConfig,
+) -> Result<f64, GridStrategyError> {
+    let account_info = get_account_info(info_client, user_address).await?;
+    
+    // 解析保证金信息
+    let margin_used = account_info.margin_summary.account_value.parse::<f64>()
+        .map_err(|e| GridStrategyError::PriceParseError(format!("解析账户价值失败: {:?}", e)))?;
+    
+    let total_margin_requirement = account_info.margin_summary.total_margin_used.parse::<f64>()
+        .map_err(|e| GridStrategyError::PriceParseError(format!("解析保证金使用失败: {:?}", e)))?;
+    
+    let margin_ratio = if total_margin_requirement > 0.0 {
+        margin_used / total_margin_requirement
+    } else {
+        1.0 // 如果没有保证金要求，认为是安全的
+    };
+    
+    if margin_ratio < grid_config.margin_safety_threshold {
+        warn!(
+            "🚨 保证金率过低: {:.2}%, 低于安全阈值: {:.2}%",
+            margin_ratio * 100.0,
+            grid_config.margin_safety_threshold * 100.0
+        );
+        return Err(GridStrategyError::MarginInsufficient(format!(
+            "保证金率过低: {:.2}%",
+            margin_ratio * 100.0
+        )));
+    }
+    
+    Ok(margin_ratio)
+}
+
+// 确保连接状态
+async fn ensure_connection(
+    info_client: &InfoClient,
+    user_address: ethers::types::Address,
+    grid_state: &mut GridState,
+) -> Result<bool, GridStrategyError> {
+    match get_account_info(info_client, user_address).await {
+        Ok(_) => {
+            grid_state.connection_retry_count = 0;
+            Ok(true)
+        }
+        Err(e) => {
+            grid_state.connection_retry_count += 1;
+            warn!(
+                "⚠️ 连接检查失败 (重试次数: {}): {:?}",
+                grid_state.connection_retry_count, e
+            );
+            
+            if grid_state.connection_retry_count > 5 {
+                return Err(GridStrategyError::NetworkError(
+                    "连接失败次数过多".to_string(),
+                ));
+            }
+            
+            // 等待一段时间后重试
+            sleep(Duration::from_secs(2_u64.pow(grid_state.connection_retry_count.min(4)))).await;
+            Ok(false)
+        }
+    }
+}
+
+// 计算性能指标
+fn calculate_performance_metrics(
+    grid_state: &GridState,
+    price_history: &[f64],
+) -> PerformanceMetrics {
+    let total_trades = grid_state.performance_history.len() as u32;
+    
+    if total_trades == 0 {
+        return PerformanceMetrics {
+            total_trades: 0,
+            winning_trades: 0,
+            losing_trades: 0,
+            win_rate: 0.0,
+            total_profit: 0.0,
+            max_drawdown: 0.0,
+            sharpe_ratio: 0.0,
+            profit_factor: 0.0,
+            average_win: 0.0,
+            average_loss: 0.0,
+            largest_win: 0.0,
+            largest_loss: 0.0,
+        };
+    }
+    
+    let mut winning_trades = 0;
+    let mut losing_trades = 0;
+    let mut total_wins = 0.0;
+    let mut total_losses = 0.0;
+    let mut largest_win: f64 = 0.0;
+    let mut largest_loss: f64 = 0.0;
+    let mut peak_capital = grid_state.total_capital;
+    let mut max_drawdown: f64 = 0.0;
+    
+    for record in &grid_state.performance_history {
+        if record.profit > 0.0 {
+            winning_trades += 1;
+            total_wins += record.profit;
+            largest_win = largest_win.max(record.profit);
+        } else if record.profit < 0.0 {
+            losing_trades += 1;
+            total_losses += record.profit.abs();
+            largest_loss = largest_loss.max(record.profit.abs());
+        }
+        
+        // 计算最大回撤
+        peak_capital = peak_capital.max(record.total_capital);
+        let drawdown = (peak_capital - record.total_capital) / peak_capital;
+        max_drawdown = max_drawdown.max(drawdown);
+    }
+    
+    let win_rate = if total_trades > 0 {
+        winning_trades as f64 / total_trades as f64
+    } else {
+        0.0
+    };
+    
+    let average_win = if winning_trades > 0 {
+        total_wins / winning_trades as f64
+    } else {
+        0.0
+    };
+    
+    let average_loss = if losing_trades > 0 {
+        total_losses / losing_trades as f64
+    } else {
+        0.0
+    };
+    
+    let profit_factor = if total_losses > 0.0 {
+        total_wins / total_losses
+    } else if total_wins > 0.0 {
+        f64::INFINITY
+    } else {
+        0.0
+    };
+    
+    // 简化的夏普比率计算
+    let returns: Vec<f64> = grid_state.performance_history
+        .iter()
+        .map(|r| r.profit / r.total_capital)
+        .collect();
+    
+    let mean_return = if !returns.is_empty() {
+        returns.iter().sum::<f64>() / returns.len() as f64
+    } else {
+        0.0
+    };
+    
+    let return_std = if returns.len() > 1 {
+        let variance = returns
+            .iter()
+            .map(|r| (r - mean_return).powi(2))
+            .sum::<f64>()
+            / (returns.len() - 1) as f64;
+        variance.sqrt()
+    } else {
+        0.0
+    };
+    
+    let sharpe_ratio = if return_std > 0.0 {
+        mean_return / return_std
+    } else {
+        0.0
+    };
+    
+    PerformanceMetrics {
+        total_trades,
+        winning_trades,
+        losing_trades,
+        win_rate,
+        total_profit: grid_state.realized_profit,
+        max_drawdown,
+        sharpe_ratio,
+        profit_factor,
+        average_win,
+        average_loss,
+        largest_win,
+        largest_loss,
+    }
+}
+
+// 分批创建订单 - 简化版本，避免复杂的类型处理
+async fn create_orders_in_batches(
+    _exchange_client: &ExchangeClient,
+    _orders: Vec<ClientOrderRequest>,
+    _grid_config: &crate::config::GridConfig,
+    _grid_state: &mut GridState,
+) -> Result<Vec<u64>, GridStrategyError> {
+    // 暂时返回空结果，避免复杂的类型处理
+    // 在实际使用时可以根据需要实现具体逻辑
+    warn!("⚠️ 批量订单创建功能暂未实现");
+    Ok(Vec::new())
+}
+
+// 检查订单状态
+async fn check_order_status(
+    info_client: &InfoClient,
+    user_address: ethers::types::Address,
+    active_orders: &mut Vec<u64>,
+    buy_orders: &mut HashMap<u64, OrderInfo>,
+    sell_orders: &mut HashMap<u64, OrderInfo>,
+) -> Result<(), GridStrategyError> {
+    // 获取当前开放订单
+    let open_orders = info_client.open_orders(user_address).await
+        .map_err(|e| GridStrategyError::ClientError(format!("获取开放订单失败: {:?}", e)))?;
+    
+    let open_order_ids: std::collections::HashSet<u64> = open_orders
+        .iter()
+        .map(|order| order.oid)
+        .collect();
+    
+    // 检查活跃订单列表中的订单
+    active_orders.retain(|&order_id| {
+        if !open_order_ids.contains(&order_id) {
+            // 订单不在开放订单列表中，可能已成交或取消
+            buy_orders.remove(&order_id);
+            sell_orders.remove(&order_id);
+            info!("📋 订单{}已从活跃列表中移除（可能已成交或取消）", order_id);
+            false
+        } else {
+            true
+        }
+    });
+    
+    Ok(())
+}
+
+// 优化网格参数
+fn optimize_grid_parameters(
+    grid_config: &mut crate::config::GridConfig,
+    grid_state: &GridState,
+) {
+    if grid_state.performance_history.len() < 10 {
+        return; // 数据不足，无法优化
+    }
+    
+    // 分析最近的表现
+    let recent_records: Vec<&PerformanceRecord> = grid_state
+        .performance_history
+        .iter()
+        .rev()
+        .take(20)
+        .collect();
+    
+    let recent_profit: f64 = recent_records.iter().map(|r| r.profit).sum();
+    let recent_win_rate = recent_records
+        .iter()
+        .filter(|r| r.profit > 0.0)
+        .count() as f64
+        / recent_records.len() as f64;
+    
+    // 根据表现调整网格间距
+    if recent_profit > 0.0 && recent_win_rate > 0.6 {
+        // 表现良好，可以稍微增加网格间距以获得更大利润
+        grid_config.min_grid_spacing *= 1.05;
+        grid_config.max_grid_spacing *= 1.05;
+        info!("📈 表现良好，增加网格间距以优化利润");
+    } else if recent_profit < 0.0 || recent_win_rate < 0.4 {
+        // 表现不佳，减少网格间距以提高成交频率
+        grid_config.min_grid_spacing *= 0.95;
+        grid_config.max_grid_spacing *= 0.95;
+        info!("📉 表现不佳，减少网格间距以提高成交频率");
+    }
+    
+    // 确保网格间距在合理范围内
+    grid_config.min_grid_spacing = grid_config.min_grid_spacing.max(0.001).min(0.05);
+    grid_config.max_grid_spacing = grid_config.max_grid_spacing.max(grid_config.min_grid_spacing).min(0.1);
 }

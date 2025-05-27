@@ -52,6 +52,10 @@ pub struct GridConfig {
     pub max_single_loss: f64,
     pub max_daily_loss: f64,
     pub trailing_stop_ratio: f64, // 浮动止损比例，默认0.1（10%）
+    pub margin_safety_threshold: f64, // 保证金安全阈值，默认0.3（30%）
+    pub slippage_tolerance: f64,   // 滑点容忍度，默认0.001（0.1%）
+    pub max_orders_per_batch: usize, // 每批最大订单数，默认5
+    pub order_batch_delay_ms: u64, // 批次间延迟毫秒数，默认200ms
     pub max_holding_time: u64,
     pub history_length: usize,
     pub max_active_orders: usize,    // 每次最多挂单数量（买/卖各自）
