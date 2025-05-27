@@ -1395,6 +1395,368 @@ struct ParameterCheckpoint {
     reason: String,
 }
 
+#[derive(Debug, Clone)]
+struct AdaptiveOrderConfig {
+    // 基础配置
+    base_max_age_minutes: f64,          // 基础最大存活时间
+    min_age_minutes: f64,               // 最小存活时间
+    max_age_minutes: f64,               // 最大存活时间
+    
+    // 市场状况适应
+    volatility_factor: f64,             // 波动率因子 (0.5-2.0)
+    trend_factor: f64,                  // 趋势因子 (0.5-2.0)
+    liquidity_factor: f64,              // 流动性因子 (0.5-2.0)
+    
+    // 性能适应
+    success_rate_factor: f64,           // 成功率因子
+    profit_factor: f64,                 // 盈利因子
+    
+    // 动态调整历史
+    adjustment_history: Vec<f64>,       // 调整历史记录
+    last_adjustment_time: u64,          // 上次调整时间
+    adjustment_count: u32,              // 调整次数
+    
+    // 统计信息
+    average_fill_time_minutes: f64,     // 平均成交时间
+    order_success_rate: f64,            // 订单成功率
+    recent_volatility: f64,             // 最近波动率
+}
+
+impl serde::Serialize for AdaptiveOrderConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("AdaptiveOrderConfig", 12)?;
+        state.serialize_field("base_max_age_minutes", &self.base_max_age_minutes)?;
+        state.serialize_field("min_age_minutes", &self.min_age_minutes)?;
+        state.serialize_field("max_age_minutes", &self.max_age_minutes)?;
+        state.serialize_field("volatility_factor", &self.volatility_factor)?;
+        state.serialize_field("trend_factor", &self.trend_factor)?;
+        state.serialize_field("liquidity_factor", &self.liquidity_factor)?;
+        state.serialize_field("success_rate_factor", &self.success_rate_factor)?;
+        state.serialize_field("profit_factor", &self.profit_factor)?;
+        state.serialize_field("adjustment_history", &self.adjustment_history)?;
+        state.serialize_field("last_adjustment_time", &self.last_adjustment_time)?;
+        state.serialize_field("adjustment_count", &self.adjustment_count)?;
+        state.serialize_field("average_fill_time_minutes", &self.average_fill_time_minutes)?;
+        state.serialize_field("order_success_rate", &self.order_success_rate)?;
+        state.serialize_field("recent_volatility", &self.recent_volatility)?;
+        state.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for AdaptiveOrderConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{MapAccess, Visitor};
+        use std::fmt;
+
+        struct AdaptiveOrderConfigVisitor;
+
+        impl<'de> Visitor<'de> for AdaptiveOrderConfigVisitor {
+            type Value = AdaptiveOrderConfig;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("struct AdaptiveOrderConfig")
+            }
+
+            fn visit_map<V>(self, mut map: V) -> Result<AdaptiveOrderConfig, V::Error>
+            where
+                V: MapAccess<'de>,
+            {
+                let mut base_max_age_minutes = None;
+                let mut min_age_minutes = None;
+                let mut max_age_minutes = None;
+                let mut volatility_factor = None;
+                let mut trend_factor = None;
+                let mut liquidity_factor = None;
+                let mut success_rate_factor = None;
+                let mut profit_factor = None;
+                let mut adjustment_history = None;
+                let mut last_adjustment_time = None;
+                let mut adjustment_count = None;
+                let mut average_fill_time_minutes = None;
+                let mut order_success_rate = None;
+                let mut recent_volatility = None;
+
+                while let Some(key) = map.next_key()? {
+                    match key {
+                        "base_max_age_minutes" => {
+                            base_max_age_minutes = Some(map.next_value()?);
+                        }
+                        "min_age_minutes" => {
+                            min_age_minutes = Some(map.next_value()?);
+                        }
+                        "max_age_minutes" => {
+                            max_age_minutes = Some(map.next_value()?);
+                        }
+                        "volatility_factor" => {
+                            volatility_factor = Some(map.next_value()?);
+                        }
+                        "trend_factor" => {
+                            trend_factor = Some(map.next_value()?);
+                        }
+                        "liquidity_factor" => {
+                            liquidity_factor = Some(map.next_value()?);
+                        }
+                        "success_rate_factor" => {
+                            success_rate_factor = Some(map.next_value()?);
+                        }
+                        "profit_factor" => {
+                            profit_factor = Some(map.next_value()?);
+                        }
+                        "adjustment_history" => {
+                            adjustment_history = Some(map.next_value()?);
+                        }
+                        "last_adjustment_time" => {
+                            last_adjustment_time = Some(map.next_value()?);
+                        }
+                        "adjustment_count" => {
+                            adjustment_count = Some(map.next_value()?);
+                        }
+                        "average_fill_time_minutes" => {
+                            average_fill_time_minutes = Some(map.next_value()?);
+                        }
+                        "order_success_rate" => {
+                            order_success_rate = Some(map.next_value()?);
+                        }
+                        "recent_volatility" => {
+                            recent_volatility = Some(map.next_value()?);
+                        }
+                        _ => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+
+                Ok(AdaptiveOrderConfig {
+                    base_max_age_minutes: base_max_age_minutes.unwrap_or(30.0),
+                    min_age_minutes: min_age_minutes.unwrap_or(0.5),
+                    max_age_minutes: max_age_minutes.unwrap_or(120.0),
+                    volatility_factor: volatility_factor.unwrap_or(1.0),
+                    trend_factor: trend_factor.unwrap_or(1.0),
+                    liquidity_factor: liquidity_factor.unwrap_or(1.0),
+                    success_rate_factor: success_rate_factor.unwrap_or(1.0),
+                    profit_factor: profit_factor.unwrap_or(1.0),
+                    adjustment_history: adjustment_history.unwrap_or_default(),
+                    last_adjustment_time: last_adjustment_time.unwrap_or_else(safe_unix_timestamp),
+                    adjustment_count: adjustment_count.unwrap_or(0),
+                    average_fill_time_minutes: average_fill_time_minutes.unwrap_or(15.0),
+                    order_success_rate: order_success_rate.unwrap_or(0.8),
+                    recent_volatility: recent_volatility.unwrap_or(0.02),
+                })
+            }
+        }
+
+        deserializer.deserialize_struct(
+            "AdaptiveOrderConfig",
+            &[
+                "base_max_age_minutes",
+                "min_age_minutes", 
+                "max_age_minutes",
+                "volatility_factor",
+                "trend_factor",
+                "liquidity_factor",
+                "success_rate_factor",
+                "profit_factor",
+                "adjustment_history",
+                "last_adjustment_time",
+                "adjustment_count",
+                "average_fill_time_minutes",
+                "order_success_rate",
+                "recent_volatility",
+            ],
+            AdaptiveOrderConfigVisitor,
+        )
+    }
+}
+
+impl AdaptiveOrderConfig {
+    fn new() -> Self {
+        Self {
+            base_max_age_minutes: 30.0,     // 基础30分钟
+            min_age_minutes: 0.5,           // 最小30秒
+            max_age_minutes: 120.0,         // 最大2小时
+            
+            volatility_factor: 1.0,
+            trend_factor: 1.0,
+            liquidity_factor: 1.0,
+            
+            success_rate_factor: 1.0,
+            profit_factor: 1.0,
+            
+            adjustment_history: Vec::new(),
+            last_adjustment_time: safe_unix_timestamp(),
+            adjustment_count: 0,
+            
+            average_fill_time_minutes: 15.0,
+            order_success_rate: 0.8,
+            recent_volatility: 0.02,
+        }
+    }
+    
+    /// 根据市场状况计算自适应的订单最大存活时间
+    fn calculate_adaptive_max_age(
+        &mut self,
+        market_analysis: &MarketAnalysis,
+        grid_state: &GridState,
+        current_success_rate: f64,
+    ) -> f64 {
+        let now = safe_unix_timestamp();
+        
+        // 1. 基于市场波动率调整
+        let volatility_adjustment = if market_analysis.volatility > 0.05 {
+            // 高波动市场：缩短订单存活时间，快速响应
+            0.3 + (0.05 - market_analysis.volatility.min(0.05)) * 10.0
+        } else if market_analysis.volatility < 0.01 {
+            // 低波动市场：延长订单存活时间，减少频繁更新
+            1.5 + (0.01 - market_analysis.volatility) * 50.0
+        } else {
+            // 正常波动：基础倍数
+            1.0
+        };
+        
+        // 2. 基于市场趋势调整
+        let trend_adjustment = match market_analysis.trend {
+            MarketTrend::Upward | MarketTrend::Downward => {
+                // 明显趋势：缩短存活时间，快速跟随趋势
+                0.6
+            }
+            MarketTrend::Sideways => {
+                // 震荡市场：延长存活时间，减少无效更新
+                1.4
+            }
+        };
+        
+        // 3. 基于市场状态调整
+        let market_state_adjustment = match market_analysis.market_state {
+            MarketState::Normal => 1.0,
+            MarketState::HighVolatility => 0.4,     // 高波动：快速更新
+            MarketState::Extreme => 0.2,            // 极端市场：极快更新
+            MarketState::ThinLiquidity => 2.0,      // 流动性不足：延长等待
+            MarketState::Flash => 0.1,              // 闪崩/闪涨：立即更新
+            MarketState::Consolidation => 1.8,      // 盘整：延长等待
+        };
+        
+        // 4. 基于订单成功率调整
+        let success_rate_adjustment = if current_success_rate > 0.9 {
+            // 高成功率：可以延长等待时间
+            1.2
+        } else if current_success_rate < 0.5 {
+            // 低成功率：缩短等待时间，快速调整
+            0.6
+        } else {
+            1.0
+        };
+        
+        // 5. 基于盈利情况调整
+        let profit_adjustment = if grid_state.realized_profit > 0.0 {
+            // 盈利状态：稍微保守，延长等待
+            1.1
+        } else if grid_state.realized_profit < -grid_state.total_capital * 0.02 {
+            // 亏损超过2%：激进调整，缩短等待
+            0.7
+        } else {
+            1.0
+        };
+        
+        // 6. 综合计算
+        let combined_factor = volatility_adjustment 
+            * trend_adjustment 
+            * market_state_adjustment 
+            * success_rate_adjustment 
+            * profit_adjustment;
+        
+        let adaptive_age = self.base_max_age_minutes * combined_factor;
+        
+        // 7. 应用边界限制
+        let final_age = adaptive_age.max(self.min_age_minutes).min(self.max_age_minutes);
+        
+        // 8. 记录调整历史
+        if (now - self.last_adjustment_time) > 300 {  // 5分钟记录一次
+            self.adjustment_history.push(final_age);
+            if self.adjustment_history.len() > 20 {
+                self.adjustment_history.remove(0);
+            }
+            self.last_adjustment_time = now;
+            self.adjustment_count += 1;
+        }
+        
+        // 9. 更新统计信息
+        self.volatility_factor = volatility_adjustment;
+        self.trend_factor = trend_adjustment;
+        self.liquidity_factor = market_state_adjustment;
+        self.success_rate_factor = success_rate_adjustment;
+        self.profit_factor = profit_adjustment;
+        self.recent_volatility = market_analysis.volatility;
+        self.order_success_rate = current_success_rate;
+        
+        final_age
+    }
+    
+    /// 获取自适应配置报告
+    fn get_adaptive_report(&self) -> String {
+        let avg_age = if self.adjustment_history.is_empty() {
+            self.base_max_age_minutes
+        } else {
+            self.adjustment_history.iter().sum::<f64>() / self.adjustment_history.len() as f64
+        };
+        
+        format!(
+            "📊 自适应订单配置状态:\n\
+             ├─ 当前基础存活时间: {:.1}分钟\n\
+             ├─ 平均调整后时间: {:.1}分钟\n\
+             ├─ 调整范围: {:.1}-{:.1}分钟\n\
+             ├─ 波动率因子: {:.2}x\n\
+             ├─ 趋势因子: {:.2}x\n\
+             ├─ 流动性因子: {:.2}x\n\
+             ├─ 成功率因子: {:.2}x\n\
+             ├─ 盈利因子: {:.2}x\n\
+             ├─ 调整次数: {}\n\
+             ├─ 订单成功率: {:.1}%\n\
+             └─ 最近波动率: {:.2}%",
+            self.base_max_age_minutes,
+            avg_age,
+            self.min_age_minutes,
+            self.max_age_minutes,
+            self.volatility_factor,
+            self.trend_factor,
+            self.liquidity_factor,
+            self.success_rate_factor,
+            self.profit_factor,
+            self.adjustment_count,
+            self.order_success_rate * 100.0,
+            self.recent_volatility * 100.0
+        )
+    }
+    
+    /// 重置统计信息
+    fn reset_stats(&mut self) {
+        self.adjustment_history.clear();
+        self.adjustment_count = 0;
+        self.last_adjustment_time = safe_unix_timestamp();
+    }
+    
+    /// 手动调整基础参数
+    fn adjust_base_parameters(&mut self, new_base_minutes: f64, new_min: f64, new_max: f64) {
+        self.base_max_age_minutes = new_base_minutes.max(0.1).min(240.0);
+        self.min_age_minutes = new_min.max(0.1).min(60.0);
+        self.max_age_minutes = new_max.max(1.0).min(480.0);
+        
+        // 确保逻辑关系正确
+        if self.min_age_minutes > self.base_max_age_minutes {
+            self.min_age_minutes = self.base_max_age_minutes * 0.1;
+        }
+        if self.max_age_minutes < self.base_max_age_minutes {
+            self.max_age_minutes = self.base_max_age_minutes * 3.0;
+        }
+    }
+}
+
 // 退出原因枚举
 #[derive(Debug, Clone, PartialEq)]
 enum ShutdownReason {
@@ -1738,7 +2100,9 @@ struct GridState {
     last_price_update: SystemTime,              // 上次价格更新时间
     last_grid_price: f64,                       // 上次网格创建时的价格
     order_update_threshold: f64,                // 订单更新阈值（价格变化百分比）
-    max_order_age_minutes: u64,                 // 订单最大存活时间（分钟）
+    max_order_age_minutes: f64,                 // 订单最大存活时间（分钟）
+    // 自适应订单管理
+    adaptive_order_config: AdaptiveOrderConfig, // 自适应订单配置
 }
 
 // 市场趋势枚举
@@ -5735,14 +6099,41 @@ async fn smart_update_orders(
 ) -> Result<bool, GridStrategyError> {
     let now = SystemTime::now();
     
+    // 分析市场状况
+    let market_analysis = analyze_market_trend(price_history);
+    
+    // 计算订单成功率
+    let total_orders = buy_orders.len() + sell_orders.len();
+    let current_success_rate = if total_orders > 0 {
+        // 简化的成功率计算，实际应该基于历史成交数据
+        0.8 // 默认80%成功率，可以根据实际情况调整
+    } else {
+        0.8
+    };
+    
+    // 使用自适应配置计算动态订单存活时间
+    let adaptive_max_age = {
+        let mut adaptive_config = grid_state.adaptive_order_config.clone();
+        let result = adaptive_config.calculate_adaptive_max_age(
+            &market_analysis,
+            grid_state,
+            current_success_rate,
+        );
+        grid_state.adaptive_order_config = adaptive_config;
+        result
+    };
+    
+    // 更新 max_order_age_minutes 为自适应值
+    grid_state.max_order_age_minutes = adaptive_max_age;
+    
     // 检查是否需要更新订单
     let price_change_ratio = (current_price - grid_state.last_grid_price).abs() / grid_state.last_grid_price;
     let time_since_last_update = now.duration_since(grid_state.last_price_update)
         .unwrap_or(Duration::from_secs(0));
     
     // 检查订单年龄
-    let order_age_minutes = time_since_last_update.as_secs() / 60;
-    let orders_too_old = order_age_minutes >= grid_state.max_order_age_minutes;
+    let order_age_minutes = time_since_last_update.as_secs() as f64 / 60.0;
+    let orders_too_old = order_age_minutes >= adaptive_max_age;
     
     // 检查买单是否远离当前价格
     let mut orders_too_far = false;
@@ -5769,11 +6160,12 @@ async fn smart_update_orders(
     
     if should_update {
         info!(
-            "🔄 触发智能订单更新 - 价格变化: {:.2}%, 订单年龄: {}分钟, 订单过远: {}, 阈值: {:.2}%",
+            "🔄 触发智能订单更新 - 价格变化: {:.2}%, 订单年龄: {:.1}分钟, 订单过远: {}, 阈值: {:.2}%, 自适应存活时间: {:.1}分钟",
             price_change_ratio * 100.0,
             order_age_minutes,
             orders_too_far,
-            grid_state.order_update_threshold * 100.0
+            grid_state.order_update_threshold * 100.0,
+            adaptive_max_age
         );
         
         // 取消现有订单
@@ -5823,7 +6215,7 @@ async fn cleanup_expired_orders(
     sell_orders: &mut HashMap<u64, OrderInfo>,
 ) -> Result<(), GridStrategyError> {
     let now = SystemTime::now();
-    let max_age = Duration::from_secs(grid_state.max_order_age_minutes * 60);
+    let max_age = Duration::from_secs((grid_state.max_order_age_minutes * 60.0) as u64);
     
     let time_since_creation = now.duration_since(grid_state.last_order_batch_time)
         .unwrap_or(Duration::from_secs(0));
@@ -6193,6 +6585,9 @@ fn generate_status_report(
         历史交易数: {}\n\
         最大回撤: {:.2}%\n\
         连接重试次数: {}\n\
+        自适应订单存活时间: {:.1}分钟\n\
+        订单成功率: {:.1}%\n\
+        平均成交时间: {:.1}分钟\n\
         ==============================",
         format!(
             "{:?}",
@@ -6220,7 +6615,10 @@ fn generate_status_report(
         grid_state.stop_loss_status.as_str(),
         grid_state.performance_history.len(),
         grid_state.current_metrics.max_drawdown * 100.0,
-        grid_state.connection_retry_count
+        grid_state.connection_retry_count,
+        grid_state.max_order_age_minutes,
+        grid_state.adaptive_order_config.order_success_rate * 100.0,
+        grid_state.adaptive_order_config.average_fill_time_minutes
     )
 }
 
@@ -6357,7 +6755,9 @@ pub async fn run_grid_strategy(
                     last_grid_price: 0.0,
                     order_update_threshold: 0.02, // 2%价格变化触发更新 TODO(需要修改进配置文件)
                     // 修改为存活1分钟
-                    max_order_age_minutes: 1,     // 订单最大存活1分钟 TODO(需要修改进配置文件)
+                    max_order_age_minutes: 0.1,     // 订单最大存活10s  TODO(需要修改进配置文件)
+                    // 自适应订单管理
+                    adaptive_order_config: AdaptiveOrderConfig::new(),
                 }
             } else {
                 info!("✅ 网格状态验证通过，继续使用已保存状态");
@@ -6419,8 +6819,10 @@ pub async fn run_grid_strategy(
                 // 智能订单更新相关字段
                 last_price_update: SystemTime::now(),
                 last_grid_price: 0.0,
-                order_update_threshold: 0.02, // 2%价格变化触发更新
-                max_order_age_minutes: 30,     // 订单最大存活30分钟
+                order_update_threshold: 0.02, // 2%价格变化触发更新 TODO(需要修改进配置文件)
+                max_order_age_minutes: 0.1,     // 订单最大存活10s TODO(需要修改进配置文件)
+                // 自适应订单管理
+                adaptive_order_config: AdaptiveOrderConfig::new(),
             }
         }
     };
