@@ -5414,7 +5414,7 @@ async fn smart_update_orders(
     active_orders: &mut Vec<u64>,
     buy_orders: &mut HashMap<u64, OrderInfo>,
     sell_orders: &mut HashMap<u64, OrderInfo>,
-    batch_optimizer: &mut BatchTaskOptimizer,
+    _batch_optimizer: &mut BatchTaskOptimizer,
 ) -> Result<bool, GridStrategyError> {
     let now = SystemTime::now();
     
