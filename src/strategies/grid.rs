@@ -1877,6 +1877,58 @@ struct DynamicFundAllocation {
     position_ratio: f64,
 }
 
+/// 自适应双向网格策略
+#[derive(Debug, Clone)]
+enum GridStrategy {
+    Neutral,     // 中性网格：50%买单 + 50%卖单
+    BullishBias, // 偏多网格：70%买单 + 30%卖单
+    BearishBias, // 偏空网格：30%买单 + 70%卖单
+    PureBull,    // 纯多网格：90%买单 + 10%卖单
+    PureBear,    // 纯空网格：10%买单 + 90%卖单
+}
+
+impl GridStrategy {
+    fn as_str(&self) -> &'static str {
+        match self {
+            GridStrategy::Neutral => "中性网格",
+            GridStrategy::BullishBias => "偏多网格",
+            GridStrategy::BearishBias => "偏空网格", 
+            GridStrategy::PureBull => "纯多网格",
+            GridStrategy::PureBear => "纯空网格",
+        }
+    }
+
+    fn buy_ratio(&self) -> f64 {
+        match self {
+            GridStrategy::Neutral => 0.5,
+            GridStrategy::BullishBias => 0.7,
+            GridStrategy::BearishBias => 0.3,
+            GridStrategy::PureBull => 0.9,
+            GridStrategy::PureBear => 0.1,
+        }
+    }
+
+    fn sell_ratio(&self) -> f64 {
+        1.0 - self.buy_ratio()
+    }
+}
+
+/// 增强的资金分配结构
+#[derive(Debug, Clone)]
+struct AdaptiveFundAllocation {
+    buy_order_funds: f64,
+    sell_order_funds: f64,
+    buy_spacing_adjustment: f64,
+    sell_spacing_adjustment: f64,
+    position_ratio: f64,
+    grid_strategy: GridStrategy,
+    // 做空相关
+    short_position_funds: f64,  // 做空持仓资金
+    max_short_exposure: f64,    // 最大做空敞口
+    // 风险控制
+    risk_adjustment_factor: f64, // 风险调整因子
+}
+
 // 止损动作枚举
 #[derive(Debug, Clone, PartialEq)]
 enum StopLossAction {
@@ -3593,6 +3645,187 @@ fn analyze_market_trend(price_history: &[f64]) -> MarketAnalysis {
 }
 
 // 计算动态资金分配
+/// 智能网格策略选择
+fn determine_adaptive_grid_strategy(
+    market_analysis: &MarketAnalysis,
+    grid_state: &GridState,
+    price_history: &[f64],
+) -> GridStrategy {
+    let trend_strength = calculate_trend_strength(price_history);
+    let volatility_level = market_analysis.volatility;
+    let rsi = market_analysis.rsi;
+    
+    // 计算综合市场信号
+    let mut bullish_score = 0.0;
+    let mut bearish_score = 0.0;
+    
+    // 1. 趋势信号 (权重: 40%)
+    match market_analysis.trend {
+        MarketTrend::Upward => bullish_score += 0.4 * trend_strength,
+        MarketTrend::Downward => bearish_score += 0.4 * trend_strength,
+        MarketTrend::Sideways => {
+            // 震荡市场，偏向中性
+            bullish_score += 0.2;
+            bearish_score += 0.2;
+        }
+    }
+    
+    // 2. RSI信号 (权重: 20%)
+    if rsi < 30.0 {
+        bullish_score += 0.2; // 超卖，偏多
+    } else if rsi > 70.0 {
+        bearish_score += 0.2; // 超买，偏空
+    }
+    
+    // 3. 价格变化信号 (权重: 20%)
+    let price_change = market_analysis.price_change_5min;
+    if price_change > 0.02 {
+        bullish_score += 0.2;
+    } else if price_change < -0.02 {
+        bearish_score += 0.2;
+    }
+    
+    // 4. 持仓偏向调整 (权重: 20%)
+    let position_bias = if grid_state.total_capital > 0.0 {
+        (grid_state.position_quantity * grid_state.position_avg_price) / grid_state.total_capital
+    } else {
+        0.0
+    };
+    
+    if position_bias > 0.6 {
+        bearish_score += 0.2; // 持仓过多，偏向卖出
+    } else if position_bias < 0.2 {
+        bullish_score += 0.2; // 持仓过少，偏向买入
+    }
+    
+    // 根据得分确定策略
+    let score_diff = bullish_score - bearish_score;
+    
+    info!(
+        "📊 网格策略评分 - 看多: {:.2}, 看空: {:.2}, 差值: {:.2}, 趋势强度: {:.2}",
+        bullish_score, bearish_score, score_diff, trend_strength
+    );
+    
+    if score_diff > 0.3 {
+        if volatility_level > 0.05 {
+            GridStrategy::BullishBias
+        } else {
+            GridStrategy::PureBull
+        }
+    } else if score_diff < -0.3 {
+        if volatility_level > 0.05 {
+            GridStrategy::BearishBias
+        } else {
+            GridStrategy::PureBear
+        }
+    } else {
+        GridStrategy::Neutral
+    }
+}
+
+/// 计算趋势强度
+fn calculate_trend_strength(price_history: &[f64]) -> f64 {
+    if price_history.len() < 10 {
+        return 0.5; // 默认中等强度
+    }
+    
+    let recent_prices = &price_history[price_history.len()-10..];
+    let first_price = recent_prices[0];
+    let _last_price = recent_prices[recent_prices.len()-1];
+    
+    // 计算线性回归斜率作为趋势强度
+    let n = recent_prices.len() as f64;
+    let sum_x: f64 = (0..recent_prices.len()).map(|i| i as f64).sum();
+    let sum_y: f64 = recent_prices.iter().sum();
+    let sum_xy: f64 = recent_prices.iter().enumerate()
+        .map(|(i, &price)| i as f64 * price).sum();
+    let sum_x2: f64 = (0..recent_prices.len()).map(|i| (i as f64).powi(2)).sum();
+    
+    let slope = (n * sum_xy - sum_x * sum_y) / (n * sum_x2 - sum_x.powi(2));
+    let trend_strength = (slope / first_price).abs().min(1.0);
+    
+    trend_strength
+}
+
+/// 增强的动态资金分配
+fn calculate_adaptive_fund_allocation(
+    grid_state: &GridState,
+    current_price: f64,
+    grid_config: &crate::config::GridConfig,
+    market_analysis: &MarketAnalysis,
+    price_history: &[f64],
+) -> AdaptiveFundAllocation {
+    // 确定网格策略
+    let grid_strategy = determine_adaptive_grid_strategy(market_analysis, grid_state, price_history);
+    
+    // 计算持仓比例
+    let position_ratio = if grid_state.total_capital > 0.0 {
+        (grid_state.position_quantity * current_price) / grid_state.total_capital
+    } else {
+        0.0
+    };
+    
+    // 风险调整因子
+    let risk_adjustment = match market_analysis.market_state {
+        MarketState::Normal => 1.0,
+        MarketState::HighVolatility => 0.8,
+        MarketState::Extreme => 0.6,
+        MarketState::ThinLiquidity => 0.7,
+        MarketState::Flash => 0.5,
+        MarketState::Consolidation => 1.1,
+    };
+    
+    // 基础资金分配
+    let total_grid_funds = grid_state.available_funds * 0.8 * risk_adjustment; // 80%资金用于网格
+    let buy_funds = total_grid_funds * grid_strategy.buy_ratio();
+    let sell_funds = total_grid_funds * grid_strategy.sell_ratio();
+    
+    // 计算单网格资金
+    let grid_count = grid_config.grid_count as f64;
+    let buy_order_funds = buy_funds / (grid_count * grid_strategy.buy_ratio()).max(1.0);
+    let sell_order_funds = sell_funds / (grid_count * grid_strategy.sell_ratio()).max(1.0);
+    
+    // 做空相关计算
+    let max_short_exposure = grid_state.total_capital * 0.3; // 最大30%做空敞口
+    let short_position_funds = sell_order_funds * grid_strategy.sell_ratio();
+    
+    // 间距调整
+    let volatility_factor = (1.0 + market_analysis.volatility * 2.0).min(2.0);
+    let buy_spacing_adjustment = match grid_strategy {
+        GridStrategy::PureBull | GridStrategy::BullishBias => 0.8 * volatility_factor,
+        GridStrategy::Neutral => 1.0 * volatility_factor,
+        _ => 1.2 * volatility_factor,
+    };
+    
+    let sell_spacing_adjustment = match grid_strategy {
+        GridStrategy::PureBear | GridStrategy::BearishBias => 0.8 * volatility_factor,
+        GridStrategy::Neutral => 1.0 * volatility_factor,
+        _ => 1.2 * volatility_factor,
+    };
+    
+    info!(
+        "🎯 自适应网格策略: {} - 买单资金: {:.2} ({:.0}%), 卖单资金: {:.2} ({:.0}%), 风险调整: {:.2}",
+        grid_strategy.as_str(),
+        buy_order_funds,
+        grid_strategy.buy_ratio() * 100.0,
+        sell_order_funds,
+        grid_strategy.sell_ratio() * 100.0,
+        risk_adjustment
+    );
+    
+    AdaptiveFundAllocation {
+        buy_order_funds,
+        sell_order_funds,
+        buy_spacing_adjustment,
+        sell_spacing_adjustment,
+        position_ratio,
+        grid_strategy,
+        short_position_funds,
+        max_short_exposure,
+        risk_adjustment_factor: risk_adjustment,
+    }
+}
+
 fn calculate_dynamic_fund_allocation(
     grid_state: &GridState,
     current_price: f64,
@@ -4799,9 +5032,14 @@ async fn create_dynamic_grid(
         return Ok(());
     }
 
-    // 获取动态资金分配
-    let mut fund_allocation =
-        calculate_dynamic_fund_allocation(grid_state, current_price, grid_config);
+    // 获取自适应资金分配
+    let mut fund_allocation = calculate_adaptive_fund_allocation(
+        grid_state, 
+        current_price, 
+        grid_config, 
+        &market_analysis, 
+        price_history
+    );
 
     // 使用振幅计算调整网格间距
     let amplitude_adjustment = if price_history.len() >= 10 {
@@ -5155,9 +5393,25 @@ async fn create_dynamic_grid(
         }
     }
 
-    // 创建卖单 - 价格递增
+    // 创建卖单 - 支持做空交易
     let mut current_sell_price = current_price;
-    let max_sell_quantity = grid_state.position_quantity * 0.8; // 最多卖出80%持仓
+    
+    // 自适应卖单数量计算
+    let max_sell_quantity = match fund_allocation.grid_strategy {
+        GridStrategy::PureBear | GridStrategy::BearishBias => {
+            // 做空策略：允许超过持仓的卖单（做空）
+            let existing_position = grid_state.position_quantity * 0.8;
+            let short_allowance = fund_allocation.max_short_exposure / current_price;
+            existing_position + short_allowance
+        },
+        _ => {
+            // 其他策略：基于持仓和资金的卖单
+            let existing_position = grid_state.position_quantity * 0.8;
+            let cash_based_quantity = fund_allocation.sell_order_funds * grid_config.grid_count as f64 / current_price;
+            existing_position.max(cash_based_quantity)
+        }
+    };
+    
     let mut allocated_sell_quantity = 0.0;
     let mut sell_count = 0;
 
@@ -5175,18 +5429,39 @@ async fn create_dynamic_grid(
             * amplitude_adjustment;
         current_sell_price = current_sell_price + (current_sell_price * dynamic_spacing);
 
-        // 计算卖单数量
+        // 自适应卖单数量计算
         let price_coefficient = (current_sell_price - current_price) / current_price;
-        let mut current_grid_quantity =
-            fund_allocation.sell_order_funds / current_sell_price * (1.0 + price_coefficient);
+        let mut current_grid_quantity = match fund_allocation.grid_strategy {
+            GridStrategy::PureBear | GridStrategy::BearishBias => {
+                // 做空策略：基于资金计算数量
+                fund_allocation.sell_order_funds / current_sell_price * (1.0 + price_coefficient * 0.5)
+            },
+            _ => {
+                // 其他策略：基于持仓和资金
+                let position_based = if grid_state.position_quantity > 0.0 {
+                    grid_state.position_quantity / grid_config.grid_count as f64 * 0.8
+                } else {
+                    0.0
+                };
+                let fund_based = fund_allocation.sell_order_funds / current_sell_price;
+                position_based.max(fund_based)
+            }
+        };
 
         // 确保不超过可售数量
         if allocated_sell_quantity + current_grid_quantity > max_sell_quantity {
             current_grid_quantity = max_sell_quantity - allocated_sell_quantity;
         }
 
-        if current_grid_quantity * current_sell_price < fund_allocation.sell_order_funds * 0.1 {
-            break; // 价值太小，停止创建卖单
+        // 最小数量检查
+        let min_order_value = fund_allocation.sell_order_funds * 0.05; // 最小5%
+        if current_grid_quantity * current_sell_price < min_order_value {
+            info!(
+                "🚫 卖单价值过小 - 当前价值: {:.2}, 最小要求: {:.2}, 停止创建卖单",
+                current_grid_quantity * current_sell_price,
+                min_order_value
+            );
+            break;
         }
 
         // 验证利润要求
@@ -5288,8 +5563,8 @@ async fn create_dynamic_grid(
     // 更新可用资金
     grid_state.available_funds -= allocated_buy_funds;
 
-    info!("✅ 动态网格创建完成 - 买单数量: {}, 卖单数量: {}, 已分配买单资金: {:.2}, 已分配卖单数量: {:.4}", 
-        buy_count, sell_count, allocated_buy_funds, allocated_sell_quantity);
+    info!("✅ 自适应网格创建完成 - 策略: {}, 买单数量: {}, 卖单数量: {}, 已分配买单资金: {:.2}, 已分配卖单数量: {:.4}, 最大做空敞口: {:.2}", 
+        fund_allocation.grid_strategy.as_str(), buy_count, sell_count, allocated_buy_funds, allocated_sell_quantity, fund_allocation.max_short_exposure);
 
     Ok(())
 }
@@ -6080,8 +6355,9 @@ pub async fn run_grid_strategy(
                     // 智能订单更新相关字段
                     last_price_update: SystemTime::now(),
                     last_grid_price: 0.0,
-                    order_update_threshold: 0.02, // 2%价格变化触发更新
-                    max_order_age_minutes: 30,     // 订单最大存活30分钟
+                    order_update_threshold: 0.02, // 2%价格变化触发更新 TODO(需要修改进配置文件)
+                    // 修改为存活1分钟
+                    max_order_age_minutes: 1,     // 订单最大存活1分钟 TODO(需要修改进配置文件)
                 }
             } else {
                 info!("✅ 网格状态验证通过，继续使用已保存状态");
