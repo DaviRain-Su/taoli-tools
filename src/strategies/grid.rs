@@ -5,10 +5,13 @@ use hyperliquid_rust_sdk::{
 };
 use log::{error, info, warn};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Error, Debug)]
 pub enum GridStrategyError {
@@ -73,13 +76,36 @@ struct PerformanceMetrics {
 }
 
 // 性能记录结构体
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PerformanceRecord {
+    #[serde(with = "system_time_serde")]
     timestamp: SystemTime,
     price: f64,
     action: String,
     profit: f64,
     total_capital: f64,
+}
+
+// SystemTime 序列化辅助模块
+mod system_time_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    pub fn serialize<S>(time: &SystemTime, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let duration = time.duration_since(UNIX_EPOCH).unwrap();
+        duration.as_secs().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<SystemTime, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let secs = u64::deserialize(deserializer)?;
+        Ok(UNIX_EPOCH + std::time::Duration::from_secs(secs))
+    }
 }
 
 // 订单状态枚举
@@ -195,6 +221,67 @@ struct ParameterCheckpoint {
     checkpoint_time: u64, // Unix timestamp
     performance_before: f64,
     reason: String,
+}
+
+// 退出原因枚举
+#[derive(Debug, Clone, PartialEq)]
+enum ShutdownReason {
+    UserSignal,           // 用户信号 (SIGINT/SIGTERM)
+    StopLossTriggered,    // 止损触发
+    MarginInsufficient,   // 保证金不足
+    NetworkError,         // 网络错误
+    ConfigurationError,   // 配置错误
+    EmergencyShutdown,    // 紧急关闭
+    NormalExit,          // 正常退出
+}
+
+impl ShutdownReason {
+    fn as_str(&self) -> &'static str {
+        match self {
+            ShutdownReason::UserSignal => "用户信号",
+            ShutdownReason::StopLossTriggered => "止损触发",
+            ShutdownReason::MarginInsufficient => "保证金不足",
+            ShutdownReason::NetworkError => "网络错误",
+            ShutdownReason::ConfigurationError => "配置错误",
+            ShutdownReason::EmergencyShutdown => "紧急关闭",
+            ShutdownReason::NormalExit => "正常退出",
+        }
+    }
+
+    fn requires_position_close(&self) -> bool {
+        matches!(
+            self,
+            ShutdownReason::StopLossTriggered
+                | ShutdownReason::MarginInsufficient
+                | ShutdownReason::EmergencyShutdown
+        )
+    }
+
+    fn is_emergency(&self) -> bool {
+        matches!(
+            self,
+            ShutdownReason::MarginInsufficient | ShutdownReason::EmergencyShutdown
+        )
+    }
+}
+
+// 性能数据保存结构体
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PerformanceSnapshot {
+    timestamp: u64,
+    total_capital: f64,
+    available_funds: f64,
+    position_quantity: f64,
+    position_avg_price: f64,
+    realized_profit: f64,
+    total_trades: u32,
+    winning_trades: u32,
+    win_rate: f64,
+    max_drawdown: f64,
+    sharpe_ratio: f64,
+    profit_factor: f64,
+    trading_duration_hours: f64,
+    final_roi: f64,
 }
 
 // 动态网格参数结构体
@@ -2192,6 +2279,10 @@ pub async fn run_grid_strategy(
 ) -> Result<(), GridStrategyError> {
     env_logger::init();
     let grid_config = &app_config.grid;
+    
+    // 设置信号处理
+    let (shutdown_flag, cancellation_token) = setup_signal_handler();
+    let start_time = SystemTime::now();
 
     // 验证配置参数
     validate_grid_config(grid_config)?;
@@ -2322,6 +2413,30 @@ pub async fn run_grid_strategy(
 
     loop {
         let now = SystemTime::now();
+        
+        // 检查是否收到退出信号
+        if shutdown_flag.load(Ordering::SeqCst) {
+            info!("🔔 检测到退出信号，开始安全退出流程...");
+            
+            // 获取当前价格用于清仓
+            let current_price = last_price.unwrap_or(0.0);
+            
+            if let Err(e) = safe_shutdown(
+                &exchange_client,
+                grid_config,
+                &mut grid_state,
+                &mut active_orders,
+                &mut buy_orders,
+                &mut sell_orders,
+                current_price,
+                ShutdownReason::UserSignal,
+                start_time,
+            ).await {
+                error!("❌ 安全退出过程中发生错误: {:?}", e);
+            }
+            
+            break;
+        }
 
         // 检查是否需要重置每日统计
         if now.duration_since(last_daily_reset).unwrap().as_secs() >= 24 * 60 * 60 {
@@ -2392,7 +2507,22 @@ pub async fn run_grid_strategy(
                         .await?;
 
                         if stop_result.action.is_full_stop() {
-                            error!("🛑 策略已全部止损，退出");
+                            error!("🛑 策略已全部止损，开始安全退出");
+                            
+                            if let Err(e) = safe_shutdown(
+                                &exchange_client,
+                                grid_config,
+                                &mut grid_state,
+                                &mut active_orders,
+                                &mut buy_orders,
+                                &mut sell_orders,
+                                current_price,
+                                ShutdownReason::StopLossTriggered,
+                                start_time,
+                            ).await {
+                                error!("❌ 安全退出过程中发生错误: {:?}", e);
+                            }
+                            
                             break;
                         }
                     }
@@ -2558,7 +2688,7 @@ pub async fn run_grid_strategy(
                                                 reason: "保证金不足".to_string(),
                                                 stop_quantity: grid_state.position_quantity,
                                             };
-                                            if let Err(stop_err) = execute_stop_loss(
+                                                                                        if let Err(stop_err) = execute_stop_loss(
                                                 &exchange_client,
                                                 grid_config,
                                                 &mut grid_state,
@@ -2570,7 +2700,23 @@ pub async fn run_grid_strategy(
                                             ).await {
                                                 error!("❌ 紧急止损执行失败: {:?}", stop_err);
                                             }
-                                            break;
+                                            
+                                            // 保证金不足时安全退出
+                                            if let Err(e) = safe_shutdown(
+                                                &exchange_client,
+                                                grid_config,
+                                                &mut grid_state,
+                                                &mut active_orders,
+                                                &mut buy_orders,
+                                                &mut sell_orders,
+                                                current_price,
+                                                ShutdownReason::MarginInsufficient,
+                                                start_time,
+                                            ).await {
+                                                error!("❌ 安全退出过程中发生错误: {:?}", e);
+                                            }
+                                            
+                                break;
                                         }
                                     }
                                 }
@@ -2582,7 +2728,23 @@ pub async fn run_grid_strategy(
                                 error!("❌ 连接检查失败: {:?}", e);
                                 // 连接失败次数过多，退出策略
                                 if grid_state.connection_retry_count > 10 {
-                                    error!("🚨 网络连接失败次数过多，退出策略");
+                                    error!("🚨 网络连接失败次数过多，开始安全退出");
+                                    
+                                    let current_price = last_price.unwrap_or(0.0);
+                                    if let Err(e) = safe_shutdown(
+                                        &exchange_client,
+                                        grid_config,
+                                        &mut grid_state,
+                                        &mut active_orders,
+                                        &mut buy_orders,
+                                        &mut sell_orders,
+                                        current_price,
+                                        ShutdownReason::NetworkError,
+                                        start_time,
+                                    ).await {
+                                        error!("❌ 安全退出过程中发生错误: {:?}", e);
+                                    }
+                                    
                                     break;
                                 }
                             }
@@ -2816,10 +2978,36 @@ pub async fn run_grid_strategy(
         }
 
         // 等待下一次检查
-        sleep(Duration::from_secs(grid_config.check_interval)).await;
+        tokio::select! {
+            _ = sleep(Duration::from_secs(grid_config.check_interval)) => {},
+            _ = cancellation_token.cancelled() => {
+                info!("🔔 收到取消信号，退出主循环");
+                break;
+            }
+        }
     }
 
-    info!("🏁 网格交易策略已结束");
+    // 如果是正常退出（非信号触发），执行安全退出
+    if !shutdown_flag.load(Ordering::SeqCst) {
+        info!("🏁 策略正常结束，执行安全退出");
+        let current_price = last_price.unwrap_or(0.0);
+        
+        if let Err(e) = safe_shutdown(
+            &exchange_client,
+            grid_config,
+            &mut grid_state,
+            &mut active_orders,
+            &mut buy_orders,
+            &mut sell_orders,
+            current_price,
+            ShutdownReason::NormalExit,
+            start_time,
+        ).await {
+            error!("❌ 安全退出过程中发生错误: {:?}", e);
+        }
+    }
+
+    info!("🏁 网格交易策略已安全结束");
     Ok(())
 }
 
@@ -4140,6 +4328,391 @@ fn auto_optimize_grid_parameters(
         info!("📊 性能中等，暂不执行自动优化");
         false
     }
+}
+
+// 安全退出函数
+async fn safe_shutdown(
+    exchange_client: &ExchangeClient,
+    grid_config: &crate::config::GridConfig,
+    grid_state: &mut GridState,
+    active_orders: &mut Vec<u64>,
+    buy_orders: &mut HashMap<u64, OrderInfo>,
+    sell_orders: &mut HashMap<u64, OrderInfo>,
+    current_price: f64,
+    reason: ShutdownReason,
+    start_time: SystemTime,
+) -> Result<(), GridStrategyError> {
+    info!("🛑 开始安全退出 - 原因: {}", reason.as_str());
+    
+    let shutdown_start = SystemTime::now();
+    
+    // 1. 取消所有未成交订单
+    if !active_orders.is_empty() {
+        info!("🗑️ 取消所有活跃订单 ({} 个)...", active_orders.len());
+        
+        // 紧急情况下使用更短的超时时间
+        let cancel_timeout = if reason.is_emergency() {
+            Duration::from_secs(10)
+        } else {
+            Duration::from_secs(30)
+        };
+        
+        let cancel_result = tokio::time::timeout(
+            cancel_timeout,
+            cancel_all_orders(exchange_client, active_orders)
+        ).await;
+        
+        match cancel_result {
+            Ok(Ok(_)) => {
+                info!("✅ 所有订单已成功取消");
+                buy_orders.clear();
+                sell_orders.clear();
+            }
+            Ok(Err(e)) => {
+                warn!("⚠️ 部分订单取消失败: {:?}", e);
+            }
+            Err(_) => {
+                warn!("⚠️ 订单取消超时，继续执行后续步骤");
+            }
+        }
+    }
+    
+    // 2. 根据退出原因和配置决定是否清仓
+    // 注意：这里假设默认在退出时清仓，可以根据需要添加配置选项
+    let close_positions_on_exit = true; // 可以从配置中读取
+    let should_close_positions = reason.requires_position_close() 
+        || (close_positions_on_exit && grid_state.position_quantity > 0.0);
+    
+    if should_close_positions && grid_state.position_quantity > 0.0 {
+        info!("📉 执行清仓操作 - 持仓数量: {:.4}", grid_state.position_quantity);
+        
+        let close_timeout = if reason.is_emergency() {
+            Duration::from_secs(15)
+        } else {
+            Duration::from_secs(60)
+        };
+        
+        let close_result = tokio::time::timeout(
+            close_timeout,
+            close_all_positions(
+                exchange_client,
+                grid_config,
+                grid_state.position_quantity,
+                0.0, // 假设只有多头持仓
+                current_price
+            )
+        ).await;
+        
+        match close_result {
+            Ok(Ok(_)) => {
+                info!("✅ 清仓操作完成");
+                grid_state.position_quantity = 0.0;
+                grid_state.position_avg_price = 0.0;
+            }
+            Ok(Err(e)) => {
+                error!("❌ 清仓操作失败: {:?}", e);
+                // 记录失败但继续执行后续步骤
+            }
+            Err(_) => {
+                error!("❌ 清仓操作超时");
+            }
+        }
+    } else if grid_state.position_quantity > 0.0 {
+        warn!("⚠️ 退出时仍有持仓 {:.4}，根据配置未执行清仓", grid_state.position_quantity);
+    }
+    
+    // 3. 保存性能数据和状态
+    info!("💾 保存性能数据和状态...");
+    
+    if let Err(e) = save_performance_data(grid_state, start_time, reason.clone()).await {
+        warn!("⚠️ 保存性能数据失败: {:?}", e);
+    }
+    
+    // 4. 保存动态参数
+    if let Err(e) = grid_state.dynamic_params.save_to_file("dynamic_grid_params.json") {
+        warn!("⚠️ 保存动态参数失败: {:?}", e);
+    }
+    
+    // 5. 生成最终报告
+    let final_report = generate_final_report(grid_state, current_price, start_time, reason.clone());
+    info!("\n{}", final_report);
+    
+    let shutdown_duration = shutdown_start.elapsed().unwrap_or_default();
+    info!("✅ 安全退出完成 - 耗时: {:.2}秒", shutdown_duration.as_secs_f64());
+    
+    Ok(())
+}
+
+// 保存性能数据
+async fn save_performance_data(
+    grid_state: &GridState,
+    start_time: SystemTime,
+    reason: ShutdownReason,
+) -> Result<(), GridStrategyError> {
+    let current_time = SystemTime::now();
+    let trading_duration = current_time.duration_since(start_time).unwrap_or_default();
+    
+    // 计算最终性能指标
+    let final_metrics = calculate_performance_metrics(grid_state, &[]);
+    let final_total_value = grid_state.available_funds + 
+        grid_state.position_quantity * grid_state.position_avg_price;
+    let final_roi = if grid_state.total_capital > 0.0 {
+        (final_total_value / grid_state.total_capital - 1.0) * 100.0
+    } else {
+        0.0
+    };
+    
+    let snapshot = PerformanceSnapshot {
+        timestamp: current_time.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+        total_capital: grid_state.total_capital,
+        available_funds: grid_state.available_funds,
+        position_quantity: grid_state.position_quantity,
+        position_avg_price: grid_state.position_avg_price,
+        realized_profit: grid_state.realized_profit,
+        total_trades: final_metrics.total_trades,
+        winning_trades: final_metrics.winning_trades,
+        win_rate: final_metrics.win_rate,
+        max_drawdown: final_metrics.max_drawdown,
+        sharpe_ratio: final_metrics.sharpe_ratio,
+        profit_factor: final_metrics.profit_factor,
+        trading_duration_hours: trading_duration.as_secs_f64() / 3600.0,
+        final_roi,
+    };
+    
+    // 保存到文件
+    let filename = format!(
+        "performance_snapshot_{}.json",
+        current_time.duration_since(UNIX_EPOCH).unwrap().as_secs()
+    );
+    
+    match serde_json::to_string_pretty(&snapshot) {
+        Ok(json_data) => {
+            match std::fs::write(&filename, json_data) {
+                Ok(_) => {
+                    info!("💾 性能快照已保存到: {}", filename);
+                    
+                    // 同时保存详细的交易历史
+                    save_trading_history(grid_state, reason).await?;
+                }
+                Err(e) => {
+                    return Err(GridStrategyError::ConfigError(format!(
+                        "保存性能快照失败: {:?}", e
+                    )));
+                }
+            }
+        }
+        Err(e) => {
+            return Err(GridStrategyError::ConfigError(format!(
+                "序列化性能数据失败: {:?}", e
+            )));
+        }
+    }
+    
+    Ok(())
+}
+
+// 保存交易历史
+async fn save_trading_history(
+    grid_state: &GridState,
+    reason: ShutdownReason,
+) -> Result<(), GridStrategyError> {
+    if grid_state.performance_history.is_empty() {
+        return Ok(());
+    }
+    
+    let current_time = SystemTime::now();
+    let filename = format!(
+        "trading_history_{}.json",
+        current_time.duration_since(UNIX_EPOCH).unwrap().as_secs()
+    );
+    
+    #[derive(serde::Serialize)]
+    struct TradingHistoryExport {
+        shutdown_reason: String,
+        export_time: u64,
+        total_trades: usize,
+        trades: Vec<PerformanceRecord>,
+    }
+    
+    let export_data = TradingHistoryExport {
+        shutdown_reason: reason.as_str().to_string(),
+        export_time: current_time.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+        total_trades: grid_state.performance_history.len(),
+        trades: grid_state.performance_history.clone(),
+    };
+    
+    match serde_json::to_string_pretty(&export_data) {
+        Ok(json_data) => {
+            match std::fs::write(&filename, json_data) {
+                Ok(_) => {
+                    info!("📊 交易历史已保存到: {} ({} 笔交易)", 
+                        filename, grid_state.performance_history.len());
+                }
+                Err(e) => {
+                    warn!("⚠️ 保存交易历史失败: {:?}", e);
+                }
+            }
+        }
+        Err(e) => {
+            warn!("⚠️ 序列化交易历史失败: {:?}", e);
+        }
+    }
+    
+    Ok(())
+}
+
+// 生成最终报告
+fn generate_final_report(
+    grid_state: &GridState,
+    current_price: f64,
+    start_time: SystemTime,
+    reason: ShutdownReason,
+) -> String {
+    let current_time = SystemTime::now();
+    let trading_duration = current_time.duration_since(start_time).unwrap_or_default();
+    let final_metrics = calculate_performance_metrics(grid_state, &[]);
+    
+    let final_total_value = grid_state.available_funds + 
+        grid_state.position_quantity * current_price;
+    let total_return = final_total_value - grid_state.total_capital;
+    let roi = if grid_state.total_capital > 0.0 {
+        (final_total_value / grid_state.total_capital - 1.0) * 100.0
+    } else {
+        0.0
+    };
+    
+    let annualized_return = if trading_duration.as_secs() > 0 {
+        let years = trading_duration.as_secs_f64() / (365.25 * 24.0 * 3600.0);
+        if years > 0.0 {
+            ((final_total_value / grid_state.total_capital).powf(1.0 / years) - 1.0) * 100.0
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+    
+    format!(
+        "===== 网格交易策略最终报告 =====\n\
+        退出原因: {}\n\
+        退出时间: {}\n\
+        运行时长: {:.2} 小时\n\
+        \n\
+        === 资金状况 ===\n\
+        初始资金: {:.2}\n\
+        最终资产: {:.2}\n\
+        绝对收益: {:.2}\n\
+        投资回报率: {:.2}%\n\
+        年化收益率: {:.2}%\n\
+        已实现利润: {:.2}\n\
+        \n\
+        === 持仓状况 ===\n\
+        当前价格: {:.4}\n\
+        持仓数量: {:.4}\n\
+        持仓均价: {:.4}\n\
+        持仓价值: {:.2}\n\
+        可用资金: {:.2}\n\
+        \n\
+        === 交易统计 ===\n\
+        总交易数: {}\n\
+        盈利交易: {}\n\
+        亏损交易: {}\n\
+        胜率: {:.1}%\n\
+        利润因子: {:.2}\n\
+        夏普比率: {:.2}\n\
+        最大回撤: {:.2}%\n\
+        平均盈利: {:.2}\n\
+        平均亏损: {:.2}\n\
+        最大单笔盈利: {:.2}\n\
+        最大单笔亏损: {:.2}\n\
+        \n\
+        === 风险指标 ===\n\
+        最大回撤: {:.2}%\n\
+        波动率: {:.2}%\n\
+        风险调整收益: {:.2}\n\
+        \n\
+        === 策略参数 ===\n\
+        当前最小网格间距: {:.4}%\n\
+        当前最大网格间距: {:.4}%\n\
+        当前交易金额: {:.2}\n\
+        参数优化次数: {}\n\
+        \n\
+        ==============================",
+        reason.as_str(),
+        format!("{:?}", current_time.duration_since(UNIX_EPOCH).unwrap().as_secs()),
+        trading_duration.as_secs_f64() / 3600.0,
+        grid_state.total_capital,
+        final_total_value,
+        total_return,
+        roi,
+        annualized_return,
+        grid_state.realized_profit,
+        current_price,
+        grid_state.position_quantity,
+        grid_state.position_avg_price,
+        grid_state.position_quantity * current_price,
+        grid_state.available_funds,
+        final_metrics.total_trades,
+        final_metrics.winning_trades,
+        final_metrics.losing_trades,
+        final_metrics.win_rate * 100.0,
+        final_metrics.profit_factor,
+        final_metrics.sharpe_ratio,
+        final_metrics.max_drawdown * 100.0,
+        final_metrics.average_win,
+        final_metrics.average_loss,
+        final_metrics.largest_win,
+        final_metrics.largest_loss,
+        final_metrics.max_drawdown * 100.0,
+        grid_state.historical_volatility * 100.0,
+        if final_metrics.max_drawdown > 0.0 { roi / (final_metrics.max_drawdown * 100.0) } else { 0.0 },
+        grid_state.dynamic_params.current_min_spacing * 100.0,
+        grid_state.dynamic_params.current_max_spacing * 100.0,
+        grid_state.dynamic_params.current_trade_amount,
+        grid_state.dynamic_params.optimization_count,
+    )
+}
+
+// 设置信号处理
+fn setup_signal_handler() -> (Arc<AtomicBool>, CancellationToken) {
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let cancellation_token = CancellationToken::new();
+    
+    let flag_clone = shutdown_flag.clone();
+    let token_clone = cancellation_token.clone();
+    
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            
+            let mut sigint = signal(SignalKind::interrupt()).expect("Failed to setup SIGINT handler");
+            let mut sigterm = signal(SignalKind::terminate()).expect("Failed to setup SIGTERM handler");
+            
+            tokio::select! {
+                _ = sigint.recv() => {
+                    info!("🔔 接收到 SIGINT 信号，开始安全退出...");
+                }
+                _ = sigterm.recv() => {
+                    info!("🔔 接收到 SIGTERM 信号，开始安全退出...");
+                }
+            }
+        }
+        
+        #[cfg(windows)]
+        {
+            use tokio::signal;
+            
+            let mut ctrl_c = signal::ctrl_c().expect("Failed to setup Ctrl+C handler");
+            ctrl_c.recv().await;
+            info!("🔔 接收到 Ctrl+C 信号，开始安全退出...");
+        }
+        
+        flag_clone.store(true, Ordering::SeqCst);
+        token_clone.cancel();
+    });
+    
+    (shutdown_flag, cancellation_token)
 }
 
 // 分析网格性能并提供优化建议
