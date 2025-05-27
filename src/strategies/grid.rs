@@ -5311,7 +5311,7 @@ async fn execute_stop_loss(
         }
 
         // 取消所有订单
-        cancel_all_orders(exchange_client, active_orders).await?;
+        cancel_all_orders(exchange_client, active_orders, &grid_config.trading_asset).await?;
         buy_orders.clear();
         sell_orders.clear();
     } else if stop_result.action.is_partial_stop() && stop_result.stop_quantity > 0.0 {
@@ -5529,7 +5529,7 @@ async fn rebalance_grid(
 
     // 取消所有现有订单
     info!("🗑️ 取消现有订单...");
-    cancel_all_orders(exchange_client, active_orders).await?;
+    cancel_all_orders(exchange_client, active_orders, &grid_config.trading_asset).await?;
     buy_orders.clear();
     sell_orders.clear();
 
@@ -5562,42 +5562,89 @@ async fn rebalance_grid(
     Ok(())
 }
 
-// 取消所有订单
+// 取消所有订单 - 改进版本，接受交易资产参数
 async fn cancel_all_orders(
     exchange_client: &ExchangeClient,
     active_orders: &mut Vec<u64>,
+    trading_asset: &str,
 ) -> Result<(), GridStrategyError> {
-    for &oid in active_orders.iter() {
-        if let Err(e) = cancel_order(exchange_client, oid).await {
-            warn!("取消订单{}失败: {:?}", oid, e);
+    if active_orders.is_empty() {
+        info!("📝 无活跃订单需要取消");
+        return Ok(());
+    }
+
+    info!("🗑️ 开始取消 {} 个活跃订单...", active_orders.len());
+    
+    let mut canceled_count = 0;
+    let mut failed_count = 0;
+    
+    // 批量取消订单，每批最多10个，使用顺序处理避免生命周期问题
+    for chunk in active_orders.chunks(10) {
+        for &oid in chunk {
+            match cancel_order_with_asset(exchange_client, oid, trading_asset).await {
+                Ok(_) => {
+                    canceled_count += 1;
+                    info!("✅ 订单 {} 已成功取消", oid);
+                }
+                Err(e) => {
+                    failed_count += 1;
+                    warn!("❌ 取消订单 {} 失败: {:?}", oid, e);
+                }
+            }
+            
+            // 每个订单间稍微延迟，避免请求过于频繁
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        
+        // 批次间延迟
+        if chunk.len() == 10 {
+            tokio::time::sleep(Duration::from_millis(300)).await;
         }
     }
+    
+    info!("📊 订单取消统计: 成功 {}, 失败 {}, 总计 {}", 
+          canceled_count, failed_count, active_orders.len());
+    
+    // 清空订单列表
     active_orders.clear();
+    
+    if failed_count > 0 {
+        warn!("⚠️ 有 {} 个订单取消失败，可能需要手动处理", failed_count);
+    }
+    
     Ok(())
 }
 
-// 取消单个订单
-async fn cancel_order(exchange_client: &ExchangeClient, oid: u64) -> Result<(), GridStrategyError> {
-    // 注意：这里硬编码了资产名称，实际应该从配置中获取
-    // 但由于函数签名限制，暂时使用通用的取消方式
+// 取消单个订单 - 带资产参数的版本
+async fn cancel_order_with_asset(
+    exchange_client: &ExchangeClient, 
+    oid: u64, 
+    trading_asset: &str
+) -> Result<(), GridStrategyError> {
     let cancel_request = ClientCancelRequest {
-        asset: "BTC".to_string(), // TODO: 从配置中获取
+        asset: trading_asset.to_string(),
         oid,
     };
 
     match exchange_client.cancel(cancel_request, None).await {
         Ok(_) => {
-            info!("✅ 订单{}已取消", oid);
+            info!("✅ 订单 {} ({}) 已取消", oid, trading_asset);
             Ok(())
         }
         Err(e) => {
-            warn!("❌ 取消订单{}失败: {:?}", oid, e);
+            warn!("❌ 取消订单 {} ({}) 失败: {:?}", oid, trading_asset, e);
             Err(GridStrategyError::OrderError(format!(
                 "取消订单失败: {:?}",
                 e
             )))
         }
     }
+}
+
+// 保持向后兼容的旧版本函数
+async fn cancel_order(exchange_client: &ExchangeClient, oid: u64) -> Result<(), GridStrategyError> {
+    // 使用默认资产名称的后备方案
+    cancel_order_with_asset(exchange_client, oid, "BTC").await
 }
 
 // 监控资金使用和订单限制
@@ -6895,7 +6942,7 @@ pub async fn run_grid_strategy(
 
                             // 回滚后需要重新创建网格
                             info!("🔄 参数回滚后重新创建网格");
-                            cancel_all_orders(&exchange_client, &mut active_orders).await?;
+                            cancel_all_orders(&exchange_client, &mut active_orders, &grid_config.trading_asset).await?;
                             buy_orders.clear();
                             sell_orders.clear();
                         } else {
@@ -7132,25 +7179,50 @@ pub async fn run_grid_strategy(
         }
     }
 
-    // 如果是正常退出（非信号触发），执行安全退出
-    if !shutdown_flag.load(Ordering::SeqCst) {
-        info!("🏁 策略正常结束，执行安全退出");
-        let current_price = last_price.unwrap_or(0.0);
+    // 执行安全退出流程 - 无论退出原因如何都需要取消订单
+    info!("🏁 开始策略安全退出流程");
+    let current_price = last_price.unwrap_or(0.0);
+    
+    // 确定退出原因
+    let shutdown_reason = if shutdown_flag.load(Ordering::SeqCst) {
+        ShutdownReason::UserSignal
+    } else {
+        ShutdownReason::NormalExit
+    };
 
-        if let Err(e) = safe_shutdown(
-            &exchange_client,
-            grid_config,
-            &mut grid_state,
-            &mut active_orders,
-            &mut buy_orders,
-            &mut sell_orders,
-            current_price,
-            ShutdownReason::NormalExit,
-            start_time,
-        )
-        .await
-        {
-            error!("❌ 安全退出过程中发生错误: {:?}", e);
+    if let Err(e) = safe_shutdown(
+        &exchange_client,
+        grid_config,
+        &mut grid_state,
+        &mut active_orders,
+        &mut buy_orders,
+        &mut sell_orders,
+        current_price,
+        shutdown_reason,
+        start_time,
+    )
+    .await
+    {
+        error!("❌ 安全退出过程中发生错误: {:?}", e);
+        
+        // 如果安全退出失败，至少尝试取消所有订单
+        if !active_orders.is_empty() {
+            warn!("⚠️ 安全退出失败，尝试紧急取消所有订单");
+            
+            if let Err(cancel_err) = cancel_all_orders(&exchange_client, &mut active_orders, "FARTCOIN").await {
+                error!("❌ 紧急取消订单也失败: {:?}", cancel_err);
+                error!("🚨 请手动在交易所界面取消剩余订单!");
+                
+                // 输出剩余订单ID供手动取消
+                if !active_orders.is_empty() {
+                    error!("📝 剩余未取消订单ID: {:?}", active_orders);
+                }
+            } else {
+                info!("✅ 紧急订单取消成功");
+                active_orders.clear();
+                buy_orders.clear();
+                sell_orders.clear();
+            }
         }
     }
 
@@ -8660,7 +8732,7 @@ async fn safe_shutdown(
 
         let cancel_result = tokio::time::timeout(
             cancel_timeout,
-            cancel_all_orders(exchange_client, active_orders),
+            cancel_all_orders(exchange_client, active_orders, &grid_config.trading_asset),
         )
         .await;
 
