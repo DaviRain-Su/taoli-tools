@@ -59,7 +59,7 @@ pub enum GridStrategyError {
 }
 
 // 性能指标结构体
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PerformanceMetrics {
     total_trades: u32,
     winning_trades: u32,
@@ -109,7 +109,7 @@ mod system_time_serde {
 }
 
 // 订单状态枚举
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 enum OrderStatus {
     Pending,    // 待处理
     Active,     // 活跃
@@ -120,7 +120,7 @@ enum OrderStatus {
 }
 
 // 增强的订单信息结构体
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct EnhancedOrderInfo {
     order_id: u64,
     price: f64,
@@ -130,13 +130,15 @@ struct EnhancedOrderInfo {
     potential_sell_price: Option<f64>,
     allocated_funds: f64,
     status: OrderStatus,
+    #[serde(with = "system_time_serde")]
     created_time: SystemTime,
+    #[serde(with = "system_time_serde")]
     last_update_time: SystemTime,
     retry_count: u32,
 }
 
 // 订单信息结构体
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct OrderInfo {
     price: f64,
     quantity: f64,
@@ -146,7 +148,7 @@ struct OrderInfo {
 }
 
 // 止损状态枚举
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 enum StopLossStatus {
     Normal,          // 正常
     Monitoring,      // 监控中
@@ -495,7 +497,7 @@ impl DynamicGridParams {
 }
 
 // 网格状态结构体
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct GridState {
     total_capital: f64,
     available_funds: f64,
@@ -505,18 +507,21 @@ struct GridState {
     highest_price_after_position: f64, // 持仓后最高价
     trailing_stop_price: f64,          // 浮动止损价
     stop_loss_status: StopLossStatus,  // 止损状态
+    #[serde(with = "system_time_serde")]
     last_rebalance_time: SystemTime,
     historical_volatility: f64,
     performance_history: Vec<PerformanceRecord>, // 性能历史记录
     current_metrics: PerformanceMetrics,         // 当前性能指标
+    #[serde(with = "system_time_serde")]
     last_margin_check: SystemTime,              // 上次保证金检查时间
     connection_retry_count: u32,                // 连接重试次数
+    #[serde(with = "system_time_serde")]
     last_order_batch_time: SystemTime,          // 上次批量下单时间
     dynamic_params: DynamicGridParams,          // 动态网格参数
 }
 
 // 市场趋势枚举
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 enum MarketTrend {
     Upward,   // 上升
     Downward, // 下降
@@ -524,7 +529,7 @@ enum MarketTrend {
 }
 
 // 市场状态枚举
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 enum MarketState {
     Normal,         // 正常市场
     HighVolatility, // 高波动市场
@@ -3075,46 +3080,138 @@ pub async fn run_grid_strategy(
         }
     }
 
-    // 初始化网格状态
-    let mut grid_state = GridState {
-        total_capital: grid_config.total_capital,
-        available_funds: grid_config.total_capital,
-        position_quantity: 0.0,
-        position_avg_price: 0.0,
-        realized_profit: 0.0,
-        highest_price_after_position: 0.0,
-        trailing_stop_price: 0.0,
-        stop_loss_status: StopLossStatus::Normal,
-        last_rebalance_time: SystemTime::now(),
-        historical_volatility: 0.0,
-        performance_history: Vec::new(),
-        current_metrics: PerformanceMetrics {
-            total_trades: 0,
-            winning_trades: 0,
-            losing_trades: 0,
-            win_rate: 0.0,
-            total_profit: 0.0,
-            max_drawdown: 0.0,
-            sharpe_ratio: 0.0,
-            profit_factor: 0.0,
-            average_win: 0.0,
-            average_loss: 0.0,
-            largest_win: 0.0,
-            largest_loss: 0.0,
-        },
-        last_margin_check: SystemTime::now(),
-        connection_retry_count: 0,
-        last_order_batch_time: SystemTime::now(),
-        dynamic_params: DynamicGridParams::load_from_file("dynamic_grid_params.json", grid_config),
+    // ===== 状态恢复与初始化 =====
+    
+    // 1. 创建状态备份
+    if let Err(e) = backup_state_files() {
+        warn!("⚠️ 创建状态备份失败: {:?}", e);
+    }
+    
+    // 2. 清理过期备份文件（保留7天）
+    if let Err(e) = cleanup_old_backups(7) {
+        warn!("⚠️ 清理过期备份失败: {:?}", e);
+    }
+    
+    // 3. 尝试加载网格状态
+    let mut grid_state = match load_grid_state("grid_state.json")? {
+        Some(loaded_state) => {
+            info!("🔄 检测到已保存的网格状态，正在恢复...");
+            
+            // 验证加载的状态是否与当前配置兼容
+            if let Err(e) = validate_loaded_state(&loaded_state, grid_config) {
+                warn!("⚠️ 状态验证失败: {:?}", e);
+                warn!("将使用默认状态重新开始");
+                GridState {
+                    total_capital: grid_config.total_capital,
+                    available_funds: grid_config.total_capital,
+                    position_quantity: 0.0,
+                    position_avg_price: 0.0,
+                    realized_profit: 0.0,
+                    highest_price_after_position: 0.0,
+                    trailing_stop_price: 0.0,
+                    stop_loss_status: StopLossStatus::Normal,
+                    last_rebalance_time: SystemTime::now(),
+                    historical_volatility: 0.0,
+                    performance_history: Vec::new(),
+                    current_metrics: PerformanceMetrics {
+                        total_trades: 0,
+                        winning_trades: 0,
+                        losing_trades: 0,
+                        win_rate: 0.0,
+                        total_profit: 0.0,
+                        max_drawdown: 0.0,
+                        sharpe_ratio: 0.0,
+                        profit_factor: 0.0,
+                        average_win: 0.0,
+                        average_loss: 0.0,
+                        largest_win: 0.0,
+                        largest_loss: 0.0,
+                    },
+                    last_margin_check: SystemTime::now(),
+                    connection_retry_count: 0,
+                    last_order_batch_time: SystemTime::now(),
+                    dynamic_params: DynamicGridParams::load_from_file("dynamic_grid_params.json", grid_config),
+                }
+            } else {
+                info!("✅ 网格状态验证通过，继续使用已保存状态");
+                info!("📊 恢复状态摘要:");
+                info!("   - 总资金: {:.2}", loaded_state.total_capital);
+                info!("   - 可用资金: {:.2}", loaded_state.available_funds);
+                info!("   - 持仓数量: {:.4}", loaded_state.position_quantity);
+                info!("   - 持仓均价: {:.4}", loaded_state.position_avg_price);
+                info!("   - 已实现利润: {:.2}", loaded_state.realized_profit);
+                info!("   - 历史交易数: {}", loaded_state.performance_history.len());
+                info!("   - 止损状态: {}", loaded_state.stop_loss_status.as_str());
+                
+                // 更新一些时间相关的字段
+                let mut state = loaded_state;
+                state.last_margin_check = SystemTime::now();
+                state.last_order_batch_time = SystemTime::now();
+                state.connection_retry_count = 0; // 重置连接重试计数
+                state
+            }
+        }
+        None => {
+            info!("📄 未找到已保存的网格状态，使用默认配置初始化");
+            GridState {
+                total_capital: grid_config.total_capital,
+                available_funds: grid_config.total_capital,
+                position_quantity: 0.0,
+                position_avg_price: 0.0,
+                realized_profit: 0.0,
+                highest_price_after_position: 0.0,
+                trailing_stop_price: 0.0,
+                stop_loss_status: StopLossStatus::Normal,
+                last_rebalance_time: SystemTime::now(),
+                historical_volatility: 0.0,
+                performance_history: Vec::new(),
+                current_metrics: PerformanceMetrics {
+                    total_trades: 0,
+                    winning_trades: 0,
+                    losing_trades: 0,
+                    win_rate: 0.0,
+                    total_profit: 0.0,
+                    max_drawdown: 0.0,
+                    sharpe_ratio: 0.0,
+                    profit_factor: 0.0,
+                    average_win: 0.0,
+                    average_loss: 0.0,
+                    largest_win: 0.0,
+                    largest_loss: 0.0,
+                },
+                last_margin_check: SystemTime::now(),
+                connection_retry_count: 0,
+                last_order_batch_time: SystemTime::now(),
+                dynamic_params: DynamicGridParams::load_from_file("dynamic_grid_params.json", grid_config),
+            }
+        }
     };
 
-    let mut active_orders: Vec<u64> = Vec::new();
+    // 4. 尝试加载订单状态
+    let (mut active_orders, mut buy_orders, mut sell_orders) = 
+        match load_orders_state("orders_state.json")? {
+            Some((orders, buys, sells)) => {
+                info!("🔄 检测到已保存的订单状态，正在恢复...");
+                info!("📊 恢复订单摘要:");
+                info!("   - 活跃订单: {}", orders.len());
+                info!("   - 买单: {}", buys.len());
+                info!("   - 卖单: {}", sells.len());
+                
+                // 注意：这里恢复的订单可能已经不存在或状态已改变
+                // 在后续的订单状态检查中会自动同步
+                (orders, buys, sells)
+            }
+            None => {
+                info!("📄 未找到已保存的订单状态，使用空状态初始化");
+                (Vec::new(), HashMap::new(), HashMap::new())
+            }
+        };
+
     let mut last_price: Option<f64> = None;
-    let mut buy_orders: HashMap<u64, OrderInfo> = HashMap::new();
-    let mut sell_orders: HashMap<u64, OrderInfo> = HashMap::new();
 
     let mut last_daily_reset = SystemTime::now();
     let mut last_status_report = SystemTime::now();
+    let mut last_state_save = SystemTime::now(); // 添加状态保存时间跟踪
 
     // 价格历史记录
     let mut price_history: Vec<f64> = Vec::new();
@@ -3202,6 +3299,18 @@ pub async fn run_grid_strategy(
                         );
                     }
                     last_price = Some(current_price);
+
+                    // 0. 定期状态保存（每5分钟保存一次）
+                    if let Err(e) = periodic_state_save(
+                        &grid_state,
+                        &active_orders,
+                        &buy_orders,
+                        &sell_orders,
+                        &mut last_state_save,
+                        300, // 5分钟 = 300秒
+                    ) {
+                        warn!("⚠️ 定期状态保存失败: {:?}", e);
+                    }
 
                     // 1. 止损检查
                     let stop_result = check_stop_loss(
@@ -5459,6 +5568,260 @@ fn setup_signal_handler() -> (Arc<AtomicBool>, CancellationToken) {
     });
     
     (shutdown_flag, cancellation_token)
+}
+
+// ===== 状态持久化与恢复功能 =====
+
+/// 保存网格状态到文件
+fn save_grid_state(grid_state: &GridState, file_path: &str) -> Result<(), GridStrategyError> {
+    let serialized = serde_json::to_string_pretty(grid_state)
+        .map_err(|e| GridStrategyError::ConfigError(format!("序列化状态失败: {:?}", e)))?;
+    
+    std::fs::write(file_path, serialized)
+        .map_err(|e| GridStrategyError::ConfigError(format!("写入状态文件失败: {:?}", e)))?;
+    
+    info!("✅ 网格状态已保存到: {}", file_path);
+    Ok(())
+}
+
+/// 从文件加载网格状态
+fn load_grid_state(file_path: &str) -> Result<Option<GridState>, GridStrategyError> {
+    match std::fs::read_to_string(file_path) {
+        Ok(contents) => {
+            let grid_state = serde_json::from_str(&contents)
+                .map_err(|e| GridStrategyError::ConfigError(format!("解析状态文件失败: {:?}", e)))?;
+            
+            info!("✅ 成功加载网格状态");
+            Ok(Some(grid_state))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            info!("📄 未找到状态文件，将使用默认设置");
+            Ok(None)
+        }
+        Err(e) => {
+            Err(GridStrategyError::ConfigError(format!("读取状态文件失败: {:?}", e)))
+        }
+    }
+}
+
+/// 保存订单状态到文件
+fn save_orders_state(
+    active_orders: &[u64],
+    buy_orders: &HashMap<u64, OrderInfo>,
+    sell_orders: &HashMap<u64, OrderInfo>,
+    file_path: &str,
+) -> Result<(), GridStrategyError> {
+    #[derive(serde::Serialize)]
+    struct OrdersState {
+        active_orders: Vec<u64>,
+        buy_orders: HashMap<u64, OrderInfo>,
+        sell_orders: HashMap<u64, OrderInfo>,
+        save_time: u64,
+    }
+    
+    let orders_state = OrdersState {
+        active_orders: active_orders.to_vec(),
+        buy_orders: buy_orders.clone(),
+        sell_orders: sell_orders.clone(),
+        save_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+    };
+    
+    let serialized = serde_json::to_string_pretty(&orders_state)
+        .map_err(|e| GridStrategyError::ConfigError(format!("序列化订单状态失败: {:?}", e)))?;
+    
+    std::fs::write(file_path, serialized)
+        .map_err(|e| GridStrategyError::ConfigError(format!("写入订单状态文件失败: {:?}", e)))?;
+    
+    info!("✅ 订单状态已保存到: {} (活跃订单: {}, 买单: {}, 卖单: {})", 
+        file_path, active_orders.len(), buy_orders.len(), sell_orders.len());
+    Ok(())
+}
+
+/// 从文件加载订单状态
+fn load_orders_state(
+    file_path: &str,
+) -> Result<Option<(Vec<u64>, HashMap<u64, OrderInfo>, HashMap<u64, OrderInfo>)>, GridStrategyError> {
+    #[derive(serde::Deserialize)]
+    struct OrdersState {
+        active_orders: Vec<u64>,
+        buy_orders: HashMap<u64, OrderInfo>,
+        sell_orders: HashMap<u64, OrderInfo>,
+        save_time: u64,
+    }
+    
+    match std::fs::read_to_string(file_path) {
+        Ok(contents) => {
+            let orders_state: OrdersState = serde_json::from_str(&contents)
+                .map_err(|e| GridStrategyError::ConfigError(format!("解析订单状态文件失败: {:?}", e)))?;
+            
+            // 检查状态文件的时效性（超过1小时的状态文件可能已过期）
+            let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let state_age = current_time - orders_state.save_time;
+            
+            if state_age > 3600 { // 1小时
+                warn!("⚠️ 订单状态文件已过期 ({:.1} 小时前)，将忽略", state_age as f64 / 3600.0);
+                return Ok(None);
+            }
+            
+            info!("✅ 成功加载订单状态 (活跃订单: {}, 买单: {}, 卖单: {})", 
+                orders_state.active_orders.len(), 
+                orders_state.buy_orders.len(), 
+                orders_state.sell_orders.len());
+            
+            Ok(Some((orders_state.active_orders, orders_state.buy_orders, orders_state.sell_orders)))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            info!("📄 未找到订单状态文件，将使用空状态");
+            Ok(None)
+        }
+        Err(e) => {
+            Err(GridStrategyError::ConfigError(format!("读取订单状态文件失败: {:?}", e)))
+        }
+    }
+}
+
+/// 定期保存状态（在主循环中调用）
+fn periodic_state_save(
+    grid_state: &GridState,
+    active_orders: &[u64],
+    buy_orders: &HashMap<u64, OrderInfo>,
+    sell_orders: &HashMap<u64, OrderInfo>,
+    last_save_time: &mut SystemTime,
+    save_interval_seconds: u64,
+) -> Result<(), GridStrategyError> {
+    let now = SystemTime::now();
+    
+    // 检查是否到了保存时间
+    if now.duration_since(*last_save_time).unwrap_or_default().as_secs() >= save_interval_seconds {
+        // 保存网格状态
+        if let Err(e) = save_grid_state(grid_state, "grid_state.json") {
+            warn!("⚠️ 保存网格状态失败: {:?}", e);
+        }
+        
+        // 保存订单状态
+        if let Err(e) = save_orders_state(active_orders, buy_orders, sell_orders, "orders_state.json") {
+            warn!("⚠️ 保存订单状态失败: {:?}", e);
+        }
+        
+        *last_save_time = now;
+        info!("💾 定期状态保存完成");
+    }
+    
+    Ok(())
+}
+
+/// 验证加载的状态是否与当前配置兼容
+fn validate_loaded_state(
+    grid_state: &GridState,
+    grid_config: &crate::config::GridConfig,
+) -> Result<bool, GridStrategyError> {
+    let mut is_valid = true;
+    let mut warnings = Vec::new();
+    
+    // 检查总资金是否匹配
+    if (grid_state.total_capital - grid_config.total_capital).abs() > 0.01 {
+        warnings.push(format!(
+            "总资金不匹配: 状态文件={:.2}, 配置文件={:.2}",
+            grid_state.total_capital, grid_config.total_capital
+        ));
+    }
+    
+    // 检查动态参数是否在合理范围内
+    if grid_state.dynamic_params.current_min_spacing < grid_config.min_grid_spacing * 0.5 
+        || grid_state.dynamic_params.current_min_spacing > grid_config.max_grid_spacing {
+        warnings.push(format!(
+            "最小网格间距超出范围: {:.4}% (配置范围: {:.4}%-{:.4}%)",
+            grid_state.dynamic_params.current_min_spacing * 100.0,
+            grid_config.min_grid_spacing * 100.0,
+            grid_config.max_grid_spacing * 100.0
+        ));
+    }
+    
+    // 检查交易金额是否合理
+    if grid_state.dynamic_params.current_trade_amount > grid_config.total_capital * 0.5 {
+        warnings.push(format!(
+            "交易金额过大: {:.2} (总资金的{:.1}%)",
+            grid_state.dynamic_params.current_trade_amount,
+            grid_state.dynamic_params.current_trade_amount / grid_config.total_capital * 100.0
+        ));
+    }
+    
+    // 输出警告信息
+    if !warnings.is_empty() {
+        warn!("⚠️ 加载的状态存在以下问题:");
+        for warning in warnings {
+            warn!("   - {}", warning);
+        }
+        warn!("建议检查状态文件或重新开始");
+    }
+    
+    Ok(is_valid)
+}
+
+/// 创建状态备份
+fn backup_state_files() -> Result<(), GridStrategyError> {
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    
+    // 备份网格状态
+    if std::path::Path::new("grid_state.json").exists() {
+        let backup_name = format!("grid_state_backup_{}.json", timestamp);
+        std::fs::copy("grid_state.json", &backup_name)
+            .map_err(|e| GridStrategyError::ConfigError(format!("备份网格状态失败: {:?}", e)))?;
+        info!("📋 网格状态已备份到: {}", backup_name);
+    }
+    
+    // 备份订单状态
+    if std::path::Path::new("orders_state.json").exists() {
+        let backup_name = format!("orders_state_backup_{}.json", timestamp);
+        std::fs::copy("orders_state.json", &backup_name)
+            .map_err(|e| GridStrategyError::ConfigError(format!("备份订单状态失败: {:?}", e)))?;
+        info!("📋 订单状态已备份到: {}", backup_name);
+    }
+    
+    // 备份动态参数
+    if std::path::Path::new("dynamic_grid_params.json").exists() {
+        let backup_name = format!("dynamic_grid_params_backup_{}.json", timestamp);
+        std::fs::copy("dynamic_grid_params.json", &backup_name)
+            .map_err(|e| GridStrategyError::ConfigError(format!("备份动态参数失败: {:?}", e)))?;
+        info!("📋 动态参数已备份到: {}", backup_name);
+    }
+    
+    Ok(())
+}
+
+/// 清理过期的备份文件
+fn cleanup_old_backups(max_backup_age_days: u64) -> Result<(), GridStrategyError> {
+    let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let max_age_seconds = max_backup_age_days * 24 * 60 * 60;
+    
+    let backup_patterns = ["grid_state_backup_", "orders_state_backup_", "dynamic_grid_params_backup_"];
+    
+    for pattern in &backup_patterns {
+        if let Ok(entries) = std::fs::read_dir(".") {
+            for entry in entries.flatten() {
+                if let Some(filename) = entry.file_name().to_str() {
+                    if filename.starts_with(pattern) && filename.ends_with(".json") {
+                        // 从文件名提取时间戳
+                        if let Some(timestamp_str) = filename
+                            .strip_prefix(pattern)
+                            .and_then(|s| s.strip_suffix(".json")) {
+                            if let Ok(timestamp) = timestamp_str.parse::<u64>() {
+                                if current_time - timestamp > max_age_seconds {
+                                    if let Err(e) = std::fs::remove_file(entry.path()) {
+                                        warn!("⚠️ 删除过期备份文件失败: {} - {:?}", filename, e);
+                                    } else {
+                                        info!("🗑️ 已删除过期备份文件: {}", filename);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(())
 }
 
 // 分析网格性能并提供优化建议
