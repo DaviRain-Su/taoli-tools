@@ -4201,6 +4201,7 @@ async fn create_dynamic_grid(
     active_orders: &mut Vec<u64>,
     buy_orders: &mut HashMap<u64, OrderInfo>,
     sell_orders: &mut HashMap<u64, OrderInfo>,
+    order_manager: &mut OrderManager,
 ) -> Result<(), GridStrategyError> {
     info!("🔄 开始创建动态网格...");
 
@@ -4908,6 +4909,9 @@ async fn rebalance_grid(
     // 这里可以根据市场分析调整网格参数
 
     // 重新创建网格
+    // 注意：这里需要传递订单管理器，但rebalance_grid函数没有接收它
+    // 暂时使用一个临时的订单管理器
+    let mut temp_order_manager = OrderManager::new(100);
     create_dynamic_grid(
         exchange_client,
         grid_config,
@@ -4917,6 +4921,7 @@ async fn rebalance_grid(
         active_orders,
         buy_orders,
         sell_orders,
+        &mut temp_order_manager,
     )
     .await?;
 
@@ -5307,6 +5312,15 @@ pub async fn run_grid_strategy(
     let mut consecutive_failures = 0u32;
     let mut last_margin_ratio = 100.0f64;
 
+    // ===== 初始化订单优先级管理器 =====
+    
+    let mut order_manager = OrderManager::new((grid_config.grid_count * 2) as usize); // 最大订单数为网格数的2倍
+    
+    info!("📋 订单优先级管理器已初始化");
+    info!("   - 最大订单数: {}", order_manager.max_orders);
+    info!("   - 清理间隔: {}分钟", order_manager.cleanup_interval.as_secs() / 60);
+    info!("   - 优先级分布: {:?}", order_manager.get_priority_distribution());
+
     // ===== 初始化连接管理器 =====
     
     let mut connection_manager = ConnectionManager::new();
@@ -5691,6 +5705,44 @@ pub async fn run_grid_strategy(
                             warn!("⚠️ 风险控制触发，暂停新的交易操作");
                             stop_trading_flag.store(true, Ordering::SeqCst);
                         }
+
+                    // 1.6. 订单优先级管理
+                    // 更新市场条件
+                    if price_history.len() >= 2 {
+                        let volatility = calculate_market_volatility(&price_history);
+                        let price_change = ((current_price - price_history[price_history.len() - 2]) / price_history[price_history.len() - 2]).abs();
+                        order_manager.update_market_conditions(current_price, volatility, price_change);
+                    }
+
+                    // 处理过期订单
+                    if let Err(e) = check_expired_orders(&exchange_client, &mut order_manager, grid_config, current_price).await {
+                        warn!("⚠️ 处理过期订单失败: {:?}", e);
+                    }
+
+                    // 处理紧急订单
+                    let urgent_orders = order_manager.get_urgent_orders();
+                    if !urgent_orders.is_empty() {
+                        info!("🚨 检测到{}个紧急订单需要处理", urgent_orders.len());
+                        for urgent_order in urgent_orders {
+                            if urgent_order.needs_immediate_attention() {
+                                info!("⚡ 处理紧急订单: {} - 剩余时间: {:?}秒", 
+                                    urgent_order.priority.as_str(), 
+                                    urgent_order.remaining_seconds());
+                                
+                                // 这里可以添加紧急订单的特殊处理逻辑
+                                // 例如：提高订单优先级、使用市价单等
+                            }
+                        }
+                    }
+
+                    // 定期清理过期订单（每5分钟）
+                    let cleanup_interval = Duration::from_secs(300);
+                    if SystemTime::now().duration_since(order_manager.last_cleanup_time).unwrap_or_default() >= cleanup_interval {
+                        let expired_count = order_manager.cleanup_expired_orders().len();
+                        if expired_count > 0 {
+                            info!("🧹 清理了{}个过期订单", expired_count);
+                        }
+                    }
                         
                         // 检查是否需要重置每日统计
                         if now.duration_since(daily_start_time).unwrap_or_default().as_secs() >= 24 * 60 * 60 {
@@ -5891,6 +5943,7 @@ pub async fn run_grid_strategy(
                             &mut active_orders,
                             &mut buy_orders,
                             &mut sell_orders,
+                            &mut order_manager,
                         )
                         .await?;
                         
@@ -6057,6 +6110,13 @@ pub async fn run_grid_strategy(
                             grid_state.current_metrics.largest_win,
                             grid_state.current_metrics.largest_loss
                         );
+                        
+                        // 订单优先级管理状态报告
+                        let order_stats = order_manager.get_statistics_report();
+                        info!("📋 订单优先级管理状态:");
+                        for line in order_stats.lines() {
+                            info!("   {}", line);
+                        }
                         
                         last_status_report = now;
                     }
