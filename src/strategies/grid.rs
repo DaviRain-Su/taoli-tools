@@ -186,15 +186,29 @@ impl StopLossStatus {
     }
 }
 
+// 参数回滚检查点
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ParameterCheckpoint {
+    min_spacing: f64,
+    max_spacing: f64,
+    trade_amount: f64,
+    checkpoint_time: u64, // Unix timestamp
+    performance_before: f64,
+    reason: String,
+}
+
 // 动态网格参数结构体
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct DynamicGridParams {
     current_min_spacing: f64,
     current_max_spacing: f64,
     current_trade_amount: f64,
-    last_optimization_time: SystemTime,
+    last_optimization_time: u64, // 改为Unix timestamp便于序列化
     optimization_count: u32,
     performance_window: Vec<f64>, // 滑动窗口性能记录
+    checkpoints: Vec<ParameterCheckpoint>, // 回滚检查点
+    last_checkpoint_time: u64,
+    rollback_threshold: f64, // 回滚阈值（性能下降超过此值时回滚）
 }
 
 impl DynamicGridParams {
@@ -203,10 +217,147 @@ impl DynamicGridParams {
             current_min_spacing: grid_config.min_grid_spacing,
             current_max_spacing: grid_config.max_grid_spacing,
             current_trade_amount: grid_config.trade_amount,
-            last_optimization_time: SystemTime::now(),
+            last_optimization_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
             optimization_count: 0,
             performance_window: Vec::new(),
+            checkpoints: Vec::new(),
+            last_checkpoint_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            rollback_threshold: 15.0, // 性能下降超过15分时触发回滚
         }
+    }
+
+    // 从文件加载参数
+    fn load_from_file(file_path: &str, grid_config: &crate::config::GridConfig) -> Self {
+        match std::fs::read_to_string(file_path) {
+            Ok(content) => {
+                match serde_json::from_str::<DynamicGridParams>(&content) {
+                    Ok(mut params) => {
+                        info!("✅ 成功加载动态参数 - 优化次数: {}, 检查点数: {}", 
+                            params.optimization_count, params.checkpoints.len());
+                        
+                        // 验证参数合理性
+                        if params.current_min_spacing < grid_config.min_grid_spacing * 0.1 
+                            || params.current_min_spacing > grid_config.max_grid_spacing {
+                            warn!("⚠️ 加载的最小间距参数异常，重置为默认值");
+                            params.current_min_spacing = grid_config.min_grid_spacing;
+                        }
+                        
+                        if params.current_max_spacing < params.current_min_spacing 
+                            || params.current_max_spacing > grid_config.max_grid_spacing * 2.0 {
+                            warn!("⚠️ 加载的最大间距参数异常，重置为默认值");
+                            params.current_max_spacing = grid_config.max_grid_spacing;
+                        }
+                        
+                        if params.current_trade_amount < grid_config.trade_amount * 0.1 
+                            || params.current_trade_amount > grid_config.total_capital * 0.2 {
+                            warn!("⚠️ 加载的交易金额参数异常，重置为默认值");
+                            params.current_trade_amount = grid_config.trade_amount;
+                        }
+                        
+                        params
+                    }
+                    Err(e) => {
+                        warn!("⚠️ 解析动态参数文件失败: {:?}，使用默认参数", e);
+                        Self::new(grid_config)
+                    }
+                }
+            }
+            Err(_) => {
+                info!("📄 动态参数文件不存在，创建新的参数配置");
+                Self::new(grid_config)
+            }
+        }
+    }
+
+    // 保存参数到文件
+    fn save_to_file(&self, file_path: &str) -> Result<(), GridStrategyError> {
+        match serde_json::to_string_pretty(self) {
+            Ok(content) => {
+                match std::fs::write(file_path, content) {
+                    Ok(_) => {
+                        info!("💾 动态参数已保存到文件: {}", file_path);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        error!("❌ 保存动态参数失败: {:?}", e);
+                        Err(GridStrategyError::ConfigError(format!("保存参数失败: {:?}", e)))
+                    }
+                }
+            }
+            Err(e) => {
+                error!("❌ 序列化动态参数失败: {:?}", e);
+                Err(GridStrategyError::ConfigError(format!("序列化参数失败: {:?}", e)))
+            }
+        }
+    }
+
+    // 创建检查点
+    fn create_checkpoint(&mut self, reason: String, current_performance: f64) {
+        let checkpoint = ParameterCheckpoint {
+            min_spacing: self.current_min_spacing,
+            max_spacing: self.current_max_spacing,
+            trade_amount: self.current_trade_amount,
+            checkpoint_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            performance_before: current_performance,
+            reason: reason.clone(),
+        };
+        
+        self.checkpoints.push(checkpoint);
+        self.last_checkpoint_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        
+        // 保持最多10个检查点
+        if self.checkpoints.len() > 10 {
+            self.checkpoints.remove(0);
+        }
+        
+        info!("📍 创建参数检查点 - 原因: {}, 性能: {:.1}, 检查点数: {}", 
+            reason, current_performance, self.checkpoints.len());
+    }
+
+    // 检查是否需要回滚
+    fn should_rollback(&self, current_performance: f64) -> Option<&ParameterCheckpoint> {
+        if self.checkpoints.is_empty() {
+            return None;
+        }
+        
+        let latest_checkpoint = self.checkpoints.last().unwrap();
+        let performance_decline = latest_checkpoint.performance_before - current_performance;
+        
+        // 检查时间条件：优化后至少6小时才考虑回滚
+        let time_since_checkpoint = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() - latest_checkpoint.checkpoint_time;
+        
+        if time_since_checkpoint >= 6 * 60 * 60 && performance_decline > self.rollback_threshold {
+            info!("🔄 检测到性能下降 {:.1}分，超过阈值 {:.1}分，建议回滚", 
+                performance_decline, self.rollback_threshold);
+            Some(latest_checkpoint)
+        } else {
+            None
+        }
+    }
+
+    // 执行回滚
+    fn rollback_to_checkpoint(&mut self, checkpoint: &ParameterCheckpoint) {
+        info!("🔄 执行参数回滚:");
+        info!("   回滚原因: {}", checkpoint.reason);
+        info!("   回滚前性能: {:.1}", checkpoint.performance_before);
+        info!("   最小间距: {:.4}% -> {:.4}%", 
+            self.current_min_spacing * 100.0, checkpoint.min_spacing * 100.0);
+        info!("   最大间距: {:.4}% -> {:.4}%", 
+            self.current_max_spacing * 100.0, checkpoint.max_spacing * 100.0);
+        info!("   交易金额: {:.2} -> {:.2}", 
+            self.current_trade_amount, checkpoint.trade_amount);
+        
+        self.current_min_spacing = checkpoint.min_spacing;
+        self.current_max_spacing = checkpoint.max_spacing;
+        self.current_trade_amount = checkpoint.trade_amount;
+        
+        // 移除已回滚的检查点
+        self.checkpoints.pop();
+        
+        info!("✅ 参数回滚完成");
     }
 }
 
@@ -2104,7 +2255,7 @@ pub async fn run_grid_strategy(
         last_margin_check: SystemTime::now(),
         connection_retry_count: 0,
         last_order_batch_time: SystemTime::now(),
-        dynamic_params: DynamicGridParams::new(grid_config),
+        dynamic_params: DynamicGridParams::load_from_file("dynamic_grid_params.json", grid_config),
     };
 
     let mut active_orders: Vec<u64> = Vec::new();
@@ -2406,10 +2557,37 @@ pub async fn run_grid_strategy(
                         }
                     }
 
-                    // 5. 定期状态报告（每小时）
+                    // 5. 定期状态报告和参数管理（每小时）
                     if now.duration_since(last_status_report).unwrap().as_secs() >= 3600 {
                         // 更新性能指标
                         grid_state.current_metrics = calculate_performance_metrics(&grid_state, &price_history);
+                        
+                        // 检查是否需要回滚（基于当前性能）
+                        let current_performance_score = if grid_state.current_metrics.total_profit > 0.0 { 50.0 } else { 0.0 }
+                            + grid_state.current_metrics.win_rate * 30.0
+                            + if grid_state.current_metrics.total_profit / grid_state.current_metrics.total_trades.max(1) as f64 > 0.0 { 20.0 } else { 0.0 };
+                        
+                        if let Some(checkpoint) = grid_state.dynamic_params.should_rollback(current_performance_score) {
+                            warn!("🔄 定期检查发现性能下降，执行参数回滚");
+                            let checkpoint_clone = checkpoint.clone();
+                            grid_state.dynamic_params.rollback_to_checkpoint(&checkpoint_clone);
+                            
+                            // 保存回滚后的参数
+                            if let Err(e) = grid_state.dynamic_params.save_to_file("dynamic_grid_params.json") {
+                                warn!("⚠️ 保存回滚参数失败: {:?}", e);
+                            }
+                            
+                            // 回滚后需要重新创建网格
+                            info!("🔄 参数回滚后重新创建网格");
+                            cancel_all_orders(&exchange_client, &mut active_orders).await?;
+                            buy_orders.clear();
+                            sell_orders.clear();
+                        } else {
+                            // 定期保存当前参数状态
+                            if let Err(e) = grid_state.dynamic_params.save_to_file("dynamic_grid_params.json") {
+                                warn!("⚠️ 定期保存动态参数失败: {:?}", e);
+                            }
+                        }
                         
                         let report = generate_status_report(
                             &grid_state,
@@ -3646,8 +3824,8 @@ fn auto_optimize_grid_parameters(
     let now = SystemTime::now();
     
     // 检查是否需要优化（每24小时最多优化一次）
-    if now.duration_since(grid_state.dynamic_params.last_optimization_time)
-        .unwrap_or_default().as_secs() < 24 * 60 * 60 {
+    let current_timestamp = now.duration_since(UNIX_EPOCH).unwrap().as_secs();
+    if current_timestamp - grid_state.dynamic_params.last_optimization_time < 24 * 60 * 60 {
         return false;
     }
     
@@ -3763,7 +3941,18 @@ fn auto_optimize_grid_parameters(
     }
     
     if optimization_applied {
-        grid_state.dynamic_params.last_optimization_time = now;
+        // 创建优化前的检查点
+        let optimization_reason = if performance_score >= 70.0 {
+            "积极优化策略".to_string()
+        } else if performance_score <= 30.0 {
+            "保守优化策略".to_string()
+        } else {
+            "微调优化策略".to_string()
+        };
+        
+        grid_state.dynamic_params.create_checkpoint(optimization_reason, performance_score);
+        
+        grid_state.dynamic_params.last_optimization_time = current_timestamp;
         grid_state.dynamic_params.optimization_count += 1;
         
         info!("✅ 自动优化完成 (第{}次):", grid_state.dynamic_params.optimization_count);
@@ -3789,8 +3978,27 @@ fn auto_optimize_grid_parameters(
             grid_state.dynamic_params.performance_window.remove(0);
         }
         
+        // 保存参数到文件
+        if let Err(e) = grid_state.dynamic_params.save_to_file("dynamic_grid_params.json") {
+            warn!("⚠️ 保存动态参数失败: {:?}", e);
+        }
+        
         true
     } else {
+        // 即使没有优化，也检查是否需要回滚
+        if let Some(checkpoint) = grid_state.dynamic_params.should_rollback(performance_score) {
+            warn!("🔄 性能下降，执行参数回滚");
+            let checkpoint_clone = checkpoint.clone();
+            grid_state.dynamic_params.rollback_to_checkpoint(&checkpoint_clone);
+            
+            // 保存回滚后的参数
+            if let Err(e) = grid_state.dynamic_params.save_to_file("dynamic_grid_params.json") {
+                warn!("⚠️ 保存回滚参数失败: {:?}", e);
+            }
+            
+            return true; // 回滚也算是一种优化
+        }
+        
         info!("📊 性能中等，暂不执行自动优化");
         false
     }

@@ -3644,6 +3644,7 @@ dependencies = [
  "hyperliquid_rust_sdk",
  "log",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "toml",
