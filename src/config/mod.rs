@@ -1,7 +1,7 @@
-use serde::Deserialize;
-use std::path::Path;
 use config::Config as ConfigBuilder;
+use serde::Deserialize;
 use std::env;
+use std::path::Path;
 
 #[derive(Debug, Deserialize)]
 pub struct SpotConfig {
@@ -51,11 +51,16 @@ pub struct GridConfig {
     // 风险控制参数 (Risk control parameters)
     pub max_single_loss: f64,
     pub max_daily_loss: f64,
+    pub trailing_stop_ratio: f64,     // 浮动止损比例，默认0.1（10%）
+    pub margin_safety_threshold: f64, // 保证金安全阈值，默认0.3（30%）
+    pub slippage_tolerance: f64,      // 滑点容忍度，默认0.001（0.1%）
+    pub max_orders_per_batch: usize,  // 每批最大订单数，默认5
+    pub order_batch_delay_ms: u64,    // 批次间延迟毫秒数，默认200ms
     pub max_holding_time: u64,
     pub history_length: usize,
-    pub max_active_orders: usize, // 每次最多挂单数量（买/卖各自）
-    pub fee_rate: f64,           // 手续费率
-    pub min_profit: f64,         // 最小盈利阈值
+    pub max_active_orders: usize,    // 每次最多挂单数量（买/卖各自）
+    pub fee_rate: f64,               // 手续费率
+    pub min_profit: f64,             // 最小盈利阈值
     pub margin_usage_threshold: f64, // 保证金使用率阈值，默认0.8（80%）
 }
 
@@ -83,9 +88,9 @@ pub fn load_config(config_path: &Path) -> Result<AppConfig, Box<dyn std::error::
         .build()?;
 
     let mut config: AppConfig = settings.try_deserialize()?;
-     // 优先从环境变量读取 private_key
-     if let Ok(pk) = env::var("PRIVATE_KEY") {
+    // 优先从环境变量读取 private_key
+    if let Ok(pk) = env::var("PRIVATE_KEY") {
         config.account.private_key = pk;
     }
     Ok(config)
-} 
+}
