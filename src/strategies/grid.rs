@@ -5451,11 +5451,33 @@ async fn create_dynamic_grid(
     let grid_reduction = market_analysis.market_state.grid_reduction_factor();
     let adjusted_grid_count = (grid_config.grid_count as f64 * grid_reduction) as u32;
     
-    // 严格限制订单数量不超过配置的最大值
-    let max_buy_orders = grid_config.max_active_orders / 2;  // 买单最多占一半
-    let max_sell_orders = grid_config.max_active_orders / 2; // 卖单最多占一半
-    let final_buy_limit = adjusted_grid_count.min(max_buy_orders as u32);
-    let final_sell_limit = adjusted_grid_count.min(max_sell_orders as u32);
+    // 检查当前订单数量，严格控制总数不超过配置限制
+    let current_total_orders = active_orders.len();
+    let remaining_order_slots = if current_total_orders >= grid_config.max_active_orders as usize {
+        warn!("⚠️ 当前订单数量({})已达到或超过配置限制({}), 停止创建新订单", 
+              current_total_orders, grid_config.max_active_orders);
+        return Ok(());
+    } else {
+        grid_config.max_active_orders as usize - current_total_orders
+    };
+
+    // 自适应网格：买单和卖单数量应该相等，平分剩余订单槽位
+    let max_new_buy_orders = remaining_order_slots / 2;  // 买单占一半
+    let max_new_sell_orders = remaining_order_slots / 2; // 卖单占一半
+    
+    // 如果剩余槽位是奇数，优先给买单（因为网格策略通常从买入开始）
+    let max_new_buy_orders = if remaining_order_slots % 2 == 1 {
+        max_new_buy_orders + 1
+    } else {
+        max_new_buy_orders
+    };
+
+    let final_buy_limit = adjusted_grid_count.min(max_new_buy_orders as u32);
+    let final_sell_limit = adjusted_grid_count.min(max_new_sell_orders as u32);
+
+    info!("📊 订单数量控制 - 当前总订单: {}, 配置限制: {}, 剩余槽位: {}, 最大新买单: {}, 最大新卖单: {}",
+          current_total_orders, grid_config.max_active_orders, remaining_order_slots, 
+          final_buy_limit, final_sell_limit);
 
     if market_analysis
         .market_state
@@ -5513,12 +5535,11 @@ async fn create_dynamic_grid(
     let mut pending_buy_order_info: Vec<OrderInfo> = Vec::new();
 
     info!(
-        "🔄 开始买单循环 - 初始买入价: {:.4}, 价格下限: {:.4}, 最大资金: {:.2}, 最大买单数: {} (配置限制: {})",
+        "🔄 开始买单循环 - 初始买入价: {:.4}, 价格下限: {:.4}, 最大资金: {:.2}, 最大买单数: {}",
         current_buy_price,
         current_price * 0.8,
         max_buy_funds,
-        final_buy_limit,
-        max_buy_orders
+        final_buy_limit
     );
 
     while current_buy_price > current_price * 0.8
@@ -5816,12 +5837,11 @@ async fn create_dynamic_grid(
     let mut pending_sell_order_info: Vec<OrderInfo> = Vec::new();
 
     info!(
-        "🔄 开始卖单循环 - 初始卖出价: {:.4}, 价格上限: {:.4}, 最大数量: {:.4}, 最大卖单数: {} (配置限制: {})",
+        "🔄 开始卖单循环 - 初始卖出价: {:.4}, 价格上限: {:.4}, 最大数量: {:.4}, 最大卖单数: {}",
         current_sell_price,
         current_price * 1.2,
         max_sell_quantity,
-        final_sell_limit,
-        max_sell_orders
+        final_sell_limit
     );
 
     while current_sell_price < current_price * 1.2
