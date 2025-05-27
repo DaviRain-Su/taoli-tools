@@ -6308,6 +6308,318 @@ async fn cleanup_expired_orders(
     Ok(())
 }
 
+async fn adaptive_order_rebalance(
+    exchange_client: &ExchangeClient,
+    grid_config: &crate::config::GridConfig,
+    grid_state: &mut GridState,
+    current_price: f64,
+    price_history: &[f64],
+    active_orders: &mut Vec<u64>,
+    buy_orders: &mut HashMap<u64, OrderInfo>,
+    sell_orders: &mut HashMap<u64, OrderInfo>,
+    current_buy_count: usize,
+    current_sell_count: usize,
+    target_buy_count: usize,
+    target_sell_count: usize,
+) -> Result<(), GridStrategyError> {
+    info!("🔄 开始自适应订单补全 - 当前买单: {}, 目标买单: {}, 当前卖单: {}, 目标卖单: {}", 
+          current_buy_count, target_buy_count, current_sell_count, target_sell_count);
+
+    // 检查当前总订单数是否已达到限制
+    let current_total = active_orders.len();
+    if current_total >= grid_config.max_active_orders as usize {
+        warn!("⚠️ 当前订单数量({})已达到配置限制({}), 跳过补全", 
+              current_total, grid_config.max_active_orders);
+        return Ok(());
+    }
+
+    // 计算需要补充的订单数量
+    let buy_deficit = if current_buy_count < target_buy_count {
+        target_buy_count - current_buy_count
+    } else { 0 };
+    
+    let sell_deficit = if current_sell_count < target_sell_count {
+        target_sell_count - current_sell_count
+    } else { 0 };
+
+    // 确保不超过总订单限制
+    let remaining_slots = grid_config.max_active_orders as usize - current_total;
+    let total_needed = buy_deficit + sell_deficit;
+    
+    if total_needed == 0 {
+        info!("✅ 订单数量已平衡，无需补全");
+        return Ok(());
+    }
+
+    if total_needed > remaining_slots {
+        warn!("⚠️ 需要补充{}个订单，但只有{}个剩余槽位，按比例分配", 
+              total_needed, remaining_slots);
+        
+        // 按比例分配剩余槽位
+        let buy_ratio = buy_deficit as f64 / total_needed as f64;
+        let actual_buy_add = (remaining_slots as f64 * buy_ratio).round() as usize;
+        let actual_sell_add = remaining_slots - actual_buy_add;
+        
+        info!("📊 按比例分配 - 补充买单: {}, 补充卖单: {}", actual_buy_add, actual_sell_add);
+        
+        // 补充买单
+        if actual_buy_add > 0 {
+            supplement_buy_orders(
+                exchange_client,
+                grid_config,
+                grid_state,
+                current_price,
+                price_history,
+                active_orders,
+                buy_orders,
+                actual_buy_add,
+            ).await?;
+        }
+        
+        // 补充卖单
+        if actual_sell_add > 0 {
+            supplement_sell_orders(
+                exchange_client,
+                grid_config,
+                grid_state,
+                current_price,
+                price_history,
+                active_orders,
+                sell_orders,
+                actual_sell_add,
+            ).await?;
+        }
+    } else {
+        // 有足够的槽位，直接补充
+        info!("📊 有足够槽位 - 补充买单: {}, 补充卖单: {}", buy_deficit, sell_deficit);
+        
+        // 补充买单
+        if buy_deficit > 0 {
+            supplement_buy_orders(
+                exchange_client,
+                grid_config,
+                grid_state,
+                current_price,
+                price_history,
+                active_orders,
+                buy_orders,
+                buy_deficit,
+            ).await?;
+        }
+        
+        // 补充卖单
+        if sell_deficit > 0 {
+            supplement_sell_orders(
+                exchange_client,
+                grid_config,
+                grid_state,
+                current_price,
+                price_history,
+                active_orders,
+                sell_orders,
+                sell_deficit,
+            ).await?;
+        }
+    }
+
+    info!("✅ 自适应订单补全完成");
+    Ok(())
+}
+
+async fn supplement_buy_orders(
+    exchange_client: &ExchangeClient,
+    grid_config: &crate::config::GridConfig,
+    grid_state: &mut GridState,
+    current_price: f64,
+    _price_history: &[f64],
+    active_orders: &mut Vec<u64>,
+    buy_orders: &mut HashMap<u64, OrderInfo>,
+    count: usize,
+) -> Result<(), GridStrategyError> {
+    info!("🟢 补充{}个买单...", count);
+    
+    // 获取当前最低买单价格，避免价格重叠
+    let mut lowest_buy_price = buy_orders.values()
+        .map(|order| order.price)
+        .fold(current_price, |acc, price| if price < current_price && price < acc { price } else { acc });
+    
+    // 如果没有现有买单，从当前价格开始
+    if lowest_buy_price >= current_price {
+        lowest_buy_price = current_price * 0.995; // 从当前价格下方0.5%开始
+    }
+
+    let mut pending_orders = Vec::new();
+    let mut pending_order_infos = Vec::new();
+    
+    for i in 0..count {
+        // 计算新的买单价格，确保不重叠
+        let spacing = grid_state.dynamic_params.current_min_spacing * (1.0 + i as f64 * 0.1);
+        let buy_price = lowest_buy_price * (1.0 - spacing * (i + 1) as f64);
+        
+        if buy_price <= current_price * 0.8 {
+            warn!("⚠️ 买单价格过低，停止补充");
+            break;
+        }
+        
+        let trade_amount = grid_state.dynamic_params.current_trade_amount;
+        let quantity = format_price(trade_amount / buy_price, grid_config.quantity_precision);
+        let formatted_price = format_price(buy_price, grid_config.price_precision);
+        
+        let order = ClientOrderRequest {
+            asset: grid_config.trading_asset.clone(),
+            is_buy: true,
+            reduce_only: false,
+            limit_px: formatted_price,
+            sz: quantity,
+            cloid: None,
+            order_type: ClientOrder::Limit(ClientLimit {
+                tif: "Gtc".to_string(),
+            }),
+        };
+        
+        pending_orders.push(order);
+        pending_order_infos.push(OrderInfo {
+            price: formatted_price,
+            quantity,
+            cost_price: None,
+            potential_sell_price: Some(buy_price * (1.0 + spacing * 2.0)),
+            allocated_funds: 0.0,
+        });
+    }
+    
+    if !pending_orders.is_empty() {
+        let mut temp_batch_optimizer = BatchTaskOptimizer::new(
+            grid_config.max_orders_per_batch.max(5),
+            Duration::from_secs(3),
+        );
+        
+        match create_orders_in_batches(
+            exchange_client,
+            pending_orders,
+            grid_config,
+            grid_state,
+            &mut temp_batch_optimizer,
+        ).await {
+            Ok((created_order_ids, _)) => {
+                for (i, order_id) in created_order_ids.iter().enumerate() {
+                    if i < pending_order_infos.len() {
+                        active_orders.push(*order_id);
+                        buy_orders.insert(*order_id, pending_order_infos[i].clone());
+                        info!("🟢 补充买单成功: ID={}, 价格={:.4}", order_id, pending_order_infos[i].price);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("⚠️ 补充买单失败: {:?}", e);
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+async fn supplement_sell_orders(
+    exchange_client: &ExchangeClient,
+    grid_config: &crate::config::GridConfig,
+    grid_state: &mut GridState,
+    current_price: f64,
+    _price_history: &[f64],
+    active_orders: &mut Vec<u64>,
+    sell_orders: &mut HashMap<u64, OrderInfo>,
+    count: usize,
+) -> Result<(), GridStrategyError> {
+    info!("🔴 补充{}个卖单...", count);
+    
+    // 获取当前最高卖单价格，避免价格重叠
+    let mut highest_sell_price = sell_orders.values()
+        .map(|order| order.price)
+        .fold(current_price, |acc, price| if price > current_price && price > acc { price } else { acc });
+    
+    // 如果没有现有卖单，从当前价格开始
+    if highest_sell_price <= current_price {
+        highest_sell_price = current_price * 1.005; // 从当前价格上方0.5%开始
+    }
+
+    let mut pending_orders = Vec::new();
+    let mut pending_order_infos = Vec::new();
+    
+    for i in 0..count {
+        // 计算新的卖单价格，确保不重叠
+        let spacing = grid_state.dynamic_params.current_min_spacing * (1.0 + i as f64 * 0.1);
+        let sell_price = highest_sell_price * (1.0 + spacing * (i + 1) as f64);
+        
+        if sell_price >= current_price * 1.2 {
+            warn!("⚠️ 卖单价格过高，停止补充");
+            break;
+        }
+        
+        // 检查是否有足够的持仓进行卖出
+        let available_quantity = grid_state.position_quantity * 0.8; // 保留20%作为缓冲
+        if available_quantity <= 0.0 {
+            warn!("⚠️ 没有足够持仓创建卖单");
+            break;
+        }
+        
+        let trade_amount = grid_state.dynamic_params.current_trade_amount;
+        let quantity = format_price(
+            (trade_amount / sell_price).min(available_quantity / count as f64), 
+            grid_config.quantity_precision
+        );
+        let formatted_price = format_price(sell_price, grid_config.price_precision);
+        
+        let order = ClientOrderRequest {
+            asset: grid_config.trading_asset.clone(),
+            is_buy: false,
+            reduce_only: false,
+            limit_px: formatted_price,
+            sz: quantity,
+            cloid: None,
+            order_type: ClientOrder::Limit(ClientLimit {
+                tif: "Gtc".to_string(),
+            }),
+        };
+        
+        pending_orders.push(order);
+        pending_order_infos.push(OrderInfo {
+            price: formatted_price,
+            quantity,
+            cost_price: Some(grid_state.position_avg_price),
+            potential_sell_price: None,
+            allocated_funds: 0.0,
+        });
+    }
+    
+    if !pending_orders.is_empty() {
+        let mut temp_batch_optimizer = BatchTaskOptimizer::new(
+            grid_config.max_orders_per_batch.max(5),
+            Duration::from_secs(3),
+        );
+        
+        match create_orders_in_batches(
+            exchange_client,
+            pending_orders,
+            grid_config,
+            grid_state,
+            &mut temp_batch_optimizer,
+        ).await {
+            Ok((created_order_ids, _)) => {
+                for (i, order_id) in created_order_ids.iter().enumerate() {
+                    if i < pending_order_infos.len() {
+                        active_orders.push(*order_id);
+                        sell_orders.insert(*order_id, pending_order_infos[i].clone());
+                        info!("🔴 补充卖单成功: ID={}, 价格={:.4}", order_id, pending_order_infos[i].price);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("⚠️ 补充卖单失败: {:?}", e);
+            }
+        }
+    }
+    
+    Ok(())
+}
+
 async fn rebalance_grid(
     exchange_client: &ExchangeClient,
     grid_config: &crate::config::GridConfig,
@@ -7827,37 +8139,27 @@ pub async fn run_grid_strategy(
                         grid_state.last_order_batch_time = now;
                     }
 
-                    // 3.1 检查是否需要重新创建网格
+                    // 3.1 自适应订单平衡检查和补全
                     let buy_count = buy_orders.len();
                     let sell_count = sell_orders.len();
-                    let should_recreate_grid = active_orders.is_empty() || 
+                    let total_orders = active_orders.len();
+                    
+                    // 计算理想的买卖单数量（基于配置限制）
+                    let ideal_total_orders = (grid_config.max_active_orders as usize).min(grid_config.grid_count as usize * 2);
+                    let ideal_buy_count = ideal_total_orders / 2;
+                    let ideal_sell_count = ideal_total_orders / 2;
+                    
+                    // 检查是否需要补全订单
+                    let should_recreate_grid = active_orders.is_empty();
+                    let should_rebalance_orders = !should_recreate_grid && (
                         (buy_count == 0 && sell_count > 0) ||  // 只有卖单，没有买单
                         (sell_count == 0 && buy_count > 0) ||  // 只有买单，没有卖单
-                        (buy_count + sell_count < grid_config.grid_count as usize / 2); // 订单数量过少
+                        (buy_count + sell_count < ideal_total_orders / 2) ||  // 订单数量过少
+                        ((buy_count as i32 - sell_count as i32).abs() > 3)  // 买卖单数量严重不平衡
+                    );
                     
                     if should_recreate_grid {
-                        if active_orders.is_empty() {
-                            info!("📊 没有活跃订单，创建动态网格...");
-                        } else if buy_count == 0 && sell_count > 0 {
-                            info!("📊 只有{}个卖单，没有买单，重新创建网格...", sell_count);
-                        } else if sell_count == 0 && buy_count > 0 {
-                            info!("📊 只有{}个买单，没有卖单，重新创建网格...", buy_count);
-                        } else {
-                            info!("📊 订单数量不足（买单:{}, 卖单:{}），重新创建网格...", buy_count, sell_count);
-                        }
-
-                        // 先取消现有订单
-                        if !active_orders.is_empty() {
-                            info!("🔄 取消现有不平衡的订单...");
-                            cancel_all_orders(
-                                &exchange_client,
-                                &mut active_orders,
-                                &grid_config.trading_asset,
-                            )
-                            .await?;
-                            buy_orders.clear();
-                            sell_orders.clear();
-                        }
+                        info!("📊 没有活跃订单，创建动态网格...");
 
                         create_dynamic_grid(
                             &exchange_client,
@@ -7869,6 +8171,28 @@ pub async fn run_grid_strategy(
                             &mut buy_orders,
                             &mut sell_orders,
                             &mut order_manager,
+                        )
+                        .await?;
+                    } else if should_rebalance_orders {
+                        // 自适应订单补全逻辑
+                        info!("🔄 检测到订单不平衡，执行自适应补全...");
+                        info!("📊 当前状态 - 买单: {}, 卖单: {}, 总计: {}, 理想总数: {}", 
+                              buy_count, sell_count, total_orders, ideal_total_orders);
+                        
+                        // 执行智能订单补全
+                        adaptive_order_rebalance(
+                            &exchange_client,
+                            grid_config,
+                            &mut grid_state,
+                            current_price,
+                            &price_history,
+                            &mut active_orders,
+                            &mut buy_orders,
+                            &mut sell_orders,
+                            buy_count,
+                            sell_count,
+                            ideal_buy_count,
+                            ideal_sell_count,
                         )
                         .await?;
 
