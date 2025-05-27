@@ -10,55 +10,12 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use thiserror::Error;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
-#[derive(Error, Debug)]
-pub enum GridStrategyError {
-    #[error("配置错误: {0}")]
-    ConfigError(String),
-    
-    #[error("钱包初始化失败: {0}")]
-    WalletError(String),
-    
-    #[error("客户端初始化失败: {0}")]
-    ClientError(String),
-    
-    #[error("订单操作失败: {0}")]
-    OrderError(String),
-    
-    #[error("订阅失败: {0}")]
-    SubscriptionError(String),
-    
-    #[error("价格解析失败: {0}")]
-    PriceParseError(String),
-    
-    #[error("数量解析失败: {0}")]
-    QuantityParseError(String),
-    
-    #[error("风险控制触发: {0}")]
-    RiskControlTriggered(String),
-
-    #[error("市场分析失败: {0}")]
-    MarketAnalysisError(String),
-
-    #[error("资金分配失败: {0}")]
-    FundAllocationError(String),
-
-    #[error("网格重平衡失败: {0}")]
-    RebalanceError(String),
-
-    #[error("止损执行失败: {0}")]
-    StopLossError(String),
-
-    #[error("保证金不足: {0}")]
-    MarginInsufficient(String),
-
-    #[error("网络连接失败: {0}")]
-    NetworkError(String),
-}
+// 导入错误类型
+use super::error::{GridStrategyError, RetryStrategy, ErrorStatistics};
 
 // 性能指标结构体
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
