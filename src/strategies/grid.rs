@@ -2600,7 +2600,7 @@ impl RiskControlModule {
         let mut result = RiskCheckResult::new();
 
         // 获取当前状态
-        let (liquid_capital, position_quantity, realized_profit, max_drawdown, total_capital) = {
+        let (liquid_capital, position_quantity, _realized_profit, max_drawdown, _total_capital) = {
             let state = self.grid_state.lock().unwrap();
             (
                 state.available_funds + state.position_quantity * current_price, // 流动资产
