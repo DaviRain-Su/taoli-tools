@@ -5450,6 +5450,12 @@ async fn create_dynamic_grid(
     // 基于市场状态调整网格策略
     let grid_reduction = market_analysis.market_state.grid_reduction_factor();
     let adjusted_grid_count = (grid_config.grid_count as f64 * grid_reduction) as u32;
+    
+    // 严格限制订单数量不超过配置的最大值
+    let max_buy_orders = grid_config.max_active_orders / 2;  // 买单最多占一半
+    let max_sell_orders = grid_config.max_active_orders / 2; // 卖单最多占一半
+    let final_buy_limit = adjusted_grid_count.min(max_buy_orders as u32);
+    let final_sell_limit = adjusted_grid_count.min(max_sell_orders as u32);
 
     if market_analysis
         .market_state
@@ -5507,16 +5513,17 @@ async fn create_dynamic_grid(
     let mut pending_buy_order_info: Vec<OrderInfo> = Vec::new();
 
     info!(
-        "🔄 开始买单循环 - 初始买入价: {:.4}, 价格下限: {:.4}, 最大资金: {:.2}, 最大网格数: {}",
+        "🔄 开始买单循环 - 初始买入价: {:.4}, 价格下限: {:.4}, 最大资金: {:.2}, 最大买单数: {} (配置限制: {})",
         current_buy_price,
         current_price * 0.8,
         max_buy_funds,
-        adjusted_grid_count
+        final_buy_limit,
+        max_buy_orders
     );
 
     while current_buy_price > current_price * 0.8
         && allocated_buy_funds < max_buy_funds
-        && buy_count < adjusted_grid_count
+        && buy_count < final_buy_limit
     {
         // 动态计算网格间距，使用优化后的参数和振幅调整
         let dynamic_spacing = grid_state.dynamic_params.current_min_spacing
@@ -5808,9 +5815,18 @@ async fn create_dynamic_grid(
     let mut pending_sell_orders: Vec<ClientOrderRequest> = Vec::new();
     let mut pending_sell_order_info: Vec<OrderInfo> = Vec::new();
 
+    info!(
+        "🔄 开始卖单循环 - 初始卖出价: {:.4}, 价格上限: {:.4}, 最大数量: {:.4}, 最大卖单数: {} (配置限制: {})",
+        current_sell_price,
+        current_price * 1.2,
+        max_sell_quantity,
+        final_sell_limit,
+        max_sell_orders
+    );
+
     while current_sell_price < current_price * 1.2
         && allocated_sell_quantity < max_sell_quantity
-        && sell_count < adjusted_grid_count
+        && sell_count < final_sell_limit
     {
         // 动态计算网格间距，使用优化后的参数和振幅调整
         let dynamic_spacing = grid_state.dynamic_params.current_min_spacing
