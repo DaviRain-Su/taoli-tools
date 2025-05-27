@@ -17,7 +17,7 @@ pair3 = "ETH/BTC"
 [grid]
 # 交易参数
 trading_asset = "FARTCOIN"    # 交易的币种名称
-total_capital = 1000.0        # 总资金量，单位USDT
+total_capital = 5000.0        # 总资金量，单位USDT
 grid_count = 8                # 网格数量，增加到8个（从5个增加），提高交易频率
 trade_amount = 80.0           # 每格交易金额，降低到80（从100降低），分散风险
 max_position = 10000.0          # 最大持仓量，防止过度持仓
