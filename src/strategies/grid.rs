@@ -2600,13 +2600,14 @@ impl RiskControlModule {
         let mut result = RiskCheckResult::new();
 
         // 获取当前状态
-        let (current_capital, position_quantity, _realized_profit, max_drawdown) = {
+        let (liquid_capital, position_quantity, realized_profit, max_drawdown, total_capital) = {
             let state = self.grid_state.lock().unwrap();
             (
-                state.available_funds + state.position_quantity * current_price,
+                state.available_funds + state.position_quantity * current_price, // 流动资产
                 state.position_quantity,
                 state.realized_profit,
                 state.current_metrics.max_drawdown,
+                state.total_capital, // 初始总资产
             )
         };
 
@@ -2664,7 +2665,7 @@ impl RiskControlModule {
 
         // 3. 检查每日亏损
         let daily_loss_ratio =
-            (self.daily_start_capital - current_capital) / self.daily_start_capital;
+            (self.daily_start_capital - liquid_capital) / self.daily_start_capital;
         result.daily_loss_ratio = daily_loss_ratio;
 
         if daily_loss_ratio > self.grid_config.max_daily_loss {
@@ -2683,7 +2684,7 @@ impl RiskControlModule {
 
         // 4. 检查持仓规模
         let position_value = position_quantity.abs() * current_price;
-        let position_ratio = position_value / current_capital;
+        let position_ratio = position_value / liquid_capital;
         result.position_risk_score = position_ratio * 100.0;
 
         if position_value > self.grid_config.max_position {
@@ -4245,31 +4246,62 @@ fn check_stop_loss(
     grid_config: &crate::config::GridConfig,
     price_history: &[f64],
 ) -> StopLossResult {
-    // 1. 总资产止损 - 使用配置的最大回撤参数
-    let current_total_value =
+    // 1. 总资产止损 - 区分持仓亏损和手续费损失
+    // 注意：这里只计算可用资金和持仓价值，不包括挂单占用的资金
+    // 挂单占用的资金仍然属于总资产，只是暂时锁定
+    let liquid_total_value =
         grid_state.available_funds + grid_state.position_quantity * current_price;
     
-    // 计算实际亏损率，而不是使用固定阈值
-    let actual_loss_rate = if grid_state.total_capital > 0.0 {
-        (grid_state.total_capital - current_total_value) / grid_state.total_capital
+    // 计算基于流动资产的亏损率（用于信息显示）
+    let liquid_loss_rate = if grid_state.total_capital > 0.0 {
+        (grid_state.total_capital - liquid_total_value) / grid_state.total_capital
     } else {
         0.0
     };
 
-    if actual_loss_rate > grid_config.max_drawdown {
+    // 区分持仓亏损和手续费损失
+    let has_significant_position = grid_state.position_quantity.abs() > 0.001; // 持仓大于0.001才算有持仓
+    let position_value = grid_state.position_quantity * current_price;
+    let unrealized_pnl = if grid_state.position_avg_price > 0.0 && has_significant_position {
+        position_value - (grid_state.position_quantity * grid_state.position_avg_price)
+    } else {
+        0.0
+    };
+    
+    // 估算手续费损失（基于已实现利润的负值部分）
+    let estimated_fee_loss = if grid_state.realized_profit < 0.0 {
+        grid_state.realized_profit.abs()
+    } else {
+        (grid_state.total_capital - liquid_total_value - unrealized_pnl.min(0.0)).max(0.0)
+    };
+
+    // 只有在有显著持仓且持仓亏损超过阈值时才触发总资产止损
+    if has_significant_position && liquid_loss_rate > grid_config.max_drawdown {
         warn!(
-            "🚨 触发总资产止损 - 当前总资产: {:.2}, 初始资产: {:.2}, 实际亏损率: {:.2}%, 最大回撤限制: {:.1}%",
-            current_total_value,
+            "🚨 触发总资产止损 - 流动资产: {:.2}, 初始资产: {:.2}, 流动资产亏损率: {:.2}%, 持仓价值: {:.2}, 未实现盈亏: {:.2}, 最大回撤限制: {:.1}%",
+            liquid_total_value,
             grid_state.total_capital,
-            actual_loss_rate * 100.0,
+            liquid_loss_rate * 100.0,
+            position_value,
+            unrealized_pnl,
             grid_config.max_drawdown * 100.0
         );
 
         return StopLossResult {
             action: StopLossAction::FullStop,
-            reason: format!("总资产亏损{:.2}%，超过{:.1}%限制", actual_loss_rate * 100.0, grid_config.max_drawdown * 100.0),
+            reason: format!("总资产亏损{:.2}%，超过{:.1}%限制", liquid_loss_rate * 100.0, grid_config.max_drawdown * 100.0),
             stop_quantity: grid_state.position_quantity,
         };
+    } else if !has_significant_position && liquid_loss_rate > 0.0 {
+        // 无持仓时的资金减少主要是手续费和挂单占用，记录但不触发止损
+        info!(
+            "📊 无持仓状态 - 流动资产: {:.2}, 初始资产: {:.2}, 流动资产减少: {:.2} ({:.2}%), 主要原因: 手续费损失约{:.2} + 挂单占用资金",
+            liquid_total_value,
+            grid_state.total_capital,
+            grid_state.total_capital - liquid_total_value,
+            liquid_loss_rate * 100.0,
+            estimated_fee_loss
+        );
     }
 
     // 2. 浮动止损 (Trailing Stop) - 使用配置的浮动止损比例
