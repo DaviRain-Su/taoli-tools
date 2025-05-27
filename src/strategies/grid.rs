@@ -1468,7 +1468,7 @@ async fn create_dynamic_grid(
         ).await;
         
         match creation_result {
-            Ok(Ok(created_order_ids)) => {
+            Ok(Ok((created_order_ids, failed_order_infos))) => {
                 // 批量创建成功
                 let success_count = created_order_ids.len();
                 let success_rate = success_count as f64 / order_count as f64 * 100.0;
@@ -1491,12 +1491,44 @@ async fn create_dynamic_grid(
                 info!("✅ 批量买单创建完成: {}/{} (成功率: {:.1}%)", 
                     success_count, order_count, success_rate);
                 
+                // 处理失败的订单进行重试
+                if !failed_order_infos.is_empty() && failed_order_infos.len() <= 20 {
+                    info!("🔄 开始重试{}个失败的买单", failed_order_infos.len());
+                    
+                    let retry_result = retry_failed_order_infos(
+                        exchange_client,
+                        failed_order_infos,
+                        grid_config,
+                    ).await;
+                    
+                    match retry_result {
+                        Ok(retry_successful_ids) => {
+                            // 将重试成功的订单也添加到管理列表
+                            for order_id in retry_successful_ids {
+                                active_orders.push(order_id);
+                                // 注意：这里我们使用默认的OrderInfo，因为重试时没有详细信息
+                                buy_orders.insert(order_id, OrderInfo {
+                                    price: 0.0, // 这些值需要从重试的订单信息中获取
+                                    quantity: 0.0,
+                                    cost_price: None,
+                                    potential_sell_price: None,
+                                    allocated_funds: 0.0,
+                                });
+                                info!("🔄✅ 重试买单成功: ID={}", order_id);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("🔄❌ 重试买单失败: {:?}", e);
+                        }
+                    }
+                }
+                
                 // 根据成功率调整后续策略
                 if success_rate < 70.0 {
                     warn!("⚠️ 买单创建成功率较低({:.1}%)，调整资金分配策略", success_rate);
                     // 按实际成功比例调整已分配资金
                     allocated_buy_funds *= success_rate / 100.0;
-                                                buy_count = success_count as u32;
+                    buy_count = success_count as u32;
                 } else if success_rate >= 95.0 {
                     info!("🎯 买单创建成功率优秀({:.1}%)，保持当前策略", success_rate);
                 }
@@ -1666,7 +1698,7 @@ async fn create_dynamic_grid(
             grid_config,
             grid_state,
         ).await {
-            Ok(created_order_ids) => {
+            Ok((created_order_ids, _failed_sell_order_infos)) => {
                 // 将创建成功的订单添加到管理列表
                 for (i, order_id) in created_order_ids.iter().enumerate() {
                     if i < pending_sell_order_info.len() {
@@ -3268,12 +3300,13 @@ async fn create_orders_in_batches(
     orders: Vec<ClientOrderRequest>,
     grid_config: &crate::config::GridConfig,
     grid_state: &mut GridState,
-) -> Result<Vec<u64>, GridStrategyError> {
+) -> Result<(Vec<u64>, Vec<OrderRequestInfo>), GridStrategyError> {
     let start_time = SystemTime::now();
     let mut created_order_ids = Vec::new();
+    let mut all_failed_order_infos = Vec::new();
     
     if orders.is_empty() {
-        return Ok(created_order_ids);
+        return Ok((created_order_ids, all_failed_order_infos));
     }
     
     // 资源限制检查
@@ -3316,7 +3349,6 @@ async fn create_orders_in_batches(
     // 分批处理订单
     let mut order_iter = orders_to_process.into_iter();
     let mut batch_count = 0;
-    let mut failed_orders_for_retry = Vec::new();
     
     loop {
         // 检查总体超时
@@ -3352,17 +3384,17 @@ async fn create_orders_in_batches(
         ).await;
         
         match batch_result {
-            Ok(Ok((successful_ids, failed_orders))) => {
+            Ok(Ok((successful_ids, failed_order_infos))) => {
                 // 批次处理成功
                 let successful_count = successful_ids.len();
-                let failed_count = failed_orders.len();
+                let failed_count = failed_order_infos.len();
                 
                 created_order_ids.extend(successful_ids.iter());
                 stats.successful_orders += successful_count;
                 stats.failed_orders += failed_count;
                 
-                // 收集失败的订单用于重试
-                failed_orders_for_retry.extend(failed_orders);
+                // 收集失败的订单信息用于重试
+                all_failed_order_infos.extend(failed_order_infos);
                 
                 let batch_time = batch_start_time.elapsed().unwrap_or_default();
                 info!("✅ 第{}批处理完成 - 成功: {}, 失败: {}, 耗时: {}ms", 
@@ -3394,12 +3426,12 @@ async fn create_orders_in_batches(
     }
     
     // 重试失败的订单（最多重试一次）
-    if !failed_orders_for_retry.is_empty() && failed_orders_for_retry.len() <= 50 {
-        info!("🔄 开始重试{}个失败的订单", failed_orders_for_retry.len());
+    if !all_failed_order_infos.is_empty() && all_failed_order_infos.len() <= 50 {
+        info!("🔄 开始重试{}个失败的订单", all_failed_order_infos.len());
         
         let retry_result = tokio::time::timeout(
             Duration::from_secs(60), // 重试阶段1分钟超时
-            retry_failed_orders(exchange_client, failed_orders_for_retry, grid_config)
+            retry_failed_order_infos(exchange_client, all_failed_order_infos.clone(), grid_config)
         ).await;
         
         match retry_result {
@@ -3408,6 +3440,8 @@ async fn create_orders_in_batches(
                 stats.successful_orders += retry_successful_ids.len();
                 stats.retried_orders = retry_successful_ids.len();
                 info!("✅ 重试完成 - 成功: {}", retry_successful_ids.len());
+                // 清空已重试的失败订单
+                all_failed_order_infos.clear();
             }
             Ok(Err(e)) => {
                 warn!("❌ 重试失败: {:?}", e);
@@ -3416,8 +3450,8 @@ async fn create_orders_in_batches(
                 warn!("⏰ 重试超时");
             }
         }
-    } else if failed_orders_for_retry.len() > 50 {
-        warn!("⚠️ 失败订单数量过多({}个)，跳过重试", failed_orders_for_retry.len());
+    } else if all_failed_order_infos.len() > 50 {
+        warn!("⚠️ 失败订单数量过多({}个)，跳过重试", all_failed_order_infos.len());
     }
     
     // 更新统计信息
@@ -3448,7 +3482,43 @@ async fn create_orders_in_batches(
     }
     
     info!("✅ 增强批量订单创建完成 - 成功创建: {}/{}", created_order_ids.len(), stats.total_orders);
-    Ok(created_order_ids)
+    Ok((created_order_ids, all_failed_order_infos))
+}
+
+// 订单信息结构体，用于重建失败的订单
+#[derive(Debug, Clone)]
+struct OrderRequestInfo {
+    asset: String,
+    is_buy: bool,
+    reduce_only: bool,
+    limit_px: f64,
+    sz: f64,
+}
+
+impl OrderRequestInfo {
+    fn from_client_order_request(order: &ClientOrderRequest) -> Self {
+        Self {
+            asset: order.asset.clone(),
+            is_buy: order.is_buy,
+            reduce_only: order.reduce_only,
+            limit_px: order.limit_px,
+            sz: order.sz,
+        }
+    }
+    
+    fn to_client_order_request(&self) -> ClientOrderRequest {
+        ClientOrderRequest {
+            asset: self.asset.clone(),
+            is_buy: self.is_buy,
+            reduce_only: self.reduce_only,
+            limit_px: self.limit_px,
+            sz: self.sz,
+            cloid: None,
+            order_type: ClientOrder::Limit(ClientLimit {
+                tif: "Gtc".to_string(),
+            }),
+        }
+    }
 }
 
 // 处理单个批次的订单
@@ -3456,11 +3526,14 @@ async fn process_order_batch(
     exchange_client: &ExchangeClient,
     orders: Vec<ClientOrderRequest>,
     _grid_config: &crate::config::GridConfig,
-) -> Result<(Vec<u64>, Vec<ClientOrderRequest>), GridStrategyError> {
+) -> Result<(Vec<u64>, Vec<OrderRequestInfo>), GridStrategyError> {
     let mut successful_ids = Vec::new();
-    let failed_orders = Vec::new();
+    let mut failed_order_infos = Vec::new();
     
     for order in orders {
+        // 保存订单信息用于失败重试
+        let order_info = OrderRequestInfo::from_client_order_request(&order);
+        
         // 单个订单超时控制
         let order_result = tokio::time::timeout(
             Duration::from_secs(10), // 单个订单10秒超时
@@ -3470,26 +3543,36 @@ async fn process_order_batch(
         match order_result {
             Ok(Ok(ExchangeResponseStatus::Ok(response))) => {
                 if let Some(data) = response.data {
+                    let mut order_created = false;
                     for status in data.statuses {
                         if let ExchangeDataStatus::Resting(order_info) = status {
                             successful_ids.push(order_info.oid);
                             info!("✅ 订单创建成功: ID={}", order_info.oid);
+                            order_created = true;
                         }
                     }
+                    
+                    // 如果响应成功但没有创建订单，也算作失败
+                    if !order_created {
+                        warn!("⚠️ 订单响应成功但未创建订单");
+                        failed_order_infos.push(order_info);
+                    }
+                } else {
+                    warn!("⚠️ 订单响应成功但无数据");
+                    failed_order_infos.push(order_info);
                 }
             }
             Ok(Ok(ExchangeResponseStatus::Err(err))) => {
                 warn!("❌ 订单创建失败: {:?}", err);
-                // 注意：这里不能再使用order，因为已经被移动了
-                // 我们只记录失败，不保存失败的订单用于重试
+                failed_order_infos.push(order_info);
             }
             Ok(Err(e)) => {
                 warn!("❌ 订单创建失败: {:?}", e);
-                // 注意：这里不能再使用order，因为已经被移动了
+                failed_order_infos.push(order_info);
             }
             Err(_) => {
                 warn!("⏰ 订单创建超时");
-                // 注意：这里不能再使用order，因为已经被移动了
+                failed_order_infos.push(order_info);
             }
         }
         
@@ -3499,7 +3582,8 @@ async fn process_order_batch(
         }
     }
     
-    Ok((successful_ids, failed_orders))
+    info!("📊 批次处理完成 - 成功: {}, 失败: {}", successful_ids.len(), failed_order_infos.len());
+    Ok((successful_ids, failed_order_infos))
 }
 
 // 重试失败的订单
@@ -3515,6 +3599,60 @@ async fn retry_failed_orders(
     for (index, order) in failed_orders.into_iter().enumerate() {
         // 重试前等待更长时间
         sleep(Duration::from_millis(200)).await;
+        
+        let retry_result = tokio::time::timeout(
+            Duration::from_secs(15), // 重试时使用更长的超时时间
+            exchange_client.order(order, None)
+        ).await;
+        
+        match retry_result {
+            Ok(Ok(ExchangeResponseStatus::Ok(response))) => {
+                if let Some(data) = response.data {
+                    for status in data.statuses {
+                        if let ExchangeDataStatus::Resting(order_info) = status {
+                            successful_ids.push(order_info.oid);
+                            info!("🔄✅ 重试订单成功: ID={}", order_info.oid);
+                        }
+                    }
+                }
+            }
+            Ok(Ok(ExchangeResponseStatus::Err(err))) => {
+                warn!("🔄❌ 重试订单失败: {:?}", err);
+            }
+            Ok(Err(e)) => {
+                warn!("🔄❌ 重试订单失败: {:?}", e);
+            }
+            Err(_) => {
+                warn!("🔄⏰ 重试订单超时");
+            }
+        }
+        
+        // 每10个重试订单后稍作休息
+        if (index + 1) % 10 == 0 {
+            sleep(Duration::from_millis(500)).await;
+        }
+    }
+    
+    info!("🔄✅ 重试完成 - 成功: {}", successful_ids.len());
+    Ok(successful_ids)
+}
+
+// 重试失败的订单信息
+async fn retry_failed_order_infos(
+    exchange_client: &ExchangeClient,
+    failed_order_infos: Vec<OrderRequestInfo>,
+    _grid_config: &crate::config::GridConfig,
+) -> Result<Vec<u64>, GridStrategyError> {
+    let mut successful_ids = Vec::new();
+    
+    info!("🔄 开始重试{}个失败订单", failed_order_infos.len());
+    
+    for (index, order_info) in failed_order_infos.into_iter().enumerate() {
+        // 重试前等待更长时间
+        sleep(Duration::from_millis(200)).await;
+        
+        // 重建订单请求
+        let order = order_info.to_client_order_request();
         
         let retry_result = tokio::time::timeout(
             Duration::from_secs(15), // 重试时使用更长的超时时间
@@ -4070,5 +4208,6 @@ fn analyze_grid_performance_and_suggest_optimization(
         info!("   - 优化手续费成本");
     }
 }
+
 
 
