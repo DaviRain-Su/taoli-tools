@@ -1,8 +1,118 @@
-/target
+# Rust 编译产物
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo 锁文件（对于库项目可以忽略）
+Cargo.lock
+
+# 配置文件（包含敏感信息）
 config.toml
-dynamic_*
-performance_snapshot_*
-dynamic_grid_params*
-performance_snapshot_*
-grid_state*
-orders_state*
+*.toml.local
+*.toml.backup
+
+# 日志文件
+*.log
+logs/
+log/
+
+# 数据文件
+data/
+*.json
+*.csv
+*.db
+*.sqlite
+
+# 备份文件
+backups/
+*.backup
+*.bak
+
+# 临时文件
+*.tmp
+*.temp
+.tmp/
+.temp/
+
+# 系统文件
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE 文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 环境变量文件
+.env
+.env.local
+.env.production
+.env.test
+
+# 性能分析文件
+*.prof
+perf.data*
+
+# 调试文件
+debug/
+*.debug
+
+# 文档生成文件
+/doc/
+/docs/book/
+
+# 测试覆盖率文件
+tarpaulin-report.html
+cobertura.xml
+lcov.info
+
+# 密钥文件
+*.key
+*.pem
+*.p12
+*.pfx
+
+# 状态文件
+grid_state.json
+orders_state.json
+dynamic_grid_params.json
+performance_data.json
+trading_history.json
+
+# 错误报告
+crash_reports/
+*.crash
+
+# 缓存文件
+.cache/
+cache/
+
+# 构建脚本生成的文件
+build/
+dist/
+
+# 包管理器文件
+node_modules/
+package-lock.json
+yarn.lock
+
+# Python 相关（如果有 Python 脚本）
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# 其他
+*.orig
+*.rej
