@@ -6,7 +6,7 @@ use hyperliquid_rust_sdk::{
     ExchangeDataStatus, ExchangeResponseStatus, InfoClient, Message, Subscription, UserData,
 };
 use log::{debug, error, info, warn};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -20,6 +20,9 @@ use super::error::{GridStrategyError};
 // 导入性能类型
 use super::performance::{PerformanceMetrics, PerformanceRecord, PerformanceSnapshot};
 use super::performance::system_time_serde;
+// 导入批处理优化器
+use super::batch_optimizer::BatchTaskOptimizer;
+
 
 
 /// 安全的时间差计算，处理时间倒退的情况
@@ -64,321 +67,8 @@ fn should_execute_periodic_task(
     should_execute
 }
 
-// 批处理任务优化器
-#[derive(Debug, Clone)]
-struct BatchTaskOptimizer {
-    last_execution_times: VecDeque<Duration>,
-    optimal_batch_size: usize,
-    adjustment_factor: f64,
-    min_batch_size: usize,
-    max_batch_size: usize,
-    target_execution_time: Duration,
-    performance_window_size: usize,
-    consecutive_adjustments: u32,
-    last_adjustment_time: Instant,
-    adjustment_cooldown: Duration,
-    performance_trend: f64, // 正值表示性能改善，负值表示性能下降
-}
 
-impl BatchTaskOptimizer {
-    /// 创建新的批处理优化器
-    fn new(initial_batch_size: usize, target_execution_time: Duration) -> Self {
-        Self {
-            last_execution_times: VecDeque::new(),
-            optimal_batch_size: initial_batch_size,
-            adjustment_factor: 0.1, // 10%的调整幅度
-            min_batch_size: 1,
-            max_batch_size: 200,
-            target_execution_time,
-            performance_window_size: 10,
-            consecutive_adjustments: 0,
-            last_adjustment_time: Instant::now(),
-            adjustment_cooldown: Duration::from_secs(30), // 30秒调整冷却时间
-            performance_trend: 0.0,
-        }
-    }
-
-    /// 基于历史执行时间自动调整最优批次大小
-    fn optimize_batch_size(&mut self, task_count: usize) -> usize {
-        // 如果任务数量小于最小批次大小，直接返回任务数量
-        if task_count <= self.min_batch_size {
-            return task_count;
-        }
-
-        // 检查是否在调整冷却期内
-        if self.last_adjustment_time.elapsed() < self.adjustment_cooldown {
-            return self.optimal_batch_size.min(task_count);
-        }
-
-        // 如果没有足够的历史数据，使用当前最优批次大小
-        if self.last_execution_times.len() < 3 {
-            return self.optimal_batch_size.min(task_count);
-        }
-
-        // 计算平均执行时间和性能趋势
-        let avg_execution_time = self.calculate_average_execution_time();
-        let performance_variance = self.calculate_performance_variance();
-
-        // 更新性能趋势
-        self.update_performance_trend(avg_execution_time);
-
-        // 决定是否需要调整批次大小
-        let should_adjust = self.should_adjust_batch_size(avg_execution_time, performance_variance);
-
-        if should_adjust {
-            let new_batch_size = self.calculate_new_batch_size(avg_execution_time, task_count);
-
-            if new_batch_size != self.optimal_batch_size {
-                info!(
-                    "📊 批处理优化器调整: {} -> {} (平均执行时间: {:.2}秒, 目标: {:.2}秒)",
-                    self.optimal_batch_size,
-                    new_batch_size,
-                    avg_execution_time.as_secs_f64(),
-                    self.target_execution_time.as_secs_f64()
-                );
-
-                self.optimal_batch_size = new_batch_size;
-                self.last_adjustment_time = Instant::now();
-                self.consecutive_adjustments += 1;
-
-                // 如果连续调整次数过多，增加调整冷却时间
-                if self.consecutive_adjustments > 5 {
-                    self.adjustment_cooldown = Duration::from_secs(60);
-                    info!("⚠️ 连续调整次数过多，增加冷却时间到60秒");
-                }
-            }
-        } else {
-            // 重置连续调整计数
-            if self.consecutive_adjustments > 0 {
-                self.consecutive_adjustments = 0;
-                self.adjustment_cooldown = Duration::from_secs(30); // 重置冷却时间
-            }
-        }
-
-        self.optimal_batch_size.min(task_count)
-    }
-
-    /// 记录执行时间，用于未来优化
-    fn record_execution_time(&mut self, duration: Duration) {
-        self.last_execution_times.push_back(duration);
-
-        // 保持窗口大小
-        if self.last_execution_times.len() > self.performance_window_size {
-            self.last_execution_times.pop_front();
-        }
-
-        // 记录性能统计
-        if self.last_execution_times.len() >= 3 {
-            let avg_time = self.calculate_average_execution_time();
-            let variance = self.calculate_performance_variance();
-
-            // 每10次记录输出一次性能统计
-            if self.last_execution_times.len() % 10 == 0 {
-                info!(
-                    "📈 批处理性能统计: 平均时间={:.2}秒, 方差={:.4}, 当前批次大小={}, 趋势={}",
-                    avg_time.as_secs_f64(),
-                    variance,
-                    self.optimal_batch_size,
-                    if self.performance_trend > 0.0 {
-                        "改善"
-                    } else if self.performance_trend < 0.0 {
-                        "下降"
-                    } else {
-                        "稳定"
-                    }
-                );
-            }
-        }
-    }
-
-    /// 计算平均执行时间
-    fn calculate_average_execution_time(&self) -> Duration {
-        if self.last_execution_times.is_empty() {
-            return self.target_execution_time;
-        }
-
-        let total_duration: Duration = self.last_execution_times.iter().sum();
-        total_duration / self.last_execution_times.len() as u32
-    }
-
-    /// 计算性能方差
-    fn calculate_performance_variance(&self) -> f64 {
-        if self.last_execution_times.len() < 2 {
-            return 0.0;
-        }
-
-        let avg = self.calculate_average_execution_time().as_secs_f64();
-        let variance = self
-            .last_execution_times
-            .iter()
-            .map(|d| {
-                let diff = d.as_secs_f64() - avg;
-                diff * diff
-            })
-            .sum::<f64>()
-            / self.last_execution_times.len() as f64;
-
-        variance.sqrt()
-    }
-
-    /// 更新性能趋势
-    fn update_performance_trend(&mut self, _current_avg: Duration) {
-        if self.last_execution_times.len() < 5 {
-            return;
-        }
-
-        // 计算最近一半和前一半的平均时间
-        let mid_point = self.last_execution_times.len() / 2;
-        let recent_times: Vec<Duration> = self
-            .last_execution_times
-            .iter()
-            .skip(mid_point)
-            .cloned()
-            .collect();
-        let earlier_times: Vec<Duration> = self
-            .last_execution_times
-            .iter()
-            .take(mid_point)
-            .cloned()
-            .collect();
-
-        let recent_avg = recent_times.iter().sum::<Duration>() / recent_times.len() as u32;
-        let earlier_avg = earlier_times.iter().sum::<Duration>() / earlier_times.len() as u32;
-
-        // 计算趋势（负值表示性能改善，正值表示性能下降）
-        self.performance_trend =
-            (recent_avg.as_secs_f64() - earlier_avg.as_secs_f64()) / earlier_avg.as_secs_f64();
-    }
-
-    /// 判断是否应该调整批次大小
-    fn should_adjust_batch_size(&self, avg_execution_time: Duration, variance: f64) -> bool {
-        let target_time = self.target_execution_time.as_secs_f64();
-        let current_time = avg_execution_time.as_secs_f64();
-
-        // 如果执行时间偏离目标时间超过20%，或者方差过大，则需要调整
-        let time_deviation = (current_time - target_time).abs() / target_time;
-        let high_variance = variance > target_time * 0.3; // 方差超过目标时间的30%
-
-        time_deviation > 0.2 || high_variance
-    }
-
-    /// 计算新的批次大小
-    fn calculate_new_batch_size(&self, avg_execution_time: Duration, task_count: usize) -> usize {
-        let target_time = self.target_execution_time.as_secs_f64();
-        let current_time = avg_execution_time.as_secs_f64();
-
-        let mut new_size = self.optimal_batch_size;
-
-        if current_time > target_time * 1.2 {
-            // 执行时间过长，减少批次大小
-            let reduction_factor = 1.0 - self.adjustment_factor;
-            new_size = ((self.optimal_batch_size as f64) * reduction_factor) as usize;
-
-            // 如果性能趋势持续下降，加大调整幅度
-            if self.performance_trend > 0.1 {
-                new_size = ((new_size as f64) * 0.9) as usize;
-            }
-        } else if current_time < target_time * 0.8 {
-            // 执行时间过短，可以增加批次大小
-            let increase_factor = 1.0 + self.adjustment_factor;
-            new_size = ((self.optimal_batch_size as f64) * increase_factor) as usize;
-
-            // 如果性能趋势持续改善，可以更积极地增加批次大小
-            if self.performance_trend < -0.1 {
-                new_size = ((new_size as f64) * 1.1) as usize;
-            }
-        }
-
-        // 应用边界限制
-        new_size = new_size
-            .max(self.min_batch_size)
-            .min(self.max_batch_size)
-            .min(task_count);
-
-        // 避免过于频繁的小幅调整
-        let change_ratio = (new_size as f64 - self.optimal_batch_size as f64).abs()
-            / self.optimal_batch_size as f64;
-        if change_ratio < 0.05 {
-            // 变化小于5%，不进行调整
-            return self.optimal_batch_size;
-        }
-
-        new_size
-    }
-
-    /// 获取当前性能报告
-    fn get_performance_report(&self) -> String {
-        if self.last_execution_times.is_empty() {
-            return "批处理优化器: 暂无性能数据".to_string();
-        }
-
-        let avg_time = self.calculate_average_execution_time();
-        let variance = self.calculate_performance_variance();
-        let efficiency = if avg_time.as_secs_f64() > 0.0 {
-            self.target_execution_time.as_secs_f64() / avg_time.as_secs_f64() * 100.0
-        } else {
-            100.0
-        };
-
-        format!(
-            "批处理优化器性能报告:\n\
-            - 当前批次大小: {}\n\
-            - 平均执行时间: {:.2}秒\n\
-            - 目标执行时间: {:.2}秒\n\
-            - 性能方差: {:.4}\n\
-            - 执行效率: {:.1}%\n\
-            - 性能趋势: {}\n\
-            - 连续调整次数: {}\n\
-            - 历史记录数: {}",
-            self.optimal_batch_size,
-            avg_time.as_secs_f64(),
-            self.target_execution_time.as_secs_f64(),
-            variance,
-            efficiency,
-            if self.performance_trend > 0.05 {
-                "下降"
-            } else if self.performance_trend < -0.05 {
-                "改善"
-            } else {
-                "稳定"
-            },
-            self.consecutive_adjustments,
-            self.last_execution_times.len()
-        )
-    }
-
-    /// 重置优化器状态
-    fn reset(&mut self) {
-        self.last_execution_times.clear();
-        self.consecutive_adjustments = 0;
-        self.performance_trend = 0.0;
-        self.adjustment_cooldown = Duration::from_secs(30);
-        info!("🔄 批处理优化器已重置");
-    }
-
-    /// 设置新的目标执行时间
-    fn set_target_execution_time(&mut self, target: Duration) {
-        self.target_execution_time = target;
-        info!(
-            "🎯 批处理优化器目标时间已更新为: {:.2}秒",
-            target.as_secs_f64()
-        );
-    }
-
-    /// 设置批次大小范围
-    fn set_batch_size_range(&mut self, min_size: usize, max_size: usize) {
-        self.min_batch_size = min_size;
-        self.max_batch_size = max_size;
-
-        // 确保当前批次大小在新范围内
-        self.optimal_batch_size = self.optimal_batch_size.max(min_size).min(max_size);
-
-        info!("📏 批处理优化器大小范围已更新: {} - {}", min_size, max_size);
-    }
-}
-
-// 订单状态枚举
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 enum OrderStatus {
     Pending,         // 待处理
     Active,          // 活跃
@@ -7269,14 +6959,15 @@ pub async fn run_grid_strategy(
     batch_optimizer.set_batch_size_range(1, grid_config.max_orders_per_batch.max(100));
 
     info!("⚡ 批处理优化器已初始化");
-    info!("   - 初始批次大小: {}", batch_optimizer.optimal_batch_size);
+    info!("   - 初始批次大小: {}", batch_optimizer.get_optimal_batch_size());
     info!(
         "   - 目标执行时间: {:.2}秒",
-        batch_optimizer.target_execution_time.as_secs_f64()
+        batch_optimizer.get_target_execution_time().as_secs_f64()
     );
+    let (min_size, max_size) = batch_optimizer.get_batch_size_range();
     info!(
         "   - 批次大小范围: {} - {}",
-        batch_optimizer.min_batch_size, batch_optimizer.max_batch_size
+        min_size, max_size
     );
 
     // ===== 初始化连接管理器 =====
@@ -9223,8 +8914,8 @@ async fn create_orders_in_batches(
     );
     info!(
         "⚡ 批处理优化器状态: 目标时间={:.2}秒, 历史记录={}次",
-        batch_optimizer.target_execution_time.as_secs_f64(),
-        batch_optimizer.last_execution_times.len()
+        batch_optimizer.get_target_execution_time().as_secs_f64(),
+        batch_optimizer.get_execution_history_count()
     );
 
     // 超时控制 - 总体处理时间限制
