@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use thiserror::Error;
 
 /// 网格交易策略错误类型
@@ -5,25 +7,25 @@ use thiserror::Error;
 pub enum GridStrategyError {
     #[error("配置错误: {0}")]
     ConfigError(String),
-    
+
     #[error("钱包初始化失败: {0}")]
     WalletError(String),
-    
+
     #[error("客户端初始化失败: {0}")]
     ClientError(String),
-    
+
     #[error("订单操作失败: {0}")]
     OrderError(String),
-    
+
     #[error("订阅失败: {0}")]
     SubscriptionError(String),
-    
+
     #[error("价格解析失败: {0}")]
     PriceParseError(String),
-    
+
     #[error("数量解析失败: {0}")]
     QuantityParseError(String),
-    
+
     #[error("风险控制触发: {0}")]
     RiskControlTriggered(String),
 
@@ -121,10 +123,10 @@ impl GridStrategyError {
     pub fn is_fatal(&self) -> bool {
         matches!(
             self,
-            Self::WalletError(_) 
-            | Self::ClientError(_) 
-            | Self::MarginInsufficient(_)
-            | Self::RiskControlTriggered(_)
+            Self::WalletError(_)
+                | Self::ClientError(_)
+                | Self::MarginInsufficient(_)
+                | Self::RiskControlTriggered(_)
         )
     }
 
@@ -132,9 +134,7 @@ impl GridStrategyError {
     pub fn is_network_error(&self) -> bool {
         matches!(
             self,
-            Self::NetworkError(_) 
-            | Self::SubscriptionError(_)
-            | Self::ClientError(_)
+            Self::NetworkError(_) | Self::SubscriptionError(_) | Self::ClientError(_)
         )
     }
 
@@ -142,19 +142,13 @@ impl GridStrategyError {
     pub fn is_order_error(&self) -> bool {
         matches!(
             self,
-            Self::OrderError(_) 
-            | Self::PriceParseError(_)
-            | Self::QuantityParseError(_)
+            Self::OrderError(_) | Self::PriceParseError(_) | Self::QuantityParseError(_)
         )
     }
 
     /// 判断是否为配置相关错误
     pub fn is_config_error(&self) -> bool {
-        matches!(
-            self,
-            Self::ConfigError(_) 
-            | Self::FundAllocationError(_)
-        )
+        matches!(self, Self::ConfigError(_) | Self::FundAllocationError(_))
     }
 
     /// 获取错误的严重程度等级 (1-5, 5最严重)
@@ -310,7 +304,8 @@ impl ErrorStatistics {
             (self.network_errors, "网络错误"),
         ];
 
-        errors.iter()
+        errors
+            .iter()
             .max_by_key(|(count, _)| *count)
             .filter(|(count, _)| *count > 0)
             .map(|(_, name)| *name)
@@ -357,4 +352,4 @@ impl ErrorStatistics {
             self.network_errors
         )
     }
-} 
+}

@@ -40,8 +40,8 @@ pub struct GridConfig {
     pub price_precision: u32,
     pub quantity_precision: u32,
     pub check_interval: u64,
-    pub max_order_age_minutes: f64,  // 订单最大存活时间（分钟）
-    pub order_status_check_interval: u64,  // 订单状态检查间隔（秒）
+    pub max_order_age_minutes: f64,       // 订单最大存活时间（分钟）
+    pub order_status_check_interval: u64, // 订单状态检查间隔（秒）
     pub leverage: u32,
 
     // 网格策略参数 (Grid strategy parameters)

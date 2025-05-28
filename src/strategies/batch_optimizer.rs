@@ -1,9 +1,11 @@
+#![allow(dead_code)]
+
 use log::{info, warn};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// 批处理任务优化器
-/// 
+///
 /// 该优化器通过分析历史执行时间来动态调整批处理大小，
 /// 以达到最佳的执行性能和资源利用率。
 #[derive(Debug, Clone)]
@@ -34,7 +36,7 @@ pub struct BatchTaskOptimizer {
 
 impl BatchTaskOptimizer {
     /// 创建新的批处理优化器
-    /// 
+    ///
     /// # 参数
     /// * `initial_batch_size` - 初始批次大小
     /// * `target_execution_time` - 目标执行时间
@@ -55,10 +57,10 @@ impl BatchTaskOptimizer {
     }
 
     /// 基于历史执行时间自动调整最优批次大小
-    /// 
+    ///
     /// # 参数
     /// * `task_count` - 当前待处理的任务数量
-    /// 
+    ///
     /// # 返回值
     /// 建议的批次大小
     pub fn optimize_batch_size(&mut self, task_count: usize) -> usize {
@@ -121,7 +123,7 @@ impl BatchTaskOptimizer {
     }
 
     /// 记录执行时间，用于未来优化
-    /// 
+    ///
     /// # 参数
     /// * `duration` - 本次执行的时间
     pub fn record_execution_time(&mut self, duration: Duration) {
@@ -173,39 +175,45 @@ impl BatchTaskOptimizer {
         }
 
         let avg_time = self.calculate_average_execution_time().as_secs_f64();
-        let variance = self.last_execution_times
+        let variance = self
+            .last_execution_times
             .iter()
             .map(|t| {
                 let diff = t.as_secs_f64() - avg_time;
                 diff * diff
             })
-            .sum::<f64>() / (self.last_execution_times.len() - 1) as f64;
+            .sum::<f64>()
+            / (self.last_execution_times.len() - 1) as f64;
 
         variance.sqrt() / avg_time // 变异系数
     }
 
     /// 更新性能趋势
-    fn update_performance_trend(&mut self, current_avg: Duration) {
+    fn update_performance_trend(&mut self, _current_avg: Duration) {
         if self.last_execution_times.len() < 5 {
             return;
         }
 
         // 计算最近一半和前一半的平均时间
         let mid = self.last_execution_times.len() / 2;
-        let recent_times: Vec<Duration> = self.last_execution_times
+        let recent_times: Vec<Duration> = self
+            .last_execution_times
             .iter()
             .skip(mid)
             .cloned()
             .collect();
-        let earlier_times: Vec<Duration> = self.last_execution_times
+        let earlier_times: Vec<Duration> = self
+            .last_execution_times
             .iter()
             .take(mid)
             .cloned()
             .collect();
 
         if !recent_times.is_empty() && !earlier_times.is_empty() {
-            let recent_avg = recent_times.iter().sum::<Duration>().as_secs_f64() / recent_times.len() as f64;
-            let earlier_avg = earlier_times.iter().sum::<Duration>().as_secs_f64() / earlier_times.len() as f64;
+            let recent_avg =
+                recent_times.iter().sum::<Duration>().as_secs_f64() / recent_times.len() as f64;
+            let earlier_avg =
+                earlier_times.iter().sum::<Duration>().as_secs_f64() / earlier_times.len() as f64;
 
             // 计算趋势：负值表示性能改善（时间减少），正值表示性能下降
             self.performance_trend = (recent_avg - earlier_avg) / earlier_avg;
@@ -214,9 +222,10 @@ impl BatchTaskOptimizer {
 
     /// 判断是否应该调整批次大小
     fn should_adjust_batch_size(&self, avg_execution_time: Duration, variance: f64) -> bool {
-        let time_diff_ratio = (avg_execution_time.as_secs_f64() - self.target_execution_time.as_secs_f64()).abs() 
-            / self.target_execution_time.as_secs_f64();
-        
+        let time_diff_ratio =
+            (avg_execution_time.as_secs_f64() - self.target_execution_time.as_secs_f64()).abs()
+                / self.target_execution_time.as_secs_f64();
+
         // 如果时间差异超过20%或方差过大，则需要调整
         time_diff_ratio > 0.2 || variance > 0.3
     }
@@ -225,7 +234,7 @@ impl BatchTaskOptimizer {
     fn calculate_new_batch_size(&self, avg_execution_time: Duration, task_count: usize) -> usize {
         let current_time = avg_execution_time.as_secs_f64();
         let target_time = self.target_execution_time.as_secs_f64();
-        
+
         let mut new_size = self.optimal_batch_size;
 
         if current_time > target_time * 1.2 {
@@ -255,8 +264,6 @@ impl BatchTaskOptimizer {
 
         new_size
     }
-
-
 
     /// 获取性能报告
     pub fn get_performance_report(&self) -> String {
@@ -328,12 +335,10 @@ impl BatchTaskOptimizer {
         if min_size > 0 && max_size >= min_size {
             self.min_batch_size = min_size;
             self.max_batch_size = max_size;
-            
+
             // 确保当前批次大小在新范围内
-            self.optimal_batch_size = self.optimal_batch_size
-                .max(min_size)
-                .min(max_size);
-                
+            self.optimal_batch_size = self.optimal_batch_size.max(min_size).min(max_size);
+
             info!("📏 批次大小范围已更新为: {}-{}", min_size, max_size);
         } else {
             warn!("⚠️ 无效的批次大小范围: {}-{}", min_size, max_size);
@@ -393,14 +398,12 @@ impl BatchTaskOptimizer {
         if avg_time_secs > target_time_secs * 1.2 {
             Some(format!(
                 "建议减少批次大小，当前执行时间({:.2}秒)超出目标时间({:.2}秒)20%以上",
-                avg_time_secs,
-                target_time_secs
+                avg_time_secs, target_time_secs
             ))
         } else if avg_time_secs < target_time_secs * 0.8 {
             Some(format!(
                 "建议增加批次大小，当前执行时间({:.2}秒)低于目标时间({:.2}秒)20%以上",
-                avg_time_secs,
-                target_time_secs
+                avg_time_secs, target_time_secs
             ))
         } else {
             Some("性能方差较大，建议观察执行稳定性".to_string())
@@ -427,4 +430,4 @@ impl Default for BatchTaskOptimizer {
     fn default() -> Self {
         Self::new(10, Duration::from_secs(5))
     }
-} 
+}

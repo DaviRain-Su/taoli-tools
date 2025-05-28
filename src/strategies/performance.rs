@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -111,9 +113,11 @@ impl PerformanceMetrics {
         }
 
         let mean_return = returns.iter().sum::<f64>() / returns.len() as f64;
-        let variance = returns.iter()
+        let variance = returns
+            .iter()
             .map(|r| (r - mean_return).powi(2))
-            .sum::<f64>() / (returns.len() - 1) as f64;
+            .sum::<f64>()
+            / (returns.len() - 1) as f64;
         let std_dev = variance.sqrt();
 
         if std_dev > 0.0 {
@@ -161,10 +165,10 @@ impl PerformanceMetrics {
 
     /// 检查性能是否良好
     pub fn is_performing_well(&self) -> bool {
-        self.win_rate >= 50.0 && 
-        self.profit_factor >= 1.2 && 
-        self.max_drawdown <= 0.2 && 
-        self.total_profit > 0.0
+        self.win_rate >= 50.0
+            && self.profit_factor >= 1.2
+            && self.max_drawdown <= 0.2
+            && self.total_profit > 0.0
     }
 
     /// 获取风险评分 (0-100, 100为最高风险)
@@ -442,7 +446,8 @@ impl PerformanceAnalyzer {
     /// 更新夏普比率
     pub fn update_sharpe_ratio(&mut self, risk_free_rate: f64) {
         let returns = self.calculate_returns();
-        self.metrics.calculate_sharpe_ratio(&returns, risk_free_rate);
+        self.metrics
+            .calculate_sharpe_ratio(&returns, risk_free_rate);
     }
 
     /// 生成详细报告
@@ -502,4 +507,4 @@ pub mod system_time_serde {
         let secs = u64::deserialize(deserializer)?;
         Ok(UNIX_EPOCH + std::time::Duration::from_secs(secs))
     }
-} 
+}
