@@ -5440,8 +5440,21 @@ async fn create_dynamic_grid(
         }
     }
 
-    // 创建卖单 - 支持做空交易
-    let mut current_sell_price = current_price;
+    // 创建卖单 - 基于成本价设置，确保盈利
+    let mut current_sell_price = if grid_state.position_avg_price > 0.0 {
+        // 如果有持仓，基于成本价设置卖单起始价格
+        let min_profitable_price = calculate_min_sell_price(
+            grid_state.position_avg_price,
+            grid_config.fee_rate,
+            grid_config.min_profit / grid_state.position_avg_price,
+        );
+        // 确保卖单价格不低于最小盈利价格，但也不要过于偏离市价
+        let market_based_price = current_price * 1.005; // 市价上浮0.5%
+        min_profitable_price.max(market_based_price)
+    } else {
+        // 如果没有持仓，基于当前市价设置
+        current_price * 1.005 // 市价上浮0.5%
+    };
     
     // 自适应卖单数量计算
     let max_sell_quantity = match fund_allocation.grid_strategy {
@@ -5467,8 +5480,9 @@ async fn create_dynamic_grid(
     let mut pending_sell_order_info: Vec<OrderInfo> = Vec::new();
 
     info!(
-        "🔄 开始卖单循环 - 初始卖出价: {:.4}, 价格上限: {:.4}, 最大数量: {:.4}, 最大卖单数: {}",
+        "🔄 开始卖单循环 - 初始卖出价: {:.4} (基于成本价: {:.4}), 价格上限: {:.4}, 最大数量: {:.4}, 最大卖单数: {}",
         current_sell_price,
+        grid_state.position_avg_price,
         current_price * 1.2,
         max_sell_quantity,
         final_sell_limit
@@ -5482,7 +5496,18 @@ async fn create_dynamic_grid(
         let dynamic_spacing = grid_state.dynamic_params.current_min_spacing
             * fund_allocation.sell_spacing_adjustment
             * amplitude_adjustment;
-        current_sell_price = current_sell_price + (current_sell_price * dynamic_spacing);
+        
+        // 基于成本价的卖单间距策略
+        let spacing_increment = if grid_state.position_avg_price > 0.0 {
+            // 有持仓时：基于成本价计算间距，确保每层都有足够利润
+            let cost_based_spacing = grid_state.position_avg_price * dynamic_spacing;
+            cost_based_spacing.max(grid_state.position_avg_price * 0.002) // 最小0.2%间距
+        } else {
+            // 无持仓时：基于市价计算间距
+            current_sell_price * dynamic_spacing
+        };
+        
+        current_sell_price = current_sell_price + spacing_increment;
 
         // 自适应卖单数量计算
         let price_coefficient = (current_sell_price - current_price) / current_price;
@@ -5519,19 +5544,37 @@ async fn create_dynamic_grid(
             break;
         }
 
-        // 验证利润要求
+        // 严格验证利润要求 - 基于成本价
         if grid_state.position_avg_price > 0.0 {
-            let sell_profit_rate = (current_sell_price * (1.0 - grid_config.fee_rate)
-                - grid_state.position_avg_price)
-                / grid_state.position_avg_price;
-            let min_required_price = grid_state.position_avg_price
-                * (1.0 + grid_config.min_profit / grid_state.position_avg_price)
-                / (1.0 - grid_config.fee_rate);
-
-            if sell_profit_rate < grid_config.min_profit / grid_state.position_avg_price
-                && current_sell_price < min_required_price
-            {
+            let actual_profit_rate = calculate_expected_profit_rate(
+                grid_state.position_avg_price,
+                current_sell_price,
+                grid_config.fee_rate,
+            );
+            let min_required_profit_rate = grid_config.min_profit / grid_state.position_avg_price;
+            
+            if actual_profit_rate < min_required_profit_rate {
+                // 如果利润不足，调整价格到最小盈利要求
+                let min_required_price = calculate_min_sell_price(
+                    grid_state.position_avg_price,
+                    grid_config.fee_rate,
+                    min_required_profit_rate,
+                );
                 current_sell_price = min_required_price;
+                
+                info!(
+                    "📈 调整卖单价格确保盈利 - 成本价: {:.4}, 调整后价格: {:.4}, 预期利润率: {:.4}%",
+                    grid_state.position_avg_price,
+                    current_sell_price,
+                    calculate_expected_profit_rate(grid_state.position_avg_price, current_sell_price, grid_config.fee_rate) * 100.0
+                );
+            } else {
+                info!(
+                    "✅ 卖单利润验证通过 - 成本价: {:.4}, 卖出价: {:.4}, 利润率: {:.4}%",
+                    grid_state.position_avg_price,
+                    current_sell_price,
+                    actual_profit_rate * 100.0
+                );
             }
         }
 
