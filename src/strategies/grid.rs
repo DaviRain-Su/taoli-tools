@@ -5154,8 +5154,27 @@ async fn create_dynamic_grid(
         grid_config.quantity_precision
     );
 
-    // 创建买单 - 价格递减
-    let mut current_buy_price = current_price;
+    // 创建买单 - 智能价格设置策略
+    let mut current_buy_price = if grid_state.position_avg_price > 0.0 && grid_state.position_quantity > 0.0 {
+        // 如果有持仓，基于成本价和当前价格的智能组合设置买单起始价格
+        let cost_weight = grid_state.position_quantity / (grid_state.position_quantity + fund_allocation.buy_order_funds / current_price);
+        let cost_based_price = grid_state.position_avg_price * 0.98; // 成本价下方2%
+        let market_based_price = current_price * 0.995; // 市价下方0.5%
+        
+        // 加权平均，持仓越多越偏向成本价
+        let weighted_price = cost_based_price * cost_weight + market_based_price * (1.0 - cost_weight);
+        
+        info!(
+            "🎯 智能买单起始价 - 成本价: {:.4}, 市价: {:.4}, 权重: {:.2}, 起始价: {:.4}",
+            grid_state.position_avg_price, current_price, cost_weight, weighted_price
+        );
+        
+        weighted_price.min(current_price * 0.999) // 确保不高于市价
+    } else {
+        // 如果没有持仓，从当前市价稍下方开始
+        current_price * 0.995 // 市价下方0.5%
+    };
+    
     let max_buy_funds = grid_state.available_funds * 0.7; // 最多使用70%资金做买单
     let mut allocated_buy_funds = 0.0;
     let mut buy_count = 0;
@@ -5165,8 +5184,9 @@ async fn create_dynamic_grid(
     let mut pending_buy_order_info: Vec<OrderInfo> = Vec::new();
 
     info!(
-        "🔄 开始买单循环 - 初始买入价: {:.4}, 价格下限: {:.4}, 最大资金: {:.2}, 最大买单数: {}",
+        "🔄 开始智能买单循环 - 起始价: {:.4} (持仓成本: {:.4}), 下限: {:.4}, 最大资金: {:.2}, 最大买单数: {}",
         current_buy_price,
+        grid_state.position_avg_price,
         current_price * 0.8,
         max_buy_funds,
         final_buy_limit
@@ -5176,18 +5196,66 @@ async fn create_dynamic_grid(
         && allocated_buy_funds < max_buy_funds
         && buy_count < final_buy_limit
     {
-        // 动态计算网格间距，使用优化后的参数和振幅调整
-        let dynamic_spacing = grid_state.dynamic_params.current_min_spacing
+        // 智能动态间距计算 - 基于成本价和市场状况
+        let base_spacing = grid_state.dynamic_params.current_min_spacing
             * fund_allocation.buy_spacing_adjustment
             * amplitude_adjustment;
-        current_buy_price = current_buy_price - (current_buy_price * dynamic_spacing);
+            
+        // 成本价导向的间距调整
+        let cost_adjusted_spacing = if grid_state.position_avg_price > 0.0 {
+            // 有持仓时：距离成本价越远，间距越大（避免在高位密集买入）
+            let distance_from_cost = (current_buy_price - grid_state.position_avg_price) / grid_state.position_avg_price;
+            if distance_from_cost > 0.0 {
+                // 高于成本价：增大间距，减少买入密度
+                base_spacing * (1.0 + distance_from_cost * 2.0)
+            } else {
+                // 低于成本价：正常间距或略微减小，增加买入机会
+                base_spacing * (1.0 + distance_from_cost * 0.5).max(0.8)
+            }
+        } else {
+            // 无持仓时：使用基础间距
+            base_spacing
+        };
+        
+        // 市场状况调整：距离当前价格越远，间距越大
+        let market_distance = (current_price - current_buy_price) / current_price;
+        let market_adjusted_spacing = cost_adjusted_spacing * (1.0 + market_distance * 1.5);
+        
+        let final_spacing = market_adjusted_spacing.min(base_spacing * 3.0); // 限制最大间距
+        current_buy_price = current_buy_price - (current_buy_price * final_spacing);
+        
+        info!(
+            "📏 智能间距计算 - 基础: {:.6}, 成本调整: {:.6}, 最终: {:.6}, 新价格: {:.4}",
+            base_spacing, cost_adjusted_spacing, final_spacing, current_buy_price
+        );
 
-        // 计算当前网格资金，使用动态交易金额
+        // 智能资金分配策略 - 基于成本价和价格位置
         let dynamic_trade_amount = grid_state.dynamic_params.current_trade_amount;
-        let mut current_grid_funds = (fund_allocation.buy_order_funds * dynamic_trade_amount
-            / grid_config.trade_amount)
-            * (1.0 - (current_price - current_buy_price) / current_price * 3.0);
-        current_grid_funds = current_grid_funds.max(fund_allocation.buy_order_funds * 0.5);
+        let base_grid_funds = fund_allocation.buy_order_funds * dynamic_trade_amount / grid_config.trade_amount;
+        
+        // 成本价导向的资金分配
+        let mut current_grid_funds = if grid_state.position_avg_price > 0.0 {
+            let distance_from_cost = (current_buy_price - grid_state.position_avg_price) / grid_state.position_avg_price;
+            if distance_from_cost < -0.1 {
+                // 远低于成本价（超过10%）：增加资金分配，抄底机会
+                base_grid_funds * 1.5
+            } else if distance_from_cost < 0.0 {
+                // 低于成本价：正常或略微增加资金分配
+                base_grid_funds * (1.0 + (-distance_from_cost) * 0.5)
+            } else {
+                // 高于成本价：减少资金分配，避免追高
+                base_grid_funds * (1.0 - distance_from_cost * 2.0).max(0.3)
+            }
+        } else {
+            // 无持仓时：基于距离市价的远近分配资金
+            let market_distance = (current_price - current_buy_price) / current_price;
+            base_grid_funds * (1.0 + market_distance * 2.0) // 距离市价越远，资金越多
+        };
+        
+        // 确保资金在合理范围内
+        current_grid_funds = current_grid_funds
+            .max(fund_allocation.buy_order_funds * 0.3) // 最小30%
+            .min(fund_allocation.buy_order_funds * 2.0); // 最大200%
 
         // 检查资金限制
         if allocated_buy_funds + current_grid_funds > max_buy_funds {
@@ -5209,7 +5277,7 @@ async fn create_dynamic_grid(
         );
 
         // 验证潜在利润
-        let potential_sell_price = current_buy_price * (1.0 + dynamic_spacing);
+        let potential_sell_price = current_buy_price * (1.0 + final_spacing);
         let expected_profit_rate = calculate_expected_profit_rate(
             current_buy_price,
             potential_sell_price,
